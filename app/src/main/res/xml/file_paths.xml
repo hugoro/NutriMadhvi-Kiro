@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Used by report sharing (cache-path/shares) — kept untouched. -->
+    <cache-path name="shares" path="shares/" />
+    <!-- Chat redesign 2026-06-12 / Phase 6: exposes the directory where
+         in-chat camera captures land so ActivityResultContracts.TakePicture
+         can write to a FileProvider URI inside our private files dir.
+         Lossless: the Camera app writes the JPEG directly here, no
+         decode/re-encode pipeline. -->
+    <files-path name="chat_images" path="chat_images/" />
+    <!-- Phase 5 (2026-06-13): expose food_images/ to the FileProvider so
+         ActivityResultContracts.TakePicture can write the lossless JPEG/HEIC
+         straight into our private files dir. Same authority
+         (com.example.fileprovider) as chat_images. -->
+    <files-path name="food_images" path="food_images/" />
+</paths>

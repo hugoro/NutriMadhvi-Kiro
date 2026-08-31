@@ -1,0 +1,65 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Outer delicate ring representing global targets & macro ring base -->
+    <path
+        android:pathData="M 54, 26 A 28, 28 0 1, 1 53.99, 26"
+        android:strokeColor="#1E293B"
+        android:strokeWidth="1.5" />
+
+    <!-- Colored macro arcs representing progress (Carbs, Protein, Fats) as elegant concentric geometric arcs -->
+    <!-- Carbs limit (Violet arc) -->
+    <path
+        android:pathData="M 54, 25 A 29, 29 0 0, 1 83, 54"
+        android:strokeColor="#8B5CF6"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round" />
+
+    <!-- Protein target (Orange arc) -->
+    <path
+        android:pathData="M 83, 54 A 29, 29 0 0, 1 54, 83"
+        android:strokeColor="#F97316"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round" />
+
+    <!-- Fats cap (Yellow-green/Emerald arc) -->
+    <path
+        android:pathData="M 54, 83 A 29, 29 0 0, 1 25, 54"
+        android:strokeColor="#10B981"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round" />
+
+    <!-- Solid Emerald Green Plate Base in the center -->
+    <path
+        android:pathData="M 54, 34 A 20, 20 0 1, 0 54, 74 A 20, 20 0 1, 0 54, 34"
+        android:fillColor="#064E3B"
+        android:strokeColor="#34D399"
+        android:strokeWidth="2.5" />
+
+    <!-- Stylized elegant white Leaf representing health & nature -->
+    <path
+        android:pathData="M 54, 44 C 47, 44 44, 49 44, 54 C 44, 59 49, 59 54, 59 C 59, 59 64, 54 64, 44 C 59, 44 54, 44 54, 44 Z"
+        android:fillColor="#F8FAFC" />
+        
+    <!-- Main stem / leaf line -->
+    <path
+        android:pathData="M 44, 54 L 59, 49"
+        android:strokeColor="#10B981"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round" />
+
+    <!-- AI Premium sparkles around representing AI tracking and smart prescription -->
+    <!-- Sparkle 1 Top Right -->
+    <path
+        android:pathData="M 80, 28 L 81.5, 31 L 84.5, 32 L 81.5, 33 L 80, 36 L 78.5, 33 L 75.5, 32 L 78.5, 31 Z"
+        android:fillColor="#34D399" />
+
+    <!-- Sparkle 2 Left -->
+    <path
+        android:pathData="M 22, 42 L 23.5, 44 L 25.5, 44.5 L 23.5, 45 L 22, 47 L 20.5, 45 L 18.5, 44.5 L 20.5, 44 Z"
+        android:fillColor="#EAB308" />
+
+</vector>

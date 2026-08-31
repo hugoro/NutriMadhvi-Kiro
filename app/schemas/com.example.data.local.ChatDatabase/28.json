@@ -1,0 +1,923 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 28,
+    "identityHash": "b81af61b54077df6b25790102cfc7c80",
+    "entities": [
+      {
+        "tableName": "chat_sessions",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `title` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `model` TEXT NOT NULL, `systemInstruction` TEXT NOT NULL, `sessionType` TEXT NOT NULL, `lastMessageAt` INTEGER NOT NULL, `cachedContentName` TEXT, `proactiveTag` TEXT, `digestSummary` TEXT)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "model",
+            "columnName": "model",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "systemInstruction",
+            "columnName": "systemInstruction",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionType",
+            "columnName": "sessionType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastMessageAt",
+            "columnName": "lastMessageAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cachedContentName",
+            "columnName": "cachedContentName",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "proactiveTag",
+            "columnName": "proactiveTag",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "digestSummary",
+            "columnName": "digestSummary",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_chat_sessions_proactiveTag",
+            "unique": false,
+            "columnNames": [
+              "proactiveTag"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_chat_sessions_proactiveTag` ON `${TABLE_NAME}` (`proactiveTag`)"
+          }
+        ]
+      },
+      {
+        "tableName": "chat_messages",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `sessionId` INTEGER NOT NULL, `sender` TEXT NOT NULL, `text` TEXT NOT NULL, `timestamp` INTEGER NOT NULL, `isError` INTEGER NOT NULL, `imageBase64` TEXT, `editedTimestamp` INTEGER, FOREIGN KEY(`sessionId`) REFERENCES `chat_sessions`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sender",
+            "columnName": "sender",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "text",
+            "columnName": "text",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timestamp",
+            "columnName": "timestamp",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isError",
+            "columnName": "isError",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "imageBase64",
+            "columnName": "imageBase64",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "editedTimestamp",
+            "columnName": "editedTimestamp",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_chat_messages_sessionId",
+            "unique": false,
+            "columnNames": [
+              "sessionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_chat_messages_sessionId` ON `${TABLE_NAME}` (`sessionId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "chat_sessions",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "sessionId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "chat_messages_fts",
+        "createSql": "CREATE VIRTUAL TABLE IF NOT EXISTS `${TABLE_NAME}` USING FTS4(`text` TEXT NOT NULL, content=`chat_messages`)",
+        "fields": [
+          {
+            "fieldPath": "text",
+            "columnName": "text",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": []
+        },
+        "ftsVersion": "FTS4",
+        "ftsOptions": {
+          "tokenizer": "simple",
+          "tokenizerArgs": [],
+          "contentTable": "chat_messages",
+          "languageIdColumnName": "",
+          "matchInfo": "FTS4",
+          "notIndexedColumns": [],
+          "prefixSizes": [],
+          "preferredOrder": "ASC"
+        },
+        "contentSyncTriggers": [
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_chat_messages_fts_BEFORE_UPDATE BEFORE UPDATE ON `chat_messages` BEGIN DELETE FROM `chat_messages_fts` WHERE `docid`=OLD.`rowid`; END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_chat_messages_fts_BEFORE_DELETE BEFORE DELETE ON `chat_messages` BEGIN DELETE FROM `chat_messages_fts` WHERE `docid`=OLD.`rowid`; END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_chat_messages_fts_AFTER_UPDATE AFTER UPDATE ON `chat_messages` BEGIN INSERT INTO `chat_messages_fts`(`docid`, `text`) VALUES (NEW.`rowid`, NEW.`text`); END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_chat_messages_fts_AFTER_INSERT AFTER INSERT ON `chat_messages` BEGIN INSERT INTO `chat_messages_fts`(`docid`, `text`) VALUES (NEW.`rowid`, NEW.`text`); END"
+        ]
+      },
+      {
+        "tableName": "food_entries",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `name` TEXT NOT NULL, `calories` INTEGER NOT NULL, `protein` REAL NOT NULL, `carbs` REAL NOT NULL, `fat` REAL NOT NULL, `timestamp` INTEGER NOT NULL, `imagePath` TEXT, `analysisSummary` TEXT, `fullSummary` TEXT NOT NULL, `lastAiAnalyzedSummary` TEXT, `mealCategory` TEXT NOT NULL, `appliedHabitIds` TEXT, `groupId` TEXT, `ingredientsJson` TEXT, `freeSugarsG` REAL, `saturatedFatG` REAL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "calories",
+            "columnName": "calories",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "protein",
+            "columnName": "protein",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "carbs",
+            "columnName": "carbs",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fat",
+            "columnName": "fat",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timestamp",
+            "columnName": "timestamp",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "imagePath",
+            "columnName": "imagePath",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "analysisSummary",
+            "columnName": "analysisSummary",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "fullSummary",
+            "columnName": "fullSummary",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastAiAnalyzedSummary",
+            "columnName": "lastAiAnalyzedSummary",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "mealCategory",
+            "columnName": "mealCategory",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "appliedHabitIds",
+            "columnName": "appliedHabitIds",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "groupId",
+            "columnName": "groupId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "ingredientsJson",
+            "columnName": "ingredientsJson",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "freeSugarsG",
+            "columnName": "freeSugarsG",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "saturatedFatG",
+            "columnName": "saturatedFatG",
+            "affinity": "REAL"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "activities",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `name` TEXT NOT NULL, `durationMinutes` INTEGER NOT NULL, `caloriesBurned` INTEGER NOT NULL, `timestamp` INTEGER NOT NULL, `sessionId` TEXT NOT NULL, `fullSummary` TEXT NOT NULL, `lastAiAnalyzedSummary` TEXT, `activityType` TEXT NOT NULL, `notes` TEXT, `shRecordId` TEXT, `sourceLabel` TEXT)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "durationMinutes",
+            "columnName": "durationMinutes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "caloriesBurned",
+            "columnName": "caloriesBurned",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timestamp",
+            "columnName": "timestamp",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fullSummary",
+            "columnName": "fullSummary",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastAiAnalyzedSummary",
+            "columnName": "lastAiAnalyzedSummary",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "activityType",
+            "columnName": "activityType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "notes",
+            "columnName": "notes",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "shRecordId",
+            "columnName": "shRecordId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "sourceLabel",
+            "columnName": "sourceLabel",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "food_habits",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `trigger` TEXT NOT NULL, `descriptor` TEXT NOT NULL, `mealCategoryHint` TEXT, `notes` TEXT, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `isActive` INTEGER NOT NULL, `lastAppliedAt` INTEGER, `timesApplied` INTEGER NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "trigger",
+            "columnName": "trigger",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "descriptor",
+            "columnName": "descriptor",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "mealCategoryHint",
+            "columnName": "mealCategoryHint",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "notes",
+            "columnName": "notes",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isActive",
+            "columnName": "isActive",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastAppliedAt",
+            "columnName": "lastAppliedAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "timesApplied",
+            "columnName": "timesApplied",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "target_snapshots",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `effectiveDateEpochDay` INTEGER NOT NULL, `targetKcal` INTEGER NOT NULL, `targetProtein` REAL NOT NULL, `targetCarbs` REAL NOT NULL, `targetFat` REAL NOT NULL, `targetSteps` INTEGER NOT NULL, `targetActiveMinutes` INTEGER NOT NULL, `targetActivityCalories` INTEGER NOT NULL, `note` TEXT, `createdAtMs` INTEGER NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "effectiveDateEpochDay",
+            "columnName": "effectiveDateEpochDay",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetKcal",
+            "columnName": "targetKcal",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetProtein",
+            "columnName": "targetProtein",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetCarbs",
+            "columnName": "targetCarbs",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetFat",
+            "columnName": "targetFat",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetSteps",
+            "columnName": "targetSteps",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetActiveMinutes",
+            "columnName": "targetActiveMinutes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetActivityCalories",
+            "columnName": "targetActivityCalories",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "note",
+            "columnName": "note",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "createdAtMs",
+            "columnName": "createdAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_target_snapshots_effectiveDateEpochDay",
+            "unique": false,
+            "columnNames": [
+              "effectiveDateEpochDay"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_target_snapshots_effectiveDateEpochDay` ON `${TABLE_NAME}` (`effectiveDateEpochDay`)"
+          }
+        ]
+      },
+      {
+        "tableName": "bmr_snapshots",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `effectiveDateEpochDay` INTEGER NOT NULL, `valueKcal` INTEGER NOT NULL, `source` TEXT NOT NULL, `sourceTimestampMs` INTEGER, `createdAtMs` INTEGER NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "effectiveDateEpochDay",
+            "columnName": "effectiveDateEpochDay",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "valueKcal",
+            "columnName": "valueKcal",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "source",
+            "columnName": "source",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceTimestampMs",
+            "columnName": "sourceTimestampMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "createdAtMs",
+            "columnName": "createdAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_bmr_snapshots_effectiveDateEpochDay",
+            "unique": false,
+            "columnNames": [
+              "effectiveDateEpochDay"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_bmr_snapshots_effectiveDateEpochDay` ON `${TABLE_NAME}` (`effectiveDateEpochDay`)"
+          }
+        ]
+      },
+      {
+        "tableName": "body_composition_snapshots",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `sourceTimestampMs` INTEGER, `capturedAtMs` INTEGER NOT NULL, `weightKg` REAL NOT NULL, `bodyFatPct` REAL, `muscleMassKg` REAL, `totalBodyWaterKg` REAL, `bmiValue` REAL, `heightCm` REAL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceTimestampMs",
+            "columnName": "sourceTimestampMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "capturedAtMs",
+            "columnName": "capturedAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "weightKg",
+            "columnName": "weightKg",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bodyFatPct",
+            "columnName": "bodyFatPct",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "muscleMassKg",
+            "columnName": "muscleMassKg",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "totalBodyWaterKg",
+            "columnName": "totalBodyWaterKg",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "bmiValue",
+            "columnName": "bmiValue",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "heightCm",
+            "columnName": "heightCm",
+            "affinity": "REAL"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_body_composition_snapshots_sourceTimestampMs",
+            "unique": false,
+            "columnNames": [
+              "sourceTimestampMs"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_body_composition_snapshots_sourceTimestampMs` ON `${TABLE_NAME}` (`sourceTimestampMs`)"
+          }
+        ]
+      },
+      {
+        "tableName": "daily_activity_snapshots",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`dateEpochDay` INTEGER NOT NULL, `activeKcal` INTEGER NOT NULL, `workoutsKcal` INTEGER NOT NULL, `steps` INTEGER NOT NULL, `activeMinutes` INTEGER NOT NULL, `capturedAtMs` INTEGER NOT NULL, PRIMARY KEY(`dateEpochDay`))",
+        "fields": [
+          {
+            "fieldPath": "dateEpochDay",
+            "columnName": "dateEpochDay",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activeKcal",
+            "columnName": "activeKcal",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "workoutsKcal",
+            "columnName": "workoutsKcal",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "steps",
+            "columnName": "steps",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activeMinutes",
+            "columnName": "activeMinutes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "capturedAtMs",
+            "columnName": "capturedAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "dateEpochDay"
+          ]
+        }
+      },
+      {
+        "tableName": "user_insights",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `text` TEXT NOT NULL, `category` TEXT NOT NULL, `confidence` REAL NOT NULL, `source` TEXT NOT NULL, `sourceSessionId` INTEGER, `createdAtMs` INTEGER NOT NULL, `confirmedAtMs` INTEGER, `expiredAtMs` INTEGER, `relatedInsightIds` TEXT, `keywords` TEXT, `lastReferencedAtMs` INTEGER, `mentionCount` INTEGER NOT NULL, `summary` TEXT)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "text",
+            "columnName": "text",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "category",
+            "columnName": "category",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "confidence",
+            "columnName": "confidence",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "source",
+            "columnName": "source",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceSessionId",
+            "columnName": "sourceSessionId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "createdAtMs",
+            "columnName": "createdAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "confirmedAtMs",
+            "columnName": "confirmedAtMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "expiredAtMs",
+            "columnName": "expiredAtMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "relatedInsightIds",
+            "columnName": "relatedInsightIds",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "keywords",
+            "columnName": "keywords",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastReferencedAtMs",
+            "columnName": "lastReferencedAtMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "mentionCount",
+            "columnName": "mentionCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "summary",
+            "columnName": "summary",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_user_insights_category",
+            "unique": false,
+            "columnNames": [
+              "category"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_user_insights_category` ON `${TABLE_NAME}` (`category`)"
+          },
+          {
+            "name": "index_user_insights_expiredAtMs",
+            "unique": false,
+            "columnNames": [
+              "expiredAtMs"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_user_insights_expiredAtMs` ON `${TABLE_NAME}` (`expiredAtMs`)"
+          }
+        ]
+      },
+      {
+        "tableName": "predicted_qa",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `queryHash` TEXT NOT NULL, `tag` TEXT NOT NULL, `canonicalText` TEXT NOT NULL, `answerText` TEXT NOT NULL, `dataFingerprint` TEXT NOT NULL, `language` TEXT NOT NULL, `createdAtMs` INTEGER NOT NULL, `expiresAtMs` INTEGER NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "queryHash",
+            "columnName": "queryHash",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "tag",
+            "columnName": "tag",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "canonicalText",
+            "columnName": "canonicalText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "answerText",
+            "columnName": "answerText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "dataFingerprint",
+            "columnName": "dataFingerprint",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "language",
+            "columnName": "language",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtMs",
+            "columnName": "createdAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expiresAtMs",
+            "columnName": "expiresAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_predicted_qa_queryHash",
+            "unique": true,
+            "columnNames": [
+              "queryHash"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_predicted_qa_queryHash` ON `${TABLE_NAME}` (`queryHash`)"
+          },
+          {
+            "name": "index_predicted_qa_expiresAtMs",
+            "unique": false,
+            "columnNames": [
+              "expiresAtMs"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_predicted_qa_expiresAtMs` ON `${TABLE_NAME}` (`expiresAtMs`)"
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'b81af61b54077df6b25790102cfc7c80')"
+    ]
+  }
+}

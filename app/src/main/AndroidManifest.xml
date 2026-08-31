@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Chat redesign 2026-06-12 / Phase 6: in-chat camera capture. Runtime
+         requested via ActivityResultContracts.RequestPermission the first
+         time the user taps the Camera option in the attach bottom sheet. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <!-- Bloco I (proactive notifications): runtime POST_NOTIFICATIONS is
+         requested in MainActivity.onCreate on API 33+. Required for the
+         ProactiveNudgeWorker output to actually surface on the device. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 2026-06-27 (Build 1.5): coarse-grained (city-level) location used
+         exclusively to look up the user's IPMA weather forecast for the
+         chat's [CONTEXTO LOCAL] block. We do NOT request FINE precision —
+         IPMA grids are per-city, COARSE (~2km radius) is enough. Runtime
+         prompt fires the first time the user opens the Chat tab; the
+         WeatherFetcher silently no-ops when permission is denied so the
+         chat keeps working without weather context. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- 2026-07-05 (Voice Mode / Read aloud): microphone is required for the
+         hands-free chat mode (SpeechRecognizer). Runtime dialog fires from
+         MainActivity the first time the user taps the mic button in the
+         chat input row. Not needed for the per-bubble TTS "read aloud"
+         button — that path uses TextToSpeech which needs no permission. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <queries>
+        <package android:name="com.sec.android.app.shealth" />
+        <!-- 2026-07-05: allow resolving the platform SpeechRecognizer and
+             TextToSpeech engines on API 30+ (package visibility). Without
+             these <intent> queries, SpeechRecognizer.isRecognitionAvailable
+             returns false on Android 11+ even when Google's engine is
+             installed, and TextToSpeech.getEngines() comes back empty. -->
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:largeHeap="true"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.MyApplication">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.MyApplication"
+            android:windowSoftInputMode="adjustResize">
+            <!-- 2026-06-18 ROUND 4: adjustResize stops the system's
+                 implicit window pan when the keyboard opens. Without it
+                 (default behaviour in edge-to-edge), the OS pan-s the
+                 entire window upward by the full IME height (1071px on
+                 the Pixel — measured via WindowInsets.ime logger), which
+                 pushes the per-tab ScreenHeader out the top of the screen
+                 and draws chat bubbles under the system status bar from
+                 the second message onwards. With adjustResize the window
+                 height shrinks instead and Material3 Scaffold's
+                 innerPadding consumes the IME inset normally — header
+                 stays anchored. SwiftKey's smart-bar adjustment lives in
+                 the Compose layer (imePadding on the input bar Column,
+                 added separately if needed). -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.PrivacyPolicyActivity"
+            android:exported="true"
+            android:label="NutriMadhvi Privacy Policy"
+            android:theme="@style/Theme.MyApplication">
+            <intent-filter>
+                <action android:name="com.samsung.android.support.health.data.intent.action.VIEW_PRIVACY_POLICY" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.samsung.android.sdk.health.data.intent.action.VIEW_PRIVACY_POLICY" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.example.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+
+</manifest>

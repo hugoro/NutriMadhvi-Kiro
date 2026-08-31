@@ -1,0 +1,6 @@
+{
+  "name": "NutriMadhvi",
+  "description": "An elegant nutrition tracker with photo-based food identification, daily nutritional stat reporting, history management, and custom conversational consultations powered by Gemini Pro.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
