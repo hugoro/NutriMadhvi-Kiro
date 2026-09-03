@@ -1749,10 +1749,13 @@ class ChatViewModel(
                         withGroup
                     }
                     val saved = if (finalEntry.id != 0L) {
-                        // AUTO when the macros came back from a fresh re-analysis,
-                        // MANUAL when the user's own edit is all that changed.
-                        val reanalysed = finalEntry.analysisModel != null &&
-                            finalEntry.analysisModel != withGroup.analysisModel
+                        // AUTO when a fresh re-analysis actually ran and produced a
+                        // model-tagged result; MANUAL when only the user's own edit
+                        // changed. Keying off `needsReanalysis` + a resolved model is
+                        // reliable — the old "did analysisModel change" check marked a
+                        // genuine re-analysis MANUAL whenever it resolved to the same
+                        // engine (and mergeReanalysis used to drop the model entirely).
+                        val reanalysed = needsReanalysis && finalEntry.analysisModel != null
                         val logType = if (reanalysed)
                             FoodEditType.AUTO
                         else
@@ -1989,8 +1992,12 @@ class ChatViewModel(
                         ingredientsJson = com.example.data.remote.encodeIngredients(result.ingredients),
                         freeSugarsG = result.freeSugarsG?.coerceAtMost(result.carbs ?: 0.0)?.coerceAtLeast(0.0),
                         saturatedFatG = result.saturatedFatG?.coerceAtMost(result.fat ?: 0.0)?.coerceAtLeast(0.0),
+                        // Record the engine behind this auto-analysis so the meal-details
+                        // activity log can show "Atualiz. Auto · <model>". The retry path
+                        // previously dropped it, leaving analysisModel + edit-log model null.
+                        analysisModel = result.analysisModel ?: entry.analysisModel,
                     )
-                    repository.updateFood(updated.appendEditLog(FoodEditType.AUTO))
+                    repository.updateFood(updated.appendEditLog(FoodEditType.AUTO, model = result.analysisModel))
                     android.util.Log.i("FOOD_RETRY", "entry ${entry.id} updated: name='${updated.name}' kcal=${updated.calories}")
                     kotlinx.coroutines.delay(2_000L)
                 }

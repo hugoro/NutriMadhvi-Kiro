@@ -767,6 +767,11 @@ class MealAnalysisOrchestrator(
             protein = result.protein ?: currentEntry.protein,
             carbs = mergedCarbs,
             fat = mergedFat,
+            // Propagate the engine behind this re-analysis so the caller can
+            // record it in the activity log (AUTO row). Without this the copy
+            // keeps the stale model and the edit log shows "Manual" with no
+            // engine even though the AI just re-ran.
+            analysisModel = result.analysisModel ?: currentEntry.analysisModel,
             fullSummary = (result.fullSummary ?: newSummary).sanitizeAiNewlines(),
             mealCategory = MealCategory.parse(result.mealCategory),
             appliedHabitIds = result.appliedHabitIds,
