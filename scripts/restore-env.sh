@@ -24,10 +24,9 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/.env"
 SERVICE="nutrimadhvi"
-ACCOUNT="GEMINI_API_KEY"
 
 read_keychain() {
-  security find-generic-password -s "$SERVICE" -a "$ACCOUNT" -w 2>/dev/null
+  security find-generic-password -s "$SERVICE" -a "$1" -w 2>/dev/null
 }
 
 if [[ "${1:-}" == "--check" ]]; then
@@ -47,14 +46,22 @@ if [[ "${1:-}" == "--check" ]]; then
   exit 0
 fi
 
-KEY="$(read_keychain || true)"
+KEY="$(read_keychain GEMINI_API_KEY || true)"
 if [[ -z "$KEY" ]]; then
   cat >&2 <<EOF
 ✗ Não encontrei GEMINI_API_KEY no Keychain.
   Adiciona com:
-    security add-generic-password -s $SERVICE -a $ACCOUNT -w "<chave>" -U
+    security add-generic-password -s $SERVICE -a GEMINI_API_KEY -w "<chave>" -U
 EOF
   exit 1
+fi
+
+# Groq — fallback DORMENTE do ensemble de meal-vision. Opcional: se não
+# estiver no Keychain, escrevemos o placeholder (o app corre GEMINI_ONLY).
+GROQ_KEY="$(read_keychain GROQ_API_KEY || true)"
+GROQ_LINE="GROQ_API_KEY=MY_GROQ_API_KEY"
+if [[ -n "$GROQ_KEY" ]]; then
+  GROQ_LINE="GROQ_API_KEY=$GROQ_KEY"
 fi
 
 # Escrever o .env (sobrescreve sempre).
@@ -62,8 +69,10 @@ umask 077  # 0600 — só o user lê
 cat > "$ENV_FILE" <<EOF
 # Gerado por scripts/restore-env.sh a partir do macOS Keychain.
 # NÃO fazer commit (já está no .gitignore).
-# Para rodar a chave: security add-generic-password -s $SERVICE -a $ACCOUNT -w "<NOVA>" -U
+# Para rodar a chave Gemini: security add-generic-password -s $SERVICE -a GEMINI_API_KEY -w "<NOVA>" -U
+# Para rodar a chave Groq:   security add-generic-password -s $SERVICE -a GROQ_API_KEY -w "<NOVA>" -U
 GEMINI_API_KEY=$KEY
+$GROQ_LINE
 EOF
 chmod 600 "$ENV_FILE"
 echo "✓ .env regenerado em $ENV_FILE (perm 600, $(wc -c < "$ENV_FILE") bytes)"
