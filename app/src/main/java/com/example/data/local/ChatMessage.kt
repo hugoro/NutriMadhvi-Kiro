@@ -34,5 +34,16 @@ data class ChatMessage(
      *
      * Added in DB v15 via [com.example.data.local.ChatDatabase.MIGRATION_14_15].
      */
-    val editedTimestamp: Long? = null
+    val editedTimestamp: Long? = null,
+    /**
+     * Which LLM produced this message, or was being attempted when a
+     * durable failure row was written (e.g. `gemini-3.5-flash`,
+     * `gemini-3.1-pro-preview`). Populated for assistant replies and for
+     * the `isError` rows [com.example.data.chat.ChatOrchestrator] persists
+     * on total send failure / dangling-session regularization, so the chat
+     * bubble and any future notification can say *which* model failed
+     * instead of a generic "analysis failed". NULL for user messages and
+     * for legacy rows (pre-v29).
+     */
+    val analysisModel: String? = null
 )

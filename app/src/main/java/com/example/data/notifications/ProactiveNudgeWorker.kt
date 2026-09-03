@@ -164,6 +164,10 @@ class ProactiveNudgeWorker(
         // tell the whole story. Adding prose ("+120 kcal acima de ontem.")
         // duplicates what the bars show and reads as noise. For every other
         // trigger we still ask Gemini for the body text.
+        // 2026-09-03 — carry which model answered alongside the prose, so
+        // both the log line and the materialized chat bubble can name it
+        // (Hugo: "o modelo ou modelos em utilização deveriam ser mostrados").
+        var resolvedModel: String? = null
         val text: String? = if (trigger is Trigger.ActivitySpike) {
             null
         } else {
@@ -176,7 +180,7 @@ class ProactiveNudgeWorker(
                 shStepsByDate = shStepsByDate,
                 shDailyActivity = shDailyActivity,
             )
-            if (generated.isNullOrBlank()) {
+            if (generated == null || generated.text.isBlank()) {
                 return if (runAttemptCount < MAX_RETRIES) {
                     Log.w(TAG, "LLM returned null — retry (attempt=$runAttemptCount)")
                     Result.retry()
@@ -185,7 +189,9 @@ class ProactiveNudgeWorker(
                     Result.success()
                 }
             }
-            generated
+            resolvedModel = generated.model
+            Log.i(TAG, "notification body generated via ${generated.model}")
+            generated.text
         }
 
         // ─ Compose final body: deterministic visual header + LLM prose. ────
@@ -264,6 +270,7 @@ class ProactiveNudgeWorker(
             chatBubbleText = chatBubbleText,
             bitmapFilePath = bitmapFilePath,
             deliveredAtMs = nowMs,
+            modelName = resolvedModel,
         )
 
         postNotification(
@@ -344,9 +351,15 @@ class ProactiveNudgeWorker(
         val notificationKey = pending.proactiveTag ?: trigger.dedupKey
         val notificationId = NOTIFICATION_ID_BASE + (notificationKey.hashCode() and 0x0FFFFFFF)
 
+        // 2026-09-03 — Hugo: tapping a proactive notification should open
+        // the app on the Dashboard, not jump straight into the chat tab.
+        // The nudge's session + assistant bubble are still materialized in
+        // the background (see materializeAndOpen) so the conversation is
+        // there and up to date whenever the user does open Chat — this only
+        // stops the automatic tab switch on tap.
         val tapIntent = Intent(ctx, MainActivity::class.java).apply {
             putExtra(PendingProactiveNudge.EXTRA_PENDING_NUDGE_JSON, pending.toJson())
-            putExtra(EXTRA_SWITCH_TO_CHAT, true)
+            putExtra(EXTRA_SWITCH_TO_CHAT, false)
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val pi = PendingIntent.getActivity(

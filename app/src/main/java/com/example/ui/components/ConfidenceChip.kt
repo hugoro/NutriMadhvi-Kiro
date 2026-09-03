@@ -36,17 +36,19 @@ import androidx.compose.foundation.layout.Box
  * [tr] so it stays consistent with the rest of the UI even if the model
  * emits the canonical English `high|medium|low` literal.
  *
- * When [escalated] is true, a small adjacent "Pro" badge tells the user
- * that this result is the product of the automatic flash→pro escalation —
- * the macros they're looking at were refined by the more capable model
- * after the streaming Flash pass came back with low/medium confidence.
+ * When [escalated] is true, a small adjacent badge names the LLM that
+ * actually produced this result (e.g. "gemini-3.1-pro-preview") instead of
+ * the previous hardcoded "Pro" label — useful once more than one provider
+ * can be behind an escalation (see the ensemble scaffolding), and honest
+ * even today since "Pro" alone didn't say *which* Gemini tier answered.
  */
 @Composable
 fun ConfidenceChip(
     level: String,
     language: String,
     modifier: Modifier = Modifier,
-    escalated: Boolean = false
+    escalated: Boolean = false,
+    modelName: String? = null
 ) {
     val normalized = level.trim().lowercase()
     val (dotColor, textColor, borderColor, label) = when (normalized) {
@@ -109,7 +111,7 @@ fun ConfidenceChip(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Pro",
+                    text = modelDisplayName(modelName),
                     color = Color.White,
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold
@@ -128,3 +130,31 @@ private data class Quad(
     val third: Color,
     val fourth: String
 )
+
+/**
+ * Shortens a raw model id into something that fits a small badge while
+ * staying identifiable, e.g. `gemini-3.1-pro-preview` → `Gemini 3.1 Pro`,
+ * `qwen/qwen3.6-27b` → `Qwen 3.6`. Falls back to "Pro" only when the model
+ * name is entirely missing, so an escalation is never shown as blank.
+ */
+internal fun modelDisplayName(rawModel: String?): String {
+    val model = rawModel?.trim()?.lowercase().orEmpty()
+    if (model.isEmpty()) return "Pro"
+    return when {
+        model.startsWith("gemini") -> {
+            val version = Regex("gemini-?(\\d+\\.\\d+)").find(model)?.groupValues?.get(1)
+            val tier = when {
+                model.contains("pro") -> "Pro"
+                model.contains("flash-lite") -> "Flash Lite"
+                model.contains("flash") -> "Flash"
+                else -> null
+            }
+            listOfNotNull("Gemini", version, tier).joinToString(" ")
+        }
+        model.contains("qwen") -> {
+            val version = Regex("qwen(\\d+\\.\\d+)").find(model)?.groupValues?.get(1)
+            listOfNotNull("Qwen", version).joinToString(" ")
+        }
+        else -> rawModel!!
+    }
+}

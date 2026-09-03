@@ -1612,4 +1612,265 @@ class DatabaseMigrationTest {
 
         db27.close()
     }
+
+    /**
+     * v32 → v33 (reconcile branch): re-mapping `IngredientNutritionEntity`
+     * after the ensemble worktree left the table UNMAPPED bumped the Room
+     * identity hash, so the version had to increment to 33. This is the
+     * upgrade path for a v32 device that NEVER had the table (a build that
+     * skipped the verbatim-ported v28→v29 DDL). `MIGRATION_32_33` must:
+     *  - CREATE the `ingredient_nutrition_cache` table + its unique index,
+     *  - add the `editLogJson` / `analysisModel` columns idempotently,
+     *  - preserve every existing `food_entries` row byte-for-byte,
+     *  - land the DB at user_version = 33.
+     */
+    @Test
+    fun testMigration32To33CreatesIngredientCacheWhenAbsent() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val dbFile = context.getDatabasePath("test_migration_v32_v33_absent")
+        if (dbFile.exists()) dbFile.delete()
+
+        val db32 = SQLiteDatabase.openOrCreateDatabase(dbFile.absolutePath, null)
+        db32.version = 32
+        // Minimal food_entries at the v32 shape (satFat + freeSugars present,
+        // but NO analysisModel / editLogJson yet — this is a v32 that never
+        // saw the reconcile columns).
+        db32.execSQL("""
+            CREATE TABLE IF NOT EXISTS `food_entries` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `name` TEXT NOT NULL,
+                `calories` INTEGER NOT NULL,
+                `protein` REAL NOT NULL,
+                `carbs` REAL NOT NULL,
+                `fat` REAL NOT NULL,
+                `timestamp` INTEGER NOT NULL,
+                `imagePath` TEXT,
+                `analysisSummary` TEXT,
+                `fullSummary` TEXT NOT NULL,
+                `lastAiAnalyzedSummary` TEXT,
+                `mealCategory` TEXT NOT NULL,
+                `appliedHabitIds` TEXT,
+                `groupId` TEXT,
+                `ingredientsJson` TEXT,
+                `freeSugarsG` REAL,
+                `saturatedFatG` REAL
+            )
+        """.trimIndent())
+        // chat_messages is a core table on every real v32 device; the
+        // migration's addColumnIfMissing("chat_messages", "analysisModel")
+        // requires it to exist (ALTER TABLE cannot target a missing table).
+        db32.execSQL("""
+            CREATE TABLE IF NOT EXISTS `chat_messages` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `sessionId` INTEGER NOT NULL,
+                `text` TEXT NOT NULL,
+                `isUser` INTEGER NOT NULL,
+                `timestamp` INTEGER NOT NULL
+            )
+        """.trimIndent())
+        db32.execSQL(
+            """INSERT INTO food_entries
+                (id, name, calories, protein, carbs, fat, timestamp,
+                 fullSummary, mealCategory, freeSugarsG, saturatedFatG)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                301L, "arroz de pato", 640, 32.0, 70.0, 22.0,
+                1_700_010_000_000L, "arroz de pato no forno", "LUNCH", 1.0, 6.5
+            )
+        )
+        db32.close()
+
+        val db33 = openWithMigration("test_migration_v32_v33_absent", 33) { db, oldV, newV ->
+            if (oldV == 32 && newV == 33) ChatDatabase.MIGRATION_32_33.migrate(db)
+        }
+
+        assertIngredientCacheAndColumns(db33)
+
+        // Seeded row survives byte-identical.
+        db33.query("SELECT * FROM food_entries WHERE id = 301").use {
+            assertTrue("row 301 vanished after migration", it.moveToFirst())
+            assertEquals("arroz de pato", it.getString(it.getColumnIndexOrThrow("name")))
+            assertEquals(640, it.getInt(it.getColumnIndexOrThrow("calories")))
+            assertEquals(6.5, it.getDouble(it.getColumnIndexOrThrow("saturatedFatG")), 0.0)
+            // New columns exist and default NULL on the legacy row.
+            assertTrue(it.isNull(it.getColumnIndexOrThrow("analysisModel")))
+            assertTrue(it.isNull(it.getColumnIndexOrThrow("editLogJson")))
+        }
+        db33.close()
+    }
+
+    /**
+     * v32 → v33, the LIVE Pixel shape: the device already physically carries
+     * `ingredient_nutrition_cache` (created by the verbatim-ported v28→v29
+     * DDL, then left unmapped). `MIGRATION_32_33`'s `CREATE TABLE IF NOT
+     * EXISTS` / `CREATE UNIQUE INDEX IF NOT EXISTS` must be a safe no-op here
+     * — the migration must NOT throw, must NOT drop the table's existing
+     * rows, and must still add the analysisModel/editLogJson columns.
+     */
+    @Test
+    fun testMigration32To33IsNoOpWhenIngredientCachePresent() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val dbFile = context.getDatabasePath("test_migration_v32_v33_present")
+        if (dbFile.exists()) dbFile.delete()
+
+        val db32 = SQLiteDatabase.openOrCreateDatabase(dbFile.absolutePath, null)
+        db32.version = 32
+        db32.execSQL("""
+            CREATE TABLE IF NOT EXISTS `food_entries` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `name` TEXT NOT NULL,
+                `calories` INTEGER NOT NULL,
+                `protein` REAL NOT NULL,
+                `carbs` REAL NOT NULL,
+                `fat` REAL NOT NULL,
+                `timestamp` INTEGER NOT NULL,
+                `imagePath` TEXT,
+                `analysisSummary` TEXT,
+                `fullSummary` TEXT NOT NULL,
+                `lastAiAnalyzedSummary` TEXT,
+                `mealCategory` TEXT NOT NULL,
+                `appliedHabitIds` TEXT,
+                `groupId` TEXT,
+                `ingredientsJson` TEXT,
+                `freeSugarsG` REAL,
+                `saturatedFatG` REAL
+            )
+        """.trimIndent())
+        // chat_messages is a core table on every real v32 device; the
+        // migration's addColumnIfMissing("chat_messages", "analysisModel")
+        // requires it to exist (ALTER TABLE cannot target a missing table).
+        db32.execSQL("""
+            CREATE TABLE IF NOT EXISTS `chat_messages` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `sessionId` INTEGER NOT NULL,
+                `text` TEXT NOT NULL,
+                `isUser` INTEGER NOT NULL,
+                `timestamp` INTEGER NOT NULL
+            )
+        """.trimIndent())
+        // Live device carries the table already (unmapped) — replicate its
+        // exact DDL (same as MIGRATION_28_29) and seed a cached ingredient.
+        db32.execSQL("""
+            CREATE TABLE IF NOT EXISTS `ingredient_nutrition_cache` (
+                `id` INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                `normalizedName` TEXT NOT NULL,
+                `displayName` TEXT NOT NULL,
+                `per100gCalories` REAL NOT NULL,
+                `per100gProtein` REAL NOT NULL,
+                `per100gCarbs` REAL NOT NULL,
+                `per100gFat` REAL NOT NULL,
+                `per100gSatFat` REAL NOT NULL,
+                `per100gFreeSugars` REAL NOT NULL,
+                `source` TEXT NOT NULL,
+                `confidence` TEXT NOT NULL,
+                `createdAtMs` INTEGER NOT NULL,
+                `updatedAtMs` INTEGER NOT NULL,
+                `timesUsed` INTEGER NOT NULL DEFAULT 0
+            )
+        """.trimIndent())
+        db32.execSQL(
+            "CREATE UNIQUE INDEX IF NOT EXISTS `index_ingredient_nutrition_cache_normalizedName` ON `ingredient_nutrition_cache` (`normalizedName`)"
+        )
+        db32.execSQL(
+            """INSERT INTO ingredient_nutrition_cache
+                (id, normalizedName, displayName, per100gCalories, per100gProtein,
+                 per100gCarbs, per100gFat, per100gSatFat, per100gFreeSugars,
+                 source, confidence, createdAtMs, updatedAtMs, timesUsed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                1L, "arroz", "Arroz cozido", 130.0, 2.7, 28.0, 0.3, 0.1, 0.0,
+                "insa", "HIGH", 1_700_000_000_000L, 1_700_000_000_000L, 4L
+            )
+        )
+        db32.execSQL(
+            """INSERT INTO food_entries
+                (id, name, calories, protein, carbs, fat, timestamp,
+                 fullSummary, mealCategory)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                401L, "frango grelhado", 330, 40.0, 0.0, 18.0,
+                1_700_011_000_000L, "peito de frango grelhado", "DINNER"
+            )
+        )
+        db32.close()
+
+        val db33 = openWithMigration("test_migration_v32_v33_present", 33) { db, oldV, newV ->
+            if (oldV == 32 && newV == 33) ChatDatabase.MIGRATION_32_33.migrate(db)
+        }
+
+        assertIngredientCacheAndColumns(db33)
+
+        // The pre-existing cached ingredient must SURVIVE (IF NOT EXISTS must
+        // not have dropped/recreated the table).
+        db33.query("SELECT displayName, timesUsed FROM ingredient_nutrition_cache WHERE normalizedName = 'arroz'").use {
+            assertTrue("cached ingredient vanished — table was recreated!", it.moveToFirst())
+            assertEquals("Arroz cozido", it.getString(0))
+            assertEquals(4, it.getInt(1))
+        }
+        db33.query("SELECT name FROM food_entries WHERE id = 401").use {
+            assertTrue("row 401 vanished after migration", it.moveToFirst())
+            assertEquals("frango grelhado", it.getString(0))
+        }
+        db33.close()
+    }
+
+    /** Shared assertions for the v33 end state: table + unique index exist,
+     *  the reconcile columns exist, and user_version == 33. */
+    private fun assertIngredientCacheAndColumns(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        // Table exists.
+        db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='ingredient_nutrition_cache'"
+        ).use {
+            assertTrue("ingredient_nutrition_cache table missing after v33", it.moveToFirst())
+        }
+        // Unique index exists.
+        db.query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='index_ingredient_nutrition_cache_normalizedName'"
+        ).use {
+            assertTrue("unique index missing after v33", it.moveToFirst())
+        }
+        // Reconcile columns present on food_entries.
+        val foodCols = mutableSetOf<String>()
+        db.query("PRAGMA table_info(food_entries)").use {
+            val nameIdx = it.getColumnIndexOrThrow("name")
+            while (it.moveToNext()) foodCols += it.getString(nameIdx)
+        }
+        assertTrue("analysisModel column missing on food_entries", "analysisModel" in foodCols)
+        assertTrue("editLogJson column missing on food_entries", "editLogJson" in foodCols)
+        // analysisModel must also land on chat_messages (both fixtures create
+        // that table, matching the live device where it always exists).
+        val chatCols = mutableSetOf<String>()
+        db.query("PRAGMA table_info(chat_messages)").use {
+            val nameIdx = it.getColumnIndexOrThrow("name")
+            while (it.moveToNext()) chatCols += it.getString(nameIdx)
+        }
+        assertTrue("analysisModel column missing on chat_messages", "analysisModel" in chatCols)
+        db.query("PRAGMA user_version").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("DB must end at user_version 33", 33, it.getInt(0))
+        }
+    }
+
+    /** Open [name] with a SupportSQLiteOpenHelper whose onUpgrade runs [onUpgrade]. */
+    private fun openWithMigration(
+        name: String,
+        targetVersion: Int,
+        onUpgrade: (androidx.sqlite.db.SupportSQLiteDatabase, Int, Int) -> Unit
+    ): androidx.sqlite.db.SupportSQLiteDatabase {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val helper = androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory().create(
+            androidx.sqlite.db.SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(name)
+                .callback(object : androidx.sqlite.db.SupportSQLiteOpenHelper.Callback(targetVersion) {
+                    override fun onCreate(db: androidx.sqlite.db.SupportSQLiteDatabase) {}
+                    override fun onUpgrade(
+                        db: androidx.sqlite.db.SupportSQLiteDatabase,
+                        oldVersion: Int,
+                        newVersion: Int
+                    ) = onUpgrade(db, oldVersion, newVersion)
+                })
+                .build()
+        )
+        return helper.writableDatabase
+    }
 }

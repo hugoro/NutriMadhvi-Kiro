@@ -59,6 +59,13 @@ data class PendingProactiveNudge(
      *  message timestamp on materialization so the chat bubble lands at
      *  the right point in the day instead of "now (when you tapped)". */
     val deliveredAtMs: Long,
+    /** Which Gemini model in [ProactivePromptBuilder]'s fallback chain
+     *  actually produced [chatBubbleText]'s prose (e.g. `gemini-3.6-flash`).
+     *  Null for triggers that skip the LLM entirely (ActivitySpike). Carried
+     *  through the intent so [com.example.MainActivity.materializeAndOpen]
+     *  can stamp it on the materialized [com.example.data.local.ChatMessage],
+     *  surviving app restarts like the meal-analysis model badge. */
+    val modelName: String? = null,
 ) {
     fun toJson(): String = JSONObject().apply {
         put(KEY_PROACTIVE_TAG, proactiveTag ?: JSONObject.NULL)
@@ -67,6 +74,7 @@ data class PendingProactiveNudge(
         put(KEY_CHAT_BUBBLE_TEXT, chatBubbleText)
         put(KEY_BITMAP_FILE_PATH, bitmapFilePath ?: JSONObject.NULL)
         put(KEY_DELIVERED_AT_MS, deliveredAtMs)
+        put(KEY_MODEL_NAME, modelName ?: JSONObject.NULL)
     }.toString()
 
     companion object {
@@ -78,6 +86,7 @@ data class PendingProactiveNudge(
         private const val KEY_CHAT_BUBBLE_TEXT = "msg"
         private const val KEY_BITMAP_FILE_PATH = "img"
         private const val KEY_DELIVERED_AT_MS = "ts"
+        private const val KEY_MODEL_NAME = "model"
 
         fun fromJson(json: String): PendingProactiveNudge? = runCatching {
             val obj = JSONObject(json)
@@ -92,6 +101,9 @@ data class PendingProactiveNudge(
                     !obj.isNull(KEY_BITMAP_FILE_PATH) && it.isNotEmpty()
                 },
                 deliveredAtMs = obj.getLong(KEY_DELIVERED_AT_MS),
+                modelName = obj.optString(KEY_MODEL_NAME).takeIf {
+                    !obj.isNull(KEY_MODEL_NAME) && it.isNotEmpty()
+                },
             )
         }.getOrNull()
 

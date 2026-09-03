@@ -1,5 +1,6 @@
 package com.example.data.remote
 
+import com.example.BuildConfig
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
@@ -33,14 +34,39 @@ object GeminiRetrofitClient {
     //
     // HEADERS keeps enough signal for auth/quota debugging without the
     // body bloat. Streaming and cache clients already use NONE.
-    private val loggingInterceptor = HttpLoggingInterceptor().apply {
-        level = HttpLoggingInterceptor.Level.HEADERS
+    // HEADERS logs the full request line, and every Gemini endpoint carries the
+    // credential as a `?key=` query parameter — so the raw API key was being
+    // written to logcat on every call, in release builds too (anything reading
+    // the device log, including a bug report, would capture it). The level is
+    // now tied to debug builds and the URL is scrubbed before it reaches the
+    // log, so enabling verbose logging can never leak the credential.
+    private val apiKeyInUrl = Regex("key=[^&\\s]+")
+
+    private val redactingLogger = HttpLoggingInterceptor.Logger { message ->
+        HttpLoggingInterceptor.Logger.DEFAULT.log(
+            apiKeyInUrl.replace(message, "key=<redacted>")
+        )
     }
 
+    private val loggingInterceptor = HttpLoggingInterceptor(redactingLogger).apply {
+        level = if (BuildConfig.DEBUG) {
+            HttpLoggingInterceptor.Level.HEADERS
+        } else {
+            HttpLoggingInterceptor.Level.NONE
+        }
+    }
+
+    // Image turns push several hundred KB of base64 up the wire. On mobile
+    // data a 60 s write budget was tight enough that large attachments
+    // aborted mid-upload and surfaced as a generic failure, so the write
+    // timeout gets the most headroom. `callTimeout` bounds the whole
+    // exchange so a stalled socket can still never hang the turn forever.
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(120, TimeUnit.SECONDS)
+        .callTimeout(180, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .addInterceptor(loggingInterceptor)
         .build()
 

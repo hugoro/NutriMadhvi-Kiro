@@ -42,6 +42,12 @@ import java.time.format.DateTimeFormatter
  */
 internal object ProactivePromptBuilder {
 
+    /** [text] is the generated notification body; [model] is the Gemini
+     *  model id that actually produced it (whichever tier in [MODEL_CHAIN]
+     *  answered first), so the worker can log/surface which LLM was used —
+     *  see [ProactiveNudgeWorker]. */
+    data class Result(val text: String, val model: String)
+
     /** Fallback chain mirroring [com.example.data.remote.GeminiRepository.generateContentWithFallback]
      *  (`GeminiRepository.kt:341`). Each model has its own free-tier RPM
      *  bucket, so on a 429 we walk the chain instead of giving up — this is
@@ -69,7 +75,7 @@ internal object ProactivePromptBuilder {
         userName: String,
         shStepsByDate: Map<LocalDate, Long>,
         shDailyActivity: Map<LocalDate, ShDailyActivity>
-    ): String? {
+    ): Result? {
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") return null
 
@@ -145,9 +151,12 @@ internal object ProactivePromptBuilder {
                 is Trigger.ActivitySpike -> 1
                 else -> 2
             }
-            response?.let { stripQuestionsAndImperatives(it, maxSentences = maxSentences) }
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
+            response?.let { (rawText, model) ->
+                stripQuestionsAndImperatives(rawText, maxSentences = maxSentences)
+                    .trim()
+                    .takeIf { it.isNotEmpty() }
+                    ?.let { Result(text = it, model = model) }
+            }
         } catch (t: Throwable) {
             // Worker retries on null; never crash the worker process.
             android.util.Log.w(
@@ -169,7 +178,7 @@ internal object ProactivePromptBuilder {
     private suspend fun callWithFallback(
         apiKey: String,
         request: GeminiRequest
-    ): String? {
+    ): Pair<String, String>? {
         for (model in MODEL_CHAIN) {
             for (attempt in 1..2) {
                 try {
@@ -207,7 +216,7 @@ internal object ProactivePromptBuilder {
                         )
                         break
                     }
-                    return text
+                    return text to model
                 } catch (e: Exception) {
                     val is429 = (e is retrofit2.HttpException && e.code() == 429) ||
                         e.message?.contains("429") == true

@@ -257,6 +257,40 @@ class ChatOrchestrator(
         backgroundScope.cancel()
     }
 
+    /**
+     * 2026-08-31 — background chat reconciliation, mirroring the
+     * meal-analysis salvage philosophy (which chat lacked, per Hugo's
+     * report). Scans for sessions whose latest message is from the user
+     * with no assistant reply at all — orphaned sends that failed before
+     * a durable error row could be written (this predates the
+     * [persistDurableSendFailure] fix, or survived an app kill mid-flight)
+     * — and backfills a visible `isError` row so the conversation isn't
+     * silently stuck "open" forever. Call once, cheaply, from app/VM
+     * start; idempotent because once a session gets its backfilled row it
+     * is no longer "last message = user" on the next pass.
+     *
+     * [graceMs] keeps this from ever touching a session with a send that
+     * is still genuinely in-flight (e.g. app cold-started while a
+     * previous send's coroutine is still running in another process
+     * instance — extremely unlikely, but free to guard against).
+     */
+    suspend fun regularizeDanglingChatSessions(language: String, graceMs: Long = 120_000L) {
+        runCatching {
+            val cutoff = System.currentTimeMillis() - graceMs
+            val sessionIds = chatDao.getDanglingUserOnlySessionIds(cutoff)
+            if (sessionIds.isEmpty()) return@runCatching
+            val text = com.example.ui.tr("chat_error_stale", language)
+            sessionIds.forEach { sid ->
+                chatDao.insertMessage(
+                    ChatMessage(sessionId = sid, sender = "gemini", text = text, isError = true)
+                )
+            }
+            android.util.Log.i("CHAT_ORCH", "regularized ${sessionIds.size} dangling session(s)")
+        }.onFailure { e ->
+            android.util.Log.w("CHAT_ORCH", "dangling-session regularization failed: ${e.message}")
+        }
+    }
+
     /** Resolved-style entry point. Returns a cold [Flow] that the ViewModel
      *  collects in `viewModelScope.launch { handle(...).collect { ... } }`. */
     fun handle(
@@ -332,9 +366,9 @@ class ChatOrchestrator(
         // set) by updating `session` in memory so downstream reads use the
         // fresh copy without going back to Room.
         var session: ChatSession? = chatDao.getSessionById(sessionId)
-        if (session != null && session!!.title == "New Chat") {
+        if (session != null && session.title == "New Chat") {
             val shortTitle = if (text.length > 25) text.take(25) + "..." else text
-            val renamed = session!!.copy(title = shortTitle)
+            val renamed = session.copy(title = shortTitle)
             chatDao.updateSession(renamed)
             session = renamed
         }
@@ -577,7 +611,7 @@ class ChatOrchestrator(
         // fast (LLM only synthesises over pre-fetched data), so a second
         // call would be wasted quota. See ITOpsEA plan for the gate.
         val fastReplyDeferred: kotlinx.coroutines.Deferred<String?>? =
-            if (intent is ChatIntent.Reasoning) {
+            if (shouldStartFastReply(intent, imageBase64Stored)) {
                 android.util.Log.d("CHAT_TWO_TIER", "kickoff fast-tier for Reasoning intent")
                 backgroundScope.async {
                     val started = System.currentTimeMillis()
@@ -786,8 +820,19 @@ class ChatOrchestrator(
         val cumulativeChars = mutableListOf<Int>()
         var runningChars = 0
         // Iterate in reverse so we measure "last N turns fit in budget".
+        //
+        // `imageBase64` is a misnomer since the file-path migration: it now
+        // holds a ~80-char `file://` URI, not the bytes. Charging its raw
+        // length made a 9 MB photo look like 80 chars to the cap, so image-
+        // heavy sessions blew far past the real payload budget and every
+        // historical photo was re-uploaded in full on every turn. Charge a
+        // flat per-image estimate instead so the window rolls forward on
+        // image-heavy sessions the way it already does on text-heavy ones.
         for (m in dbMessages.asReversed()) {
-            runningChars += m.text.length + (m.imageBase64?.length ?: 0)
+            val imageCost = m.imageBase64
+                ?.let { com.example.ui.ChatImageStore.decode(it).size * IMAGE_CHAR_COST }
+                ?: 0
+            runningChars += m.text.length + imageCost
             cumulativeChars.add(runningChars)
         }
         // Find the largest suffix that fits BOTH caps.
@@ -1083,10 +1128,16 @@ class ChatOrchestrator(
         // resolves to null, no FastReply is ever emitted, and the
         // bubble goes straight from typing-dots to deep partial.
         var fastReplyEmitted = false
+        // Set by [onModelResolved] the moment any reply-producing path
+        // succeeds, so the final persisted message (and any durable
+        // failure row) can record which LLM actually answered / was being
+        // attempted. See [ChatMessage.analysisModel].
+        var resolvedModel: String? = null
         val replyText: String = if (streaming) {
             try {
                 streamReply(
                     modelToUse, apiKey, request, language,
+                    onModelResolved = { resolvedModel = it },
                     onPartial = { partial ->
                         if (!fastReplyEmitted) {
                             fastReplyEmitted = true
@@ -1145,8 +1196,12 @@ class ChatOrchestrator(
                 // from withTimeoutOrNull falls into the same `?: run` path as
                 // a nulled blockingReply, preserving the fast-tier fallback
                 // and Error emission.
-                kotlinx.coroutines.withTimeoutOrNull(30_000L) {
-                    blockingReply(modelToUse, apiKey, request, language)
+                // 2026-08-31 — cap widened for image turns via
+                // blockingFallbackTimeoutMs so the automatic model-cascade
+                // net actually gets to try before giving up (see constant
+                // doc comment).
+                kotlinx.coroutines.withTimeoutOrNull(blockingFallbackTimeoutMs(request.hasInlineData())) {
+                    blockingReply(modelToUse, apiKey, request, language, onModelResolved = { resolvedModel = it })
                 }
                     ?: run {
                         // 2026-07-06 (Frente H v2) — deep failed completely.
@@ -1174,6 +1229,20 @@ class ChatOrchestrator(
                             emit(HandleEvent.Done(fastFallback, insertedMessageId = fallbackId))
                             return@flow
                         }
+                        // 2026-08-31 — every automatic recovery tier (deep
+                        // stream, blocking 5-model cascade, fast-tier race)
+                        // is now exhausted. Before this fix the turn ended
+                        // here with ONLY a transient HandleEvent.Error: if
+                        // the app was backgrounded/killed before the user
+                        // saw the in-memory retry card, the conversation
+                        // was left with a dangling user message and NO
+                        // record a reply was ever attempted (Hugo found
+                        // exactly this — session with a photo+text send and
+                        // zero assistant rows, weeks old). Persist a durable
+                        // error row, mirroring the existing API-key-missing
+                        // path above, so the failure — and the retry
+                        // affordance — survives process death.
+                        persistDurableSendFailure(sessionId, t, language, attemptedModel = modelToUse)
                         emit(HandleEvent.Error(t))
                         return@flow
                     }
@@ -1183,8 +1252,8 @@ class ChatOrchestrator(
             // above. Non-streaming callers pay the full model-cascade cost
             // sequentially, so a 30s ceiling here is strictly a floor for
             // the fast-tier fallback + Error branch.
-            kotlinx.coroutines.withTimeoutOrNull(30_000L) {
-                blockingReply(modelToUse, apiKey, request, language)
+            kotlinx.coroutines.withTimeoutOrNull(blockingFallbackTimeoutMs(request.hasInlineData())) {
+                blockingReply(modelToUse, apiKey, request, language, onModelResolved = { resolvedModel = it })
             }
                 ?: run {
                     // 2026-07-06 (Frente H v2) — same fallback for the
@@ -1204,26 +1273,28 @@ class ChatOrchestrator(
                                 sessionId = sessionId,
                                 sender = "gemini",
                                 text = fastFallback,
+                                analysisModel = "gemini-3.1-flash-lite"
                             )
                         )
                         emit(HandleEvent.Done(fastFallback, insertedMessageId = fallbackId))
                         return@flow
                     }
-                    emit(HandleEvent.Error(IllegalStateException("LLM call failed")))
+                    val cause = IllegalStateException("LLM call failed")
+                    persistDurableSendFailure(sessionId, cause, language, attemptedModel = modelToUse)
+                    emit(HandleEvent.Error(cause))
                     return@flow
                 }
         }
 
         // --- 7. Optional QUERY_DATA fallback round-trip (paridade with old) ---
         val firstParse = ActionProposalParser.parse(replyText)
-        val finalReplyText: String = if (firstParse.queryDataRequest != null) {
+        val finalReplyText: String = firstParse.queryDataRequest?.let { qdr ->
             emit(HandleEvent.Phase(com.example.ui.tr("querying_records", language)))
             android.util.Log.d(
                 "CHAT_QUERY",
-                "fallback type=${firstParse.queryDataRequest!!.type} " +
-                    "from=${firstParse.queryDataRequest!!.fromDate} to=${firstParse.queryDataRequest!!.toDate}"
+                "fallback type=${qdr.type} from=${qdr.fromDate} to=${qdr.toDate}"
             )
-            val resultBlock = runQueryAndFormat(firstParse.queryDataRequest!!)
+            val resultBlock = runQueryAndFormat(qdr)
             val followupContents = contents +
                 Content(role = "model", parts = listOf(Part(text = replyText))) +
                 Content(role = "user", parts = listOf(Part(text = "[QUERY_DATA_RESULT]\n$resultBlock")))
@@ -1241,10 +1312,10 @@ class ChatOrchestrator(
             // fall back to the pre-QUERY_DATA replyText — the raw tag
             // just leaks through, but the user sees something.
             val followup = kotlinx.coroutines.withTimeoutOrNull(30_000L) {
-                blockingReply(modelToUse, apiKey, followupRequest, language)
+                blockingReply(modelToUse, apiKey, followupRequest, language, onModelResolved = { resolvedModel = it })
             }
             followup ?: replyText
-        } else replyText
+        } ?: replyText
 
         // --- 8. Parse, persist cleaned, emit Done ---
         val finalParse = ActionProposalParser.parse(finalReplyText)
@@ -1265,7 +1336,13 @@ class ChatOrchestrator(
                 // Persist the RAW final text so the existing
                 // ingestAssistantMessage flow in the ViewModel can re-derive
                 // proposals on the next collect — same shape as today.
-                text = finalReplyText
+                text = finalReplyText,
+                // Whichever model in the fleet actually answered (may differ
+                // from modelToUse if the primary quota'd out and a fallback
+                // tier responded). Falls back to modelToUse in the rare case
+                // resolvedModel wasn't set (e.g. the QUERY_DATA follow-up
+                // path reused the earlier text without a fresh model call).
+                analysisModel = resolvedModel ?: modelToUse
             )
         )
         val elapsed = System.currentTimeMillis() - started
@@ -1517,11 +1594,13 @@ class ChatOrchestrator(
 
         emit(HandleEvent.Phase("thinking_proactive"))
 
+        var proactiveResolvedModel: String? = null
         val replyText = blockingReply(
             model = "gemini-3.5-flash",
             apiKey = apiKey,
             request = request,
-            language = language
+            language = language,
+            onModelResolved = { proactiveResolvedModel = it }
         )
 
         if (replyText.isNullOrBlank()) {
@@ -1544,7 +1623,8 @@ class ChatOrchestrator(
             ChatMessage(
                 sessionId = sessionId,
                 sender = "gemini",
-                text = cleaned
+                text = cleaned,
+                analysisModel = proactiveResolvedModel ?: "gemini-3.5-flash"
             )
         )
         chatDao.touchSession(sessionId)
@@ -1636,6 +1716,9 @@ class ChatOrchestrator(
         val error: Throwable? = null,
     )
 
+    private fun GeminiRequest.hasInlineData(): Boolean =
+        contents.any { content -> content.parts.any { it.inlineData != null } }
+
     private suspend fun collectStreamAttempt(
         modelName: String,
         apiKey: String,
@@ -1644,13 +1727,14 @@ class ChatOrchestrator(
         onFirstToken: suspend () -> Unit,
         logLabel: String = modelName,
     ): StreamAttemptResult {
+        val ttftTimeoutMs = streamTtftTimeoutMs(request.hasInlineData())
         val result = GeminiStreamWatchdogCollector.collect(
             model = modelName,
             apiKey = apiKey,
             request = request,
             logTag = "CHAT_STREAM",
             spec = GeminiStreamWatchdogCollector.Spec(
-                ttftTimeoutMs = TTFT_TIMEOUT_MS,
+                ttftTimeoutMs = ttftTimeoutMs,
                 idleTimeoutMs = STREAM_IDLE_TIMEOUT_MS,
                 tickMs = STREAM_WATCHDOG_TICK_MS,
                 ttftReason = StreamAttemptWatchdog.REASON_TTFT,
@@ -1661,7 +1745,7 @@ class ChatOrchestrator(
             onTimeoutLog = { reason ->
                 when (reason) {
                     StreamAttemptWatchdog.REASON_TTFT ->
-                        "$logLabel TTFT >${TTFT_TIMEOUT_MS}ms, cancelling"
+                        "$logLabel TTFT >${ttftTimeoutMs}ms, cancelling"
                     StreamAttemptWatchdog.REASON_IDLE ->
                         "$logLabel idle >${STREAM_IDLE_TIMEOUT_MS}ms after first token, cancelling"
                     else -> "$logLabel watchdog timeout, cancelling"
@@ -1716,23 +1800,18 @@ class ChatOrchestrator(
          *  model. [onCacheRejected] is called so the orchestrator can
          *  clear the DB column and force re-creation on the next turn. */
         fullSystemInstructionForCacheFallback: Content? = null,
-        onCacheRejected: suspend (cacheName: String) -> Unit = {}
+        onCacheRejected: suspend (cacheName: String) -> Unit = {},
+        /** Called with the model id once a reply is actually obtained, so
+         *  the caller can persist which LLM produced this turn (see
+         *  [ChatMessage.analysisModel]). Not called on total failure. */
+        onModelResolved: suspend (String) -> Unit = {}
     ): String {
         // Same model fleet as blockingReply, but only ONE attempt per model
         // on the streaming side because each is multi-second; iterating with
         // retries would push perceived latency past the user's patience. If
         // every model 503s, we surface the error so the caller can fall back
-        // 2026-08-16 — chat cascade. 3.7-flash is text-safe but returns HTTP
-        // 503 on VISION input, so when the request carries an image (inlineData
-        // part) it is EXCLUDED everywhere — including from the `model` seed,
-        // in case a session persisted 3.7-flash. Text-only turns keep it.
-        val hasImage = request.contents.any { c -> c.parts.any { it.inlineData != null } }
-        val models = if (hasImage) {
-            listOf(model, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite")
-                .filterNot { it == "gemini-3.7-flash" }
-        } else {
-            listOf(model, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite")
-        }.distinct()
+        // to non-streaming (which has its own retry loop).
+        val models = streamModelFleet(model, request.hasInlineData())
         var lastError: Throwable? = null
         // 2026-07-06 (Frente H v2) — one-shot flag so `onFirstToken` fires
         // exactly once across all fleet-loop retries and sub-branches
@@ -1801,6 +1880,7 @@ class ChatOrchestrator(
             if (accumulated.isNotBlank()) {
                 android.util.Log.d("CHAT_STREAM", "stream OK via $modelName (len=${accumulated.length})")
                 circuitBreaker.recordSuccess(modelName)
+                onModelResolved(modelName)
                 return@withTimeout accumulated
             }
             // Fix 9 fallback: API rejected the cachedContent reference
@@ -1820,12 +1900,12 @@ class ChatOrchestrator(
                         errMsgEarly.contains("cachedContent", ignoreCase = true) ||
                         (errMsgEarly.contains("HTTP 400", ignoreCase = true) &&
                             errMsgEarly.contains("cache", ignoreCase = true)))
-                if (looksLikeCacheRejected) {
+                if (looksLikeCacheRejected && cacheName != null) {
                     android.util.Log.w(
                         "CHAT_CACHE",
                         "$modelName rejected $cacheName, falling back to full systemInstruction"
                     )
-                    onCacheRejected(cacheName!!)
+                    onCacheRejected(cacheName)
                     effectiveRequest = effectiveRequest.copy(
                         cachedContent = null,
                         systemInstruction = fullSystemInstructionForCacheFallback
@@ -1848,6 +1928,7 @@ class ChatOrchestrator(
                             "stream OK via $modelName after dropping cachedContent (len=${accumulatedC.length})"
                         )
                         circuitBreaker.recordSuccess(modelName)
+                        onModelResolved(modelName)
                         return@withTimeout accumulatedC
                     }
                     streamError = streamErrorC ?: streamError
@@ -1894,6 +1975,7 @@ class ChatOrchestrator(
                         "stream OK via $modelName after dropping thinkingConfig (len=${accumulated2.length})"
                     )
                     circuitBreaker.recordSuccess(modelName)
+                    onModelResolved(modelName)
                     return@withTimeout accumulated2
                 }
                 streamError = streamError2 ?: streamError
@@ -2002,12 +2084,53 @@ class ChatOrchestrator(
         }
     }
 
+    /**
+     * 2026-08-31 — persist a durable, visible record of a totally-failed
+     * send. Mirrors the pre-existing API-key-missing path (top of
+     * [handle]) which already inserts an `isError` assistant row instead
+     * of relying solely on the transient in-memory error card. Without
+     * this, a send that exhausts streaming + the blocking model cascade
+     * left the conversation with a dangling user message and no trace a
+     * reply was ever attempted — invisible once the app backgrounds or
+     * the user navigates away before the retry card is seen. Never
+     * deletes or edits existing rows; only appends.
+     */
+    private suspend fun persistDurableSendFailure(
+        sessionId: Long,
+        cause: Throwable,
+        language: String,
+        /** Model whose whole fleet was exhausted, so the persisted error row
+         *  names it instead of leaving the user to guess which LLM was
+         *  involved. Null when the failure happened before any model was
+         *  even attempted (e.g. request-building threw). */
+        attemptedModel: String? = null
+    ) {
+        runCatching {
+            val text = com.example.ui.tr(chatErrorKeyFor(cause), language)
+            chatDao.insertMessage(
+                ChatMessage(
+                    sessionId = sessionId,
+                    sender = "gemini",
+                    text = text,
+                    isError = true,
+                    analysisModel = attemptedModel
+                )
+            )
+        }.onFailure { e ->
+            android.util.Log.w("CHAT_ORCH", "failed to persist durable send-failure row: ${e.message}")
+        }
+    }
+
     private suspend fun blockingReply(
         model: String,
         apiKey: String,
         request: GeminiRequest,
-        @Suppress("UNUSED_PARAMETER") language: String
-    ): String? {
+        @Suppress("UNUSED_PARAMETER") language: String,
+        /** Called with the model id once a reply is actually obtained, so
+         *  the caller can persist which LLM produced this turn (see
+         *  [ChatMessage.analysisModel]). Not called on total failure. */
+        onModelResolved: suspend (String) -> Unit = {}
+    ): String? = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
         // Mirror the legacy GeminiRepository.generateContentWithFallback:
         // a single 503/429 on the streaming endpoint should NOT lose us the
         // turn — the model fleet has cheaper fallbacks that usually answer
@@ -2026,16 +2149,14 @@ class ChatOrchestrator(
         // saturated and we jump to the next one immediately. Other
         // error codes (non-429) still hit the original `break` path
         // unchanged.
-        // 2026-08-16 — vision-safe cascade: drop 3.7-flash (503 on images)
-        // when the request carries an image, same as streamReply. Filter also
-        // covers the `model` seed in case a session persisted 3.7-flash.
-        val hasImage = request.contents.any { c -> c.parts.any { it.inlineData != null } }
-        val models = if (hasImage) {
-            listOf(model, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite")
-                .filterNot { it == "gemini-3.7-flash" }
-        } else {
-            listOf(model, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite")
-        }.distinct()
+        // 2026-08-31 — use the same fleet selection as streamReply
+        // (streamModelFleet) instead of a separately-maintained list, so the
+        // blocking last-resort path always matches the field-tuned,
+        // vision-safe cascade (3.7-flash excluded on image requests) and the
+        // image-turn attempt cap. Previously this list had drifted from
+        // streamReply's, silently reverting the fleet whenever this path
+        // fired.
+        val models = streamModelFleet(model, request.hasInlineData())
         for ((index, modelName) in models.withIndex()) {
             val maxAttempts = if (index == 0) 2 else 1
             for (attempt in 1..maxAttempts) {
@@ -2066,7 +2187,8 @@ class ChatOrchestrator(
                     val text = resp.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
                     if (!text.isNullOrBlank()) {
                         android.util.Log.d("CHAT_ORCH", "blocking reply via $modelName (attempt $attempt)")
-                        return text
+                        onModelResolved(modelName)
+                        return@withContext text
                     }
                     break
                 } catch (e: Exception) {
@@ -2085,7 +2207,7 @@ class ChatOrchestrator(
             }
         }
         android.util.Log.e("CHAT_ORCH", "blocking reply: all models exhausted")
-        return null
+        null
     }
 
     /**
@@ -2497,12 +2619,30 @@ class ChatOrchestrator(
                     return@mapIndexedNotNull null
                 }
                 val mime = mimeFromPath(path)
-                val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                // Oversized originals (12-MP HEIC/JPEG straight off the Pixel
+                // camera) are the dominant cause of failed image sends: base64
+                // inflates them by ~33%, so a 9 MB photo becomes ~12 MB of JSON
+                // on a single request. That reliably trips request-size limits
+                // and read timeouts on mobile data — and when several such
+                // photos sit in the session history they are ALL re-uploaded on
+                // every subsequent turn, so the failure becomes permanent for
+                // that session rather than transient.
+                //
+                // Gemini downsamples images to ~768-1024px tiles internally, so
+                // sending more pixels buys no accuracy. Re-encode anything above
+                // the threshold to a bounded JPEG. The file on disk is never
+                // modified — only the in-flight copy is shrunk.
+                val (uploadBytes, uploadMime) = if (bytes.size > IMAGE_UPLOAD_MAX_BYTES) {
+                    downscaleForUpload(path) ?: (bytes to mime)
+                } else {
+                    bytes to mime
+                }
+                val b64 = android.util.Base64.encodeToString(uploadBytes, android.util.Base64.NO_WRAP)
                 android.util.Log.d(
                     "CHAT_IMG",
-                    "  [$i] OK bytes=${bytes.size} b64.len=${b64.length} mime=$mime"
+                    "  [$i] OK bytes=${bytes.size} upload=${uploadBytes.size} b64.len=${b64.length} mime=$uploadMime"
                 )
-                ResolvedImage(b64, mime)
+                ResolvedImage(b64, uploadMime)
             } else {
                 // Legacy raw base64 row from before the file-path migration.
                 // No MIME information is recoverable; JPEG was the previous
@@ -2514,6 +2654,52 @@ class ChatOrchestrator(
                 ResolvedImage(entry, "image/jpeg")
             }
         }
+    }
+
+    /** Budget an attachment occupies in the rolling-window char cap. A
+     *  bounded upload is typically 1-3 MB; charging 8000 "chars"
+     *  keeps roughly four images inside the 32k window, which is what a
+     *  realistic meal-comparison turn needs, while still letting the window
+     *  roll forward on sessions with a long photo history. */
+    private val IMAGE_CHAR_COST = 8_000
+
+    /** Preserve already-reasonable files byte-for-byte; only large camera
+     *  originals are re-encoded for transport. */
+    private val IMAGE_UPLOAD_MAX_BYTES = 3_000_000
+
+    /** Retain enough detail for nutrition labels and packaging OCR while
+     *  avoiding raw 12/48-MP uploads. */
+    private val IMAGE_UPLOAD_MAX_DIMENSION = 2048
+
+    /**
+     * Decode [path] downsampled and re-encode it as a bounded JPEG for upload.
+     * Returns null when the file cannot be decoded (corrupt, or an exotic
+     * format the platform decoder rejects) so the caller can fall back to
+     * sending the original bytes rather than dropping the image entirely.
+     *
+     * EXIF orientation is applied during the re-encode: the rotation tag does
+     * not survive into the JPEG we synthesise, so without this a landscape
+     * photo would reach the model sideways.
+     */
+    private fun downscaleForUpload(path: String): Pair<ByteArray, String>? = try {
+        val bmp = com.example.ui.ChatImageStore.decodeBitmapWithOrientation(
+            path,
+            maxDimension = IMAGE_UPLOAD_MAX_DIMENSION
+        )
+        if (bmp == null) {
+            android.util.Log.w("CHAT_IMG", "downscale: decode failed for $path — sending original")
+            null
+        } else {
+            val out = java.io.ByteArrayOutputStream()
+            bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, out)
+            bmp.recycle()
+            out.toByteArray() to "image/jpeg"
+        }
+    } catch (t: Throwable) {
+        // OutOfMemoryError included: falling back to the original bytes is
+        // strictly better than losing the user's photo.
+        android.util.Log.w("CHAT_IMG", "downscale failed: ${t.javaClass.simpleName}: ${t.message}")
+        null
     }
 
     /** Derive Gemini's `inlineData.mimeType` from the on-disk file extension.
@@ -2599,6 +2785,68 @@ class ChatOrchestrator(
          *  a legitimately slow route, bump this value here — the fleet
          *  loop will keep trying the alternate models regardless. */
         internal const val TTFT_TIMEOUT_MS: Long = 8_000L
+
+        internal const val IMAGE_TTFT_TIMEOUT_MS: Long = 20_000L
+        internal const val IMAGE_MODEL_ATTEMPT_LIMIT: Int = 2
+
+        internal fun streamTtftTimeoutMs(hasInlineData: Boolean): Long =
+            if (hasInlineData) IMAGE_TTFT_TIMEOUT_MS else TTFT_TIMEOUT_MS
+
+        /** 2026-08-31 — the last-resort blocking fallback (used both when
+         *  streaming throws and, rarely, when streaming is disabled
+         *  outright) cascades up to 5 models sequentially. A flat 30s cap
+         *  was tuned for text-only turns; live Pixel testing showed image
+         *  (vision) requests routinely need longer than that just for a
+         *  SINGLE model's full non-streaming round-trip, so the automatic
+         *  retry net was expiring before it ever got a real chance —
+         *  every image-turn failure fell straight through to the error
+         *  card instead of being recovered silently. Image turns now get
+         *  60s, mirroring the extra headroom already given to
+         *  [IMAGE_TTFT_TIMEOUT_MS] on the streaming side. */
+        internal const val BLOCKING_FALLBACK_TIMEOUT_MS: Long = 30_000L
+        internal const val IMAGE_BLOCKING_FALLBACK_TIMEOUT_MS: Long = 60_000L
+
+        internal fun blockingFallbackTimeoutMs(hasInlineData: Boolean): Long =
+            if (hasInlineData) IMAGE_BLOCKING_FALLBACK_TIMEOUT_MS else BLOCKING_FALLBACK_TIMEOUT_MS
+
+        /** Same throwable → i18n-key classification the ViewModel uses for
+         *  the transient error card, shared here so the durable DB row
+         *  persisted on total failure (see [ChatOrchestrator.handle]) reads
+         *  the same message the user would otherwise only see in-memory. */
+        internal fun chatErrorKeyFor(t: Throwable?): String {
+            val msg = t?.message.orEmpty()
+            return when {
+                t is java.net.UnknownHostException ||
+                    t is java.net.ConnectException -> "chat_error_offline"
+                t is java.net.SocketTimeoutException ||
+                    msg.contains("timeout", ignoreCase = true) -> "chat_error_timeout"
+                msg.contains("429") ||
+                    msg.contains("quota", ignoreCase = true) -> "chat_error_busy"
+                else -> "chat_error_generic"
+            }
+        }
+
+        internal fun shouldStartFastReply(intent: ChatIntent, imageStored: String?): Boolean =
+            intent is ChatIntent.Reasoning && imageStored.isNullOrBlank()
+
+        internal fun streamModelFleet(model: String, hasInlineData: Boolean): List<String> {
+            // 2026-08-16 — chat cascade (field-tuned fleet). 3.7-flash is
+            // text-safe but returns HTTP 503 on VISION input, so it is
+            // EXCLUDED everywhere — including the `model` seed, in case a
+            // session persisted 3.7-flash — when the request carries an
+            // image. Text-only turns keep it in the cascade.
+            val models = if (hasInlineData) {
+                listOf(model, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite")
+                    .filterNot { it == "gemini-3.7-flash" }
+            } else {
+                listOf(model, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite")
+            }.distinct()
+            // 2026-08-31 — cap image turns to IMAGE_MODEL_ATTEMPT_LIMIT so a
+            // vision request doesn't cascade through the whole fleet (each
+            // attempt is a full paid round-trip); text turns keep the full
+            // cascade since those calls are cheap and fast.
+            return if (hasInlineData) models.take(IMAGE_MODEL_ATTEMPT_LIMIT) else models
+        }
 
         /** 2026-07-09 — once a stream has produced its first token, keep
          *  waiting only while chunks continue landing within this gap.

@@ -467,6 +467,7 @@ class MainActivity : ComponentActivity() {
                     sender = "gemini",
                     text = pending.chatBubbleText,
                     timestamp = pending.deliveredAtMs,
+                    analysisModel = pending.modelName,
                 )
             )
             db.chatDao.touchSession(sessionId, pending.deliveredAtMs)

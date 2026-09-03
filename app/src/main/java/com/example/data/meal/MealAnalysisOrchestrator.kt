@@ -4,6 +4,13 @@ import com.example.BuildConfig
 import com.example.data.local.ActivityEntry
 import com.example.data.local.FoodEntry
 import com.example.data.local.MealCategory
+import com.example.data.meal.ensemble.EnsembleAnalysisOrchestrator
+import com.example.data.meal.ensemble.EnsembleConfig
+import com.example.data.meal.ensemble.EnsembleMode
+import com.example.data.meal.ensemble.EnsemblePrompts
+import com.example.data.meal.ensemble.FoodVisionRequest
+import com.example.data.meal.ensemble.GeminiFoodVisionProvider
+import com.example.data.meal.ensemble.createQwenGroqProvider
 import com.example.data.remote.ActivityAnalysisResult
 import com.example.data.remote.Content
 import com.example.data.remote.FoodAnalysisResult
@@ -193,6 +200,20 @@ class MealAnalysisOrchestrator(
             )
         )
 
+        if (tryEnsembleAnalysis(
+                collector = this,
+                request = request,
+                base64Image = base64Image,
+                mimeType = mimeType,
+                promptHint = promptHint,
+                habitsBlock = habitsBlock,
+                offeredHabitIds = offeredIds,
+                language = language,
+            )
+        ) {
+            return@flow
+        }
+
         consumeStream(
             collector = this,
             request = request,
@@ -203,6 +224,104 @@ class MealAnalysisOrchestrator(
             allowEscalation = true
         )
     }
+
+    /**
+     * Confidence-gated multi-model analysis, inserted at the *provider
+     * decision layer* only.
+     *
+     * Returns true when the ensemble produced a result and already emitted
+     * [MealAnalysisEvent.Done]; the caller then skips the Gemini streaming
+     * path entirely. Returns false whenever the ensemble is disabled,
+     * unconfigured, or failed to produce anything usable — in which case the
+     * caller proceeds with the existing behaviour untouched.
+     *
+     * Everything downstream of the decision is unchanged: the winning result
+     * still flows through [postProcessResult] and the existing nutrition
+     * pipeline, so the models never own the final macros.
+     */
+    private suspend fun tryEnsembleAnalysis(
+        collector: kotlinx.coroutines.flow.FlowCollector<MealAnalysisEvent>,
+        request: GeminiRequest,
+        base64Image: String?,
+        mimeType: String,
+        promptHint: String?,
+        habitsBlock: String,
+        offeredHabitIds: Set<Long>,
+        language: String,
+    ): Boolean {
+        if (!EnsembleConfig.isEnsembleActive) return false
+        // Ensemble routing is only meaningful when there is an image to get a
+        // second opinion on; text-only re-analysis keeps its existing path.
+        if (base64Image.isNullOrBlank()) return false
+
+        val groqKey = EnsembleConfig.groqApiKey
+        if (groqKey.isBlank()) return false
+
+        val visionRequest = FoodVisionRequest(
+            base64Image = base64Image,
+            mimeType = mimeType,
+            promptHint = promptHint,
+            language = language,
+            habitsBlock = habitsBlock,
+            offeredHabitIds = offeredHabitIds,
+        )
+
+        val qwen = createQwenGroqProvider(apiKey = groqKey) { req ->
+            buildAnalysisPrompt(
+                promptHint = req.promptHint,
+                language = req.language,
+                habitsBlock = req.habitsBlock.orEmpty(),
+            ) + EnsemblePrompts.CANONICAL_NAMING_RULES
+        }
+
+        // Reuses the repository's existing blocking Gemini path (5-model
+        // fallback + retries) rather than a second implementation, so
+        // "Gemini as challenger" behaves exactly like Gemini does today.
+        val gemini = GeminiFoodVisionProvider(
+            hasApiKey = EnsembleConfig.geminiApiKey.isNotBlank(),
+            call = { repository.runFoodImageBlockingForRequest(request = request, language = language) },
+        )
+
+        val ensemble = EnsembleAnalysisOrchestrator(
+            primary = qwen,
+            challenger = gemini,
+            adjudicator = if (EnsembleConfig.mode == EnsembleMode.QWEN_ENSEMBLE) qwen else null,
+            policy = EnsembleConfig.policy,
+        )
+
+        collector.emit(MealAnalysisEvent.Phase(PHASE_ANALYZING))
+        val outcome = runCatching { ensemble.analyze(visionRequest) }
+            .onFailure { e ->
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                android.util.Log.w("MealEnsemble", "ensemble threw; falling back to Gemini", e)
+            }
+            .getOrNull() ?: return false
+
+        android.util.Log.d(
+            "MealEnsemble",
+            "path=${outcome.decisionPath.joinToString(">")} winner=${outcome.evidence.provider} " +
+                "calls=${outcome.providerCallCount} latency=${outcome.evidence.latencyMs}ms"
+        )
+
+        val winner = outcome.evidence.result
+        repository.markHabitsApplied(winner.appliedHabitIds)
+        collector.emit(MealAnalysisEvent.Phase(PHASE_FINALIZING))
+        collector.emit(MealAnalysisEvent.Done(postProcessResult(collector, winner)))
+        return true
+    }
+
+    /**
+     * Post-processing seam applied to an ensemble winner before it is emitted.
+     *
+     * Routes the ensemble winner through the same INSA nutrition-enrichment
+     * and plausibility-gating stage the Gemini streaming path applies via
+     * [enrichResult], keeping both analyzer paths symmetric so ensemble meals
+     * get local-cluster macros too and the models never own the final numbers.
+     */
+    private suspend fun postProcessResult(
+        collector: kotlinx.coroutines.flow.FlowCollector<MealAnalysisEvent>,
+        result: FoodAnalysisResult,
+    ): FoodAnalysisResult = enrichResult(collector, result)
 
     /**
      * Streaming re-analysis from an edited summary. Mirror of

@@ -82,6 +82,27 @@ interface ChatDao {
     @Query("SELECT imageBase64 FROM chat_messages WHERE imageBase64 IS NOT NULL")
     suspend fun allImagePayloads(): List<String>
 
+    /**
+     * 2026-08-31 — background chat reconciliation (mirrors the meal-analysis
+     * salvage philosophy, which chat lacked). Finds sessions whose most
+     * recent message is from the user with NO assistant reply at all —
+     * i.e. a send that failed before a durable error row could be
+     * persisted (pre-fix crashes, app kills mid-request, etc). [cutoffTs]
+     * guards against flagging a session with a send still genuinely
+     * in-flight when the reconciliation pass runs on app start.
+     */
+    @Query(
+        """
+        SELECT cm.sessionId FROM chat_messages cm
+        WHERE cm.timestamp = (
+            SELECT MAX(timestamp) FROM chat_messages WHERE sessionId = cm.sessionId
+        )
+        AND cm.sender = 'user'
+        AND cm.timestamp < :cutoffTs
+        """
+    )
+    suspend fun getDanglingUserOnlySessionIds(cutoffTs: Long): List<Long>
+
     /** Phase A refinement: bump the session's lastMessageAt so it floats to
      *  the top of the resume list. Called from the repo on every user-side
      *  send. Cheap (single-row UPDATE on a primary key). */

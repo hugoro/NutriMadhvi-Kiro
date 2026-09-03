@@ -590,7 +590,11 @@ class ChatViewModel(
                 ?.coerceAtLeast(0.0),
             saturatedFatG = result.saturatedFatG
                 ?.coerceAtMost(result.fat ?: 0.0)
-                ?.coerceAtLeast(0.0)
+                ?.coerceAtLeast(0.0),
+            // Persist which LLM produced this analysis so the badge in
+            // ConfidenceChip survives app restarts (result.analysisModel
+            // only lived in-memory before).
+            analysisModel = result.analysisModel
         )
         _pendingFoodSession.value = when {
             request.replaceIndex != null -> {
@@ -742,7 +746,8 @@ class ChatViewModel(
                                 ?.coerceAtLeast(0.0),
                             saturatedFatG = result.saturatedFatG
                                 ?.coerceAtMost(result.fat ?: 0.0)
-                                ?.coerceAtLeast(0.0)
+                                ?.coerceAtLeast(0.0),
+                            analysisModel = result.analysisModel
                         )
                     }.onFailure { exception ->
                         val msg = exception.message ?: tr("Unknown analysis error", _userProfile.value.language)
@@ -1199,6 +1204,7 @@ class ChatViewModel(
             // the LLM when it produced the card.
             val messages = activeMessages.value
             val anchorIdx = messages.indexOfFirst { it.id == messageId }
+            val proposalModel = messages.getOrNull(anchorIdx)?.analysisModel
             val searchTo = if (anchorIdx >= 0) anchorIdx else messages.lastIndex
             var sourcePath: String? = null
             for (i in searchTo downTo 0) {
@@ -1245,8 +1251,12 @@ class ChatViewModel(
                     groupId = sid?.let { "chat:$it" },
                     // Already clamped in ActionProposalParser to [0, carbs] / [0, fat].
                     freeSugarsG = item.proposal.freeSugarsG,
-                    saturatedFatG = item.proposal.saturatedFatG
-                ).appendEditLog(FoodEditType.ADDED)
+                    saturatedFatG = item.proposal.saturatedFatG,
+                    // The macros here were produced by whichever model wrote the
+                    // proposal card, so the meal inherits that message's model
+                    // rather than showing no attribution at all.
+                    analysisModel = proposalModel
+                ).appendEditLog(FoodEditType.ADDED, proposalModel)
             )
             addReceipt(messageId, ProposalKind.MEAL, ProposalOutcome.CONFIRMED, item.proposal.name)
             removeMealProposal(messageId, item)
@@ -1703,37 +1713,62 @@ class ChatViewModel(
                             }
                         }
                         val result = streamedResult
-                            ?: throw IllegalStateException(
-                                tr(streamErrorKey ?: "analysis_failed_retry", _userProfile.value.language)
+                        if (result == null) {
+                            // 2026-09-03 — a re-analysis failure here used to
+                            // throw and abort the ENTIRE save, so the user's
+                            // manually-edited summary (and the whole session)
+                            // was silently lost even though the original
+                            // AI-analysed macros were still perfectly valid.
+                            // Instead: log it, surface a non-blocking notice,
+                            // and fall through to save `withGroup` as-is (the
+                            // edited text, previous macros) so the user never
+                            // loses their entry to a transient network blip.
+                            android.util.Log.w(
+                                "MealSave",
+                                "reanalysis failed key=$streamErrorKey — saving without updated macros"
                             )
-                        mealOrchestrator
-                            .mergeReanalysis(withGroup, result, withGroup.fullSummary)
-                            .copy(
-                                // Manual mealCategory always wins — the user's pick from the edit
-                                // dialog must never be overwritten by Gemini's classification of the
-                                // summary text. ([[user-choice-wins-after-llm-reanalysis]])
-                                mealCategory = withGroup.mealCategory,
-                                // Preserve the groupId that the UI already settled on.
-                                groupId = withGroup.groupId,
-                                // Use the *actually-analysed* summary as the next baseline so the
-                                // re-analysis branch only fires when the user truly edits the
-                                // summary again.
-                                lastAiAnalyzedSummary = result.fullSummary ?: withGroup.fullSummary
-                            )
+                            _oneShotSnack.tryEmit("snack_reanalysis_failed_saved_anyway")
+                            withGroup
+                        } else {
+                            mealOrchestrator
+                                .mergeReanalysis(withGroup, result, withGroup.fullSummary)
+                                .copy(
+                                    // Manual mealCategory always wins — the user's pick from the edit
+                                    // dialog must never be overwritten by Gemini's classification of the
+                                    // summary text. ([[user-choice-wins-after-llm-reanalysis]])
+                                    mealCategory = withGroup.mealCategory,
+                                    // Preserve the groupId that the UI already settled on.
+                                    groupId = withGroup.groupId,
+                                    // Use the *actually-analysed* summary as the next baseline so the
+                                    // re-analysis branch only fires when the user truly edits the
+                                    // summary again.
+                                    lastAiAnalyzedSummary = result.fullSummary ?: withGroup.fullSummary
+                                )
+                        }
                     } else {
                         withGroup
                     }
                     val saved = if (finalEntry.id != 0L) {
-                        val logType = if (needsReanalysis)
+                        // AUTO when the macros came back from a fresh re-analysis,
+                        // MANUAL when the user's own edit is all that changed.
+                        val reanalysed = finalEntry.analysisModel != null &&
+                            finalEntry.analysisModel != withGroup.analysisModel
+                        val logType = if (reanalysed)
                             FoodEditType.AUTO
                         else
                             FoodEditType.MANUAL
-                        val withLog = finalEntry.appendEditLog(logType)
+                        val withLog = finalEntry.appendEditLog(
+                            type = logType,
+                            model = if (reanalysed) finalEntry.analysisModel else null
+                        )
                         android.util.Log.i("EditLog", "update id=${finalEntry.id} type=$logType log=${withLog.editLogJson?.take(60)}")
                         repository.updateFood(withLog)
                         withLog
                     } else {
-                        val withLog = finalEntry.appendEditLog(FoodEditType.ADDED)
+                        val withLog = finalEntry.appendEditLog(
+                            type = FoodEditType.ADDED,
+                            model = finalEntry.analysisModel
+                        )
                         android.util.Log.i("EditLog", "insert id=0 log=${withLog.editLogJson?.take(60)}")
                         val newId = repository.insertFood(withLog)
                         withLog.copy(id = newId)
@@ -1813,11 +1848,20 @@ class ChatViewModel(
                                 streamErrorKey = event.messageKey
                         }
                     }
-                    val rows = streamedRows
-                        ?: throw IllegalStateException(
-                            tr(streamErrorKey ?: "analysis_failed_retry", _userProfile.value.language)
+                    // 2026-09-03 — same fix as confirmAndSaveFoodEntry: don't
+                    // let a transient re-analysis failure abort the whole
+                    // save. Fall back to the previous rows (with the user's
+                    // edited summary applied) instead of throwing.
+                    if (streamedRows == null) {
+                        android.util.Log.w(
+                            "MealSave",
+                            "activity reanalysis failed key=$streamErrorKey — saving without updated data"
                         )
-                    rows.map { it.copy(lastAiAnalyzedSummary = head.fullSummary) }
+                        _oneShotSnack.tryEmit("snack_reanalysis_failed_saved_anyway")
+                        list.map { it.copy(fullSummary = head.fullSummary) }
+                    } else {
+                        streamedRows!!.map { it.copy(lastAiAnalyzedSummary = head.fullSummary) }
+                    }
                 } else {
                     list
                 }
@@ -2461,6 +2505,15 @@ class ChatViewModel(
         // launch — it's a no-op once empty.
         viewModelScope.launch {
             runCatching { repository.purgeShImportedActivities() }
+        }
+        // 2026-08-31 — background chat reconciliation (see
+        // ChatOrchestrator.regularizeDanglingChatSessions doc comment).
+        // Backfills a visible failure row on any session left with a
+        // dangling user-only message from a send that never got a durable
+        // record. Cheap no-op once there's nothing to backfill; never
+        // deletes existing content.
+        viewModelScope.launch {
+            orchestrator.regularizeDanglingChatSessions(_userProfile.value.language)
         }
         // Phase E: aggregate-pattern analyzer. Runs at most once per 24h
         // (cooldown is enforced inside the repository against the
@@ -3705,6 +3758,53 @@ class ChatViewModel(
         }
     }
 
+    /** Set when a chat turn fails outright (no text was persisted). Carries an
+     *  i18n key the UI resolves, so the user sees *why* the reply never
+     *  arrived instead of the typing bubble silently vanishing. Cleared on
+     *  retry, on a new send, and on session switch. */
+    private val _chatSendError = MutableStateFlow<String?>(null)
+    val chatSendError: StateFlow<String?> = _chatSendError.asStateFlow()
+
+    /** Snapshot of the last send so [retryLastSend] can replay it verbatim —
+     *  including attachments, which are the most expensive thing for a user
+     *  to re-pick by hand. */
+    private data class PendingSend(
+        val sessionId: Long,
+        val text: String,
+        val imageBase64Stored: String?
+    )
+
+    private var lastSend: PendingSend? = null
+
+    /** Re-run the last failed send. The user message row is already in the DB
+     *  from the original attempt, so we skip re-inserting it — otherwise the
+     *  timeline would show the same question twice. */
+    fun retryLastSend() {
+        val pending = lastSend ?: return
+        if (_isTyping.value) return
+        _chatSendError.value = null
+        runSend(
+            targetSessionId = pending.sessionId,
+            textToSend = pending.text,
+            imageToSend = pending.imageBase64Stored,
+            alreadyInserted = true
+        )
+    }
+
+    fun clearChatSendError() {
+        _chatSendError.value = null
+    }
+
+    /** Map a failure to a user-facing i18n key. Network and quota problems are
+     *  worth distinguishing because the user's best next action differs:
+     *  "check your connection" vs "wait a moment and retry". Delegates to
+     *  [com.example.data.chat.ChatOrchestrator.chatErrorKeyFor] (2026-08-31)
+     *  so the transient in-memory card and the durable DB row persisted by
+     *  the orchestrator on total failure always agree on the same message
+     *  for the same cause. */
+    private fun chatErrorKeyFor(t: Throwable?): String =
+        com.example.data.chat.ChatOrchestrator.chatErrorKeyFor(t)
+
     fun sendMessage() {
         val textToSend = _inputText.value.trim()
         val sessionId = _selectedSessionId.value
@@ -3734,15 +3834,35 @@ class ChatViewModel(
         _attachedChatImageBase64.value = null
         _attachedChatImagePaths.value = emptyList()
 
+        val targetSessionId = sessionId ?: return
+        _chatSendError.value = null
+        lastSend = PendingSend(targetSessionId, textToSend, imageToSend)
+        runSend(
+            targetSessionId = targetSessionId,
+            textToSend = textToSend,
+            imageToSend = imageToSend,
+            alreadyInserted = false
+        )
+    }
+
+    /**
+     * Shared body of the send pipeline, used by both the first attempt and
+     * [retryLastSend]. [alreadyInserted] skips the eager user-row insert on a
+     * retry, where the row is already on screen from the failed attempt.
+     */
+    private fun runSend(
+        targetSessionId: Long,
+        textToSend: String,
+        imageToSend: String?,
+        alreadyInserted: Boolean
+    ) {
         val sendGeneration = startSendGeneration()
         sendJob = viewModelScope.launch {
-            val targetSessionId = sessionId
-            if (targetSessionId == null) {
-                finishSendLaunch(sendGeneration)
-                clearSendUiIfCurrent(sendGeneration)
-                ifCurrentSend(sendGeneration) { sendJob = null }
-                return@launch
-            }
+            // Tracks whether the turn produced anything the user can read. If
+            // it did not, the `finally` block raises the inline error card
+            // rather than letting the typing bubble vanish without a trace.
+            var producedReply = false
+            var failureCause: Throwable? = null
 
             // 2026-06-29 — Frente Memory C1.b. Insert the user ChatMessage
             // row EAGERLY here (before the typing indicator paints) so the
@@ -3755,7 +3875,7 @@ class ChatViewModel(
             // own insertion via `skipUserMessageInsert=true` ONLY IF the
             // eager insert actually succeeded — otherwise the legacy path
             // (orchestrator inserts) still runs so we never lose the row.
-            val eagerInsertOk = runCatching {
+            val eagerInsertOk = alreadyInserted || runCatching {
                 repository.insertUserChatMessage(
                     sessionId = targetSessionId,
                     text = textToSend,
@@ -3865,18 +3985,11 @@ class ChatViewModel(
                             // below still clears defensively for early-exit
                             // paths (Error before Done, cancel, exception).
                             handleAssistantDone(event)
+                            producedReply = true
                         }
                         is com.example.data.chat.HandleEvent.Error -> {
                             android.util.Log.w("CHAT_ORCH", "Error: ${event.cause.message}")
-                            _streamingText.value = null
-                            _isTyping.value = false
-                            _typingPhase.value = null
-                            val lang = _userProfile.value.language
-                            val errText = tr("analysis_failed_retry", lang)
-                            val sid = targetSessionId
-                            runCatching {
-                                repository.insertErrorChatMessage(sid, errText)
-                            }
+                            failureCause = event.cause
                         }
                         is com.example.data.chat.HandleEvent.ChartReady -> {
                             // 2026-06-28 — Frente C: parallel chart call
@@ -3901,11 +4014,24 @@ class ChatViewModel(
                 }
             } catch (t: Throwable) {
                 android.util.Log.w("CHAT_ORCH", "send failed/cancelled: ${t.message}")
+                // A cancellation is the user tapping ✕ — that is a deliberate
+                // action, not a failure, so it must not raise the error card.
+                if (t !is kotlinx.coroutines.CancellationException) {
+                    failureCause = t
+                }
             } finally {
                 phaseWatcher.cancel()
                 finishSendLaunch(sendGeneration)
                 clearSendUiIfCurrent(sendGeneration)
                 ifCurrentSend(sendGeneration) { sendJob = null }
+                // Only the send that is still current may raise the error
+                // card — a superseded turn must not overwrite the UI of the
+                // one that replaced it.
+                if (!producedReply && failureCause != null) {
+                    ifCurrentSend(sendGeneration) {
+                        _chatSendError.value = chatErrorKeyFor(failureCause)
+                    }
+                }
             }
         }
     }

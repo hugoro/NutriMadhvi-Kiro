@@ -162,18 +162,23 @@ object ChatImageStore {
      * to the plain decoded bitmap (no rotation) when the EXIF segment is
      * missing or unreadable.
      */
-    fun decodeBitmapWithOrientation(absolutePath: String): Bitmap? {
+    fun decodeBitmapWithOrientation(
+        absolutePath: String,
+        maxDimension: Int = 1024
+    ): Bitmap? {
         // Pass 1: read bounds without allocating.
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(absolutePath, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        // Pass 2: downsample to ≤ 1024 px on the longer side. Chat bubbles
-        // never render bigger than that, and a full-resolution 12-MP photo in
-        // ARGB_8888 costs ~48 MB per bitmap — which was OOM-killing the app on
-        // the S25 (heap capped at ~268 MB). 1024 @ ARGB_8888 ≈ 4 MB.
+        // Pass 2: downsample to ≤ maxDimension px on the longer side. Chat
+        // bubbles never render bigger than 1024, and a full-resolution 12-MP
+        // photo in ARGB_8888 costs ~48 MB per bitmap — which was OOM-killing
+        // the app on the S25 (heap capped at ~268 MB). 1024 @ ARGB_8888 ≈ 4 MB.
+        // The upload path passes a larger bound so the model still gets full
+        // tile detail without the app ever holding the raw 12-MP buffer.
         var sample = 1
         val longSide = maxOf(bounds.outWidth, bounds.outHeight)
-        while (longSide / sample > 1024) sample *= 2
+        while (longSide / sample > maxDimension) sample *= 2
         val opts = BitmapFactory.Options().apply {
             inSampleSize = sample
             inPreferredConfig = Bitmap.Config.ARGB_8888

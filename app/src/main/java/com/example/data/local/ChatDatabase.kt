@@ -23,7 +23,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         PredictedQaEntity::class,
         IngredientNutritionEntity::class
     ],
-    version = 30,
+    version = 33,
     exportSchema = true
 )
 @androidx.room.TypeConverters(Converters::class)
@@ -577,6 +577,93 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Persists which LLM (Gemini tier or ensemble provider) produced a
+         * meal-analysis result / attempted a chat reply, so the model badge in
+         * the edit-meal screen survives an app restart — previously this only
+         * lived in an in-memory ViewModel StateFlow and was lost on process
+         * death.
+         *
+         * `food_entries.analysisModel TEXT NULL` + `chat_messages.analysisModel
+         * TEXT NULL`. Additive: pre-existing rows keep NULL and the UI falls
+         * back to the legacy generic label. No data lost.
+         *
+         * NOTE on numbering: this is the `analysisModel` change that shipped on
+         * the live device already (verified: v32 DB physically carries both
+         * columns). In the ensemble worktree it was numbered v30→v31 to stack
+         * on top of main's v29→v30 editLogJson migration. Kept guarded so it is
+         * a no-op where the column already exists.
+         */
+        val MIGRATION_30_31 = object : Migration(30, 31) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.addColumnIfMissing("food_entries", "analysisModel", "TEXT DEFAULT NULL")
+                db.addColumnIfMissing("chat_messages", "analysisModel", "TEXT DEFAULT NULL")
+            }
+        }
+
+        /**
+         * Repairs installs whose v31 was produced by an ensemble-worktree build
+         * that predated the reconciliation. Both the INSA line and the ensemble
+         * line independently shipped a schema numbered 31/32, so a device could
+         * be stamped v31/v32 while missing (or already having) editLogJson /
+         * analysisModel. Every add is guarded, so this is a no-op on the live
+         * v32 shape and only backfills a column on the rare mismatched install.
+         */
+        val MIGRATION_31_32 = object : Migration(31, 32) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.addColumnIfMissing("food_entries", "editLogJson", "TEXT DEFAULT NULL")
+                db.addColumnIfMissing("food_entries", "analysisModel", "TEXT DEFAULT NULL")
+                db.addColumnIfMissing("chat_messages", "analysisModel", "TEXT DEFAULT NULL")
+            }
+        }
+
+        /**
+         * Reconciliation bump (base = main + ensemble graft). The live device
+         * is stamped v32 with a 12-entity identity hash (6941a9db…) because the
+         * ensemble worktree left `ingredient_nutrition_cache` UNMAPPED. This
+         * build re-maps `IngredientNutritionEntity` (13 entities) AND carries
+         * the analysisModel columns, so Room computes a NEW identity hash that
+         * matches neither v30 nor the live v32 stamp.
+         *
+         * Bumping to v33 forces Room through this migration and then re-stamps
+         * room_master_table with the new hash instead of failing the integrity
+         * check on launch (which would crash). Every object referenced here is
+         * already physically present on the live DB (columns via v30/v31,
+         * `ingredient_nutrition_cache` via v28→v29), so the body is a pure
+         * no-op-if-exists guard. DDL is byte-identical to MIGRATION_28_29 so the
+         * post-migration schema validation matches the generated 33.json.
+         */
+        val MIGRATION_32_33 = object : Migration(32, 33) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `ingredient_nutrition_cache` (
+                        `id` INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                        `normalizedName` TEXT NOT NULL,
+                        `displayName` TEXT NOT NULL,
+                        `per100gCalories` REAL NOT NULL,
+                        `per100gProtein` REAL NOT NULL,
+                        `per100gCarbs` REAL NOT NULL,
+                        `per100gFat` REAL NOT NULL,
+                        `per100gSatFat` REAL NOT NULL,
+                        `per100gFreeSugars` REAL NOT NULL,
+                        `source` TEXT NOT NULL,
+                        `confidence` TEXT NOT NULL,
+                        `createdAtMs` INTEGER NOT NULL,
+                        `updatedAtMs` INTEGER NOT NULL,
+                        `timesUsed` INTEGER NOT NULL DEFAULT 0
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_ingredient_nutrition_cache_normalizedName` ON `ingredient_nutrition_cache` (`normalizedName`)"
+                )
+                db.addColumnIfMissing("food_entries", "editLogJson", "TEXT DEFAULT NULL")
+                db.addColumnIfMissing("food_entries", "analysisModel", "TEXT DEFAULT NULL")
+                db.addColumnIfMissing("chat_messages", "analysisModel", "TEXT DEFAULT NULL")
+            }
+        }
+
         val MIGRATION_28_29 = object : Migration(28, 29) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // Ingredient nutrition cache — grows organically as the user
@@ -668,7 +755,10 @@ abstract class ChatDatabase : RoomDatabase() {
                     MIGRATION_26_27,
                     MIGRATION_27_28,
                     MIGRATION_28_29,
-                    MIGRATION_29_30
+                    MIGRATION_29_30,
+                    MIGRATION_30_31,
+                    MIGRATION_31_32,
+                    MIGRATION_32_33
                 )
                 // Hard guarantee that v9→v10 (and later) NEVER nukes user data:
                 // if a defined migration throws, the app crashes loudly instead of
@@ -685,5 +775,29 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
     }
+}
+
+/**
+ * Idempotent `ALTER TABLE … ADD COLUMN`.
+ *
+ * SQLite has no `ADD COLUMN IF NOT EXISTS`, and a plain `ALTER TABLE` on an
+ * existing column throws, aborting the whole migration and leaving the database
+ * stamped at the old version. Two branches of this app shipped overlapping
+ * schema numbers, so the same column can legitimately already exist on some
+ * installs and not on others; every additive migration goes through this helper
+ * to stay replay-safe.
+ */
+private fun SupportSQLiteDatabase.addColumnIfMissing(
+    table: String,
+    column: String,
+    typeAndDefault: String
+) {
+    query("PRAGMA table_info(`$table`)").use { cursor ->
+        val nameIndex = cursor.getColumnIndex("name")
+        while (cursor.moveToNext()) {
+            if (cursor.getString(nameIndex) == column) return
+        }
+    }
+    execSQL("ALTER TABLE `$table` ADD COLUMN `$column` $typeAndDefault")
 }
 

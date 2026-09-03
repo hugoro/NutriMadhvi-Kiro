@@ -7,6 +7,7 @@ import com.example.data.local.ActivityEntry
 import com.example.data.local.FoodDao
 import com.example.data.local.FoodEntry
 import com.example.data.local.TrainingBucket
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -45,11 +46,29 @@ class DataFetcher(
         val endMs = window.to.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
 
         val mealsDeferred: Deferred<List<FoodEntry>>? = if (intent.type != DataType.ACTIVITY) {
-            async { runCatching { foodDao.getFoodsBetween(startMs, endMs) }.getOrDefault(emptyList()) }
+            async {
+                try {
+                    foodDao.getFoodsBetween(startMs, endMs)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    android.util.Log.e("DataFetcher", "Failed to fetch meals for window $window", e)
+                    emptyList()
+                }
+            }
         } else null
 
         val activitiesDeferred: Deferred<List<ActivityEntry>>? = if (intent.type != DataType.MEALS) {
-            async { runCatching { activityDao.getActivitiesBetween(startMs, endMs) }.getOrDefault(emptyList()) }
+            async {
+                try {
+                    activityDao.getActivitiesBetween(startMs, endMs)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    android.util.Log.e("DataFetcher", "Failed to fetch activities for window $window", e)
+                    emptyList()
+                }
+            }
         } else null
 
         val stepsDeferred = async {

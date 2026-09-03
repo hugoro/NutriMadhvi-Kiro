@@ -800,7 +800,7 @@ class GeminiRepository(
                     val responseError = response.error
                     if (responseError != null) {
                         val code = responseError.code ?: 0
-                        if (code == 429 || responseError.message?.contains("429") == true) {
+                        if (isTransientCode(code) || messageLooksTransient(responseError.message)) {
                             lastError = Exception(responseError.message ?: tr("Quota Exceeded (429)", language))
                             if (attempt < maxAttempts) {
                                 kotlinx.coroutines.delay(rateLimitBackoffMs(attempt))
@@ -823,8 +823,8 @@ class GeminiRepository(
                     return Result.success(rawText)
                 } catch (e: Exception) {
                     lastError = e
-                    val isRateLimit = e is retrofit2.HttpException && e.code() == 429
-                    val isMessageRateLimit = e.message?.contains("429") == true
+                    val isRateLimit = e is retrofit2.HttpException && isTransientCode(e.code())
+                    val isMessageRateLimit = messageLooksTransient(e.message)
                     if (isRateLimit || isMessageRateLimit) {
                          if (attempt < maxAttempts) {
                              kotlinx.coroutines.delay(rateLimitBackoffMs(attempt))
@@ -839,6 +839,27 @@ class GeminiRepository(
             }
         }
         return Result.failure(lastError ?: Exception(tr("Unknown error in analysis", language)))
+    }
+
+    /** Transient HTTP statuses worth a same-model retry: rate-limit (429) plus
+     *  the 5xx gateway/overload family (500/502/503/504). Distinct from a hard
+     *  model error (404 unknown model), which should fall straight through to
+     *  the next model in the cascade. */
+    private fun isTransientCode(code: Int): Boolean =
+        code == 429 || code == 500 || code == 502 || code == 503 || code == 504
+
+    /**
+     * Gemini often reports the condition only in prose (`"The model is
+     * overloaded. Please try again later."`) with no usable numeric code, so
+     * the text is checked as well.
+     */
+    private fun messageLooksTransient(message: String?): Boolean {
+        val text = message?.lowercase() ?: return false
+        return text.contains("429") ||
+            text.contains("503") ||
+            text.contains("overloaded") ||
+            text.contains("unavailable") ||
+            text.contains("try again later")
     }
 
     /**

@@ -3150,7 +3150,8 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                         ConfidenceChip(
                             level = conf,
                             language = userProfile.language,
-                            escalated = analysisForEntry?.escalated == true
+                            escalated = analysisForEntry?.escalated == true,
+                            modelName = analysisForEntry?.analysisModel ?: entry.analysisModel
                         )
                     }
 

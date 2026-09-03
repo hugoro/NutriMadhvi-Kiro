@@ -2,6 +2,8 @@ package com.example.ui
 
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -73,6 +75,13 @@ object FoodImageStore {
      * REST inlineData payload does not tolerate embedded newlines on some
      * code paths.
      */
+    /** Above this size the image is re-encoded before upload. See
+     *  [loadImageBytesAndMime]. */
+    private const val UPLOAD_MAX_BYTES = 3_000_000
+
+    /** Longest edge kept when re-encoding, preserving fine packaging text. */
+    private const val UPLOAD_MAX_DIMENSION = 2048
+
     fun loadImageBytesAndMime(context: Context, fileUriString: String): Pair<String, String>? {
         return try {
             val uri = Uri.parse(fileUriString)
@@ -83,12 +92,53 @@ object FoodImageStore {
                 requireNotNull(input) { "openInputStream returned null for $fileUriString" }
                 input.readBytes()
             }
-            val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-            b64 to mime
+            // A 12-MP camera original is ~9 MB, which base64 inflates to ~12 MB
+            // on the wire — the dominant cause of failed/timed-out analyses on
+            // mobile data. A 2048px transport copy retains fine packaging text
+            // while keeping the request bounded. The persisted original is
+            // never modified; only the upload copy shrinks.
+            val (uploadBytes, uploadMime) = if (bytes.size > UPLOAD_MAX_BYTES) {
+                downscaleForUpload(bytes) ?: (bytes to mime)
+            } else {
+                bytes to mime
+            }
+            val b64 = Base64.encodeToString(uploadBytes, Base64.NO_WRAP)
+            b64 to uploadMime
         } catch (e: Exception) {
-            e.printStackTrace()
+            android.util.Log.w("FoodImageStore", "loadImageBytesAndMime failed for $fileUriString", e)
             null
         }
+    }
+
+    /**
+     * Re-encode [source] as a bounded JPEG. Returns null when the bytes cannot
+     * be decoded, so the caller falls back to uploading the original rather
+     * than dropping the image.
+     */
+    private fun downscaleForUpload(source: ByteArray): Pair<ByteArray, String>? = try {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(source, 0, source.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            null
+        } else {
+            var sample = 1
+            val longSide = maxOf(bounds.outWidth, bounds.outHeight)
+            while (longSide / sample > UPLOAD_MAX_DIMENSION) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bmp = BitmapFactory.decodeByteArray(source, 0, source.size, opts)
+            if (bmp == null) {
+                null
+            } else {
+                val out = java.io.ByteArrayOutputStream()
+                bmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                bmp.recycle()
+                out.toByteArray() to "image/jpeg"
+            }
+        }
+    } catch (t: Throwable) {
+        // Includes OutOfMemoryError — uploading the original beats losing it.
+        android.util.Log.w("FoodImageStore", "downscaleForUpload failed: ${t.javaClass.simpleName}")
+        null
     }
 
     /**

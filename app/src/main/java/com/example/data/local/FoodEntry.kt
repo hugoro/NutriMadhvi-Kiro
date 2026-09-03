@@ -62,10 +62,27 @@ data class FoodEntry(
      *  been updated. UI falls back to the single-color yellow fat bar when
      *  `hasAnySatFatData` is false across the reporting window. */
     val saturatedFatG: Double? = null,
-    /** JSON-encoded list of [FoodEditLogEntry]. Records every significant write
-     *  to this row: initial insert ("added"), AI re-analysis ("auto"), and
-     *  manual save ("manual"). Most-recent first. NULL for entries created
-     *  before v30 (no backfill). */
-    val editLogJson: String? = null
+    /** JSON-encoded edit log introduced by the main branch in schema v30.
+     *
+     *  This branch does not read or write it, but the column MUST stay declared:
+     *  devices that ran a main-branch build already have it inside
+     *  `food_entries`, and Room rejects an entity whose column set doesn't match
+     *  the physical table. Dropping it here would both crash those installs on
+     *  open and destroy the history on a future merge back into main. */
+    val editLogJson: String? = null,
+    /**
+     * Which LLM produced this entry's analysis (e.g. `gemini-3.1-pro-preview`,
+     * `qwen/qwen3.6-27b`). Persisted (not just kept in the in-memory
+     * [com.example.data.remote.FoodAnalysisResult.analysisModel]) so the model
+     * badge in the edit-meal screen survives an app restart — before this
+     * column, re-opening a saved entry always showed the hardcoded "Pro" badge
+     * or nothing, because the analysis result that named the real model only
+     * ever lived in a ViewModel StateFlow.
+     *
+     * NULL for legacy entries (pre-v29) and for entries saved through paths
+     * that don't stamp it; the UI falls back to a generic "Pro" label in that
+     * case rather than showing a blank badge.
+     */
+    val analysisModel: String? = null
 )
 
