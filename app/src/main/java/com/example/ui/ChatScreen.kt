@@ -3628,6 +3628,13 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                                 com.example.data.local.FoodEditType.AUTO   -> "Atualiz. Auto"
                                 com.example.data.local.FoodEditType.MANUAL -> "Atualiz. Manual"
                             }
+                            // Append the LLM behind the write (e.g. "· gemini-3.5-flash").
+                            // Null for purely manual edits and pre-field entries — those
+                            // show the type label alone rather than a blank suffix.
+                            val rightLabel = entry.model
+                                ?.takeIf { it.isNotBlank() }
+                                ?.let { "$typeLabel · $it" }
+                                ?: typeLabel
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween
@@ -3639,7 +3646,7 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                                     fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                                 )
                                 Text(
-                                    typeLabel,
+                                    rightLabel,
                                     fontSize = 11.sp,
                                     color = Color(0xFF64748B)
                                 )
