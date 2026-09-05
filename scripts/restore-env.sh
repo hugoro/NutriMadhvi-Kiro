@@ -64,6 +64,14 @@ if [[ -n "$GROQ_KEY" ]]; then
   GROQ_LINE="GROQ_API_KEY=$GROQ_KEY"
 fi
 
+# Bitdeer — host alternativo para Qwen3.8-27B (benchmark/failover). Opcional,
+# mesmo padrão do Groq: sem chave no Keychain → placeholder.
+BITDEER_KEY="$(read_keychain BITDEER_API_KEY || true)"
+BITDEER_LINE="BITDEER_API_KEY=MY_BITDEER_API_KEY"
+if [[ -n "$BITDEER_KEY" ]]; then
+  BITDEER_LINE="BITDEER_API_KEY=$BITDEER_KEY"
+fi
+
 # Escrever o .env (sobrescreve sempre).
 umask 077  # 0600 — só o user lê
 cat > "$ENV_FILE" <<EOF
@@ -71,8 +79,10 @@ cat > "$ENV_FILE" <<EOF
 # NÃO fazer commit (já está no .gitignore).
 # Para rodar a chave Gemini: security add-generic-password -s $SERVICE -a GEMINI_API_KEY -w "<NOVA>" -U
 # Para rodar a chave Groq:   security add-generic-password -s $SERVICE -a GROQ_API_KEY -w "<NOVA>" -U
+# Para rodar a chave Bitdeer: security add-generic-password -s $SERVICE -a BITDEER_API_KEY -w "<NOVA>" -U
 GEMINI_API_KEY=$KEY
 $GROQ_LINE
+$BITDEER_LINE
 EOF
 chmod 600 "$ENV_FILE"
 echo "✓ .env regenerado em $ENV_FILE (perm 600, $(wc -c < "$ENV_FILE") bytes)"
