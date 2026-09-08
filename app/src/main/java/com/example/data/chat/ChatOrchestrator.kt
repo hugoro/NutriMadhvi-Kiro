@@ -140,6 +140,11 @@ class ChatOrchestrator(
         val windowEndMs: Long,
         val foods: List<com.example.data.local.FoodEntry>,
         val activities: List<com.example.data.local.ActivityEntry>,
+        // Phase 8: retain already-read rows so NutritionToolRunner gets them
+        // without an extra DAO round-trip (reads happen inside buildCanonicalSnapshot,
+        // they just weren't kept before).
+        val latestTarget: com.example.data.local.TargetSnapshot? = null,
+        val bodyComposition: List<com.example.data.local.BodyCompositionSnapshotEntity> = emptyList(),
     )
     private val snapshotCache = MutableStateFlow<SnapshotCache?>(null)
 
@@ -599,6 +604,25 @@ class ChatOrchestrator(
                 "type=${effectiveIntent.type} block=${prefetched.length}chars"
         )
 
+        // Phase 8 — deterministic NutritionTools injection.
+        // Classify which tools are relevant for this turn (pure heuristics, zero
+        // LLM work), then run them on rows already in hand and inject the result
+        // as ground-truth Markdown so the LLM synthesises numbers it cannot
+        // hallucinate. Returns "" for non-computational turns → no-op.
+        val toolPlan = ToolPlanner.plan(text, effectiveIntent)
+        val cachedForTools = snapshotCache.value
+        val computedToolsBlock = NutritionToolRunner.run(
+            plan = toolPlan,
+            foods = cachedForTools?.foods ?: prefetchedData.meals,
+            activities = cachedForTools?.activities ?: prefetchedData.activities,
+            bodyComp = cachedForTools?.bodyComposition ?: emptyList(),
+            target = cachedForTools?.latestTarget,
+            shSteps = shStepsByDate,
+            shDaily = shDailyActivity,
+            shWorkouts = shWorkouts,
+            zone = ZoneId.systemDefault(),
+        )
+
         // 2026-07-06 (Frente H) — two-tier response kickoff.
         //
         // For `ChatIntent.Reasoning` questions (open-ended "should I…?",
@@ -701,7 +725,7 @@ class ChatOrchestrator(
         // we silently fall back to the full system instruction — no
         // user-visible change. Touch the TTL in the background so an
         // active session doesn't get its cache evicted between turns.
-        val dynamicSystemText = (canonical + prefetched + knownHabitsBlock + carryoverBlock + kbBlock).trimStart()
+        val dynamicSystemText = (canonical + prefetched + computedToolsBlock + knownHabitsBlock + carryoverBlock + kbBlock).trimStart()
         // 2026-07-06 (Frente C) — reuse the `session` var captured at the
         // top of `handle` instead of re-fetching. If the session was
         // renamed above (title == "New Chat" branch), the in-memory copy
@@ -2706,6 +2730,8 @@ class ChatOrchestrator(
             windowEndMs = windowEndMs,
             foods = reads.foods,
             activities = reads.activities,
+            latestTarget = reads.latestTarget,
+            bodyComposition = reads.bodyComp,
         )
         // 2026-07-06 (Frente A) — expose reads-only and total build ms so a
         // regression on the parallel fan-out is visible in logs. `readsMs`
