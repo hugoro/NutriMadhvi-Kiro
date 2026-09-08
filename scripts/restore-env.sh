@@ -72,6 +72,16 @@ if [[ -n "$BITDEER_KEY" ]]; then
   BITDEER_LINE="BITDEER_API_KEY=$BITDEER_KEY"
 fi
 
+# RunInfra — o failover real do Groq na cadeia de chat (Groq → RunInfra →
+# Gemini). Opcional, mesmo padrão do Groq/Bitdeer: sem chave no Keychain →
+# placeholder MY_RUNINFRA_API_KEY (o RunInfraChatProvider trata o placeholder
+# como "não configurado" e o router salta o link em vez de falhar).
+RUNINFRA_KEY_VAL="$(read_keychain RUNINFRA_API_KEY || true)"
+RUNINFRA_LINE="RUNINFRA_API_KEY=MY_RUNINFRA_API_KEY"
+if [[ -n "$RUNINFRA_KEY_VAL" ]]; then
+  RUNINFRA_LINE="RUNINFRA_API_KEY=$RUNINFRA_KEY_VAL"
+fi
+
 # Escrever o .env (sobrescreve sempre).
 umask 077  # 0600 — só o user lê
 cat > "$ENV_FILE" <<EOF
@@ -80,9 +90,11 @@ cat > "$ENV_FILE" <<EOF
 # Para rodar a chave Gemini: security add-generic-password -s $SERVICE -a GEMINI_API_KEY -w "<NOVA>" -U
 # Para rodar a chave Groq:   security add-generic-password -s $SERVICE -a GROQ_API_KEY -w "<NOVA>" -U
 # Para rodar a chave Bitdeer: security add-generic-password -s $SERVICE -a BITDEER_API_KEY -w "<NOVA>" -U
+# Para rodar a chave RunInfra: security add-generic-password -s $SERVICE -a RUNINFRA_API_KEY -w "<NOVA>" -U
 GEMINI_API_KEY=$KEY
 $GROQ_LINE
 $BITDEER_LINE
+$RUNINFRA_LINE
 EOF
 chmod 600 "$ENV_FILE"
 echo "✓ .env regenerado em $ENV_FILE (perm 600, $(wc -c < "$ENV_FILE") bytes)"
