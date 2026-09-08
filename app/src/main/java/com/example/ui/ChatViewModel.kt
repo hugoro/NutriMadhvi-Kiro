@@ -3980,6 +3980,17 @@ class ChatViewModel(
                         is com.example.data.chat.HandleEvent.Partial -> {
                             _streamingText.value = event.accumulatedText
                         }
+                        is com.example.data.chat.HandleEvent.Reset -> {
+                            // 2026-09-08 (Phase 6, §13) — router failed over
+                            // mid-stream. Discard the abandoned partial so the
+                            // fallback provider re-renders from scratch; the
+                            // dead provider's text is never appended/persisted.
+                            android.util.Log.i(
+                                "CHAT_ROUTER",
+                                "VM Reset: ${event.from} -> ${event.to} (clearing partial)"
+                            )
+                            _streamingText.value = ""
+                        }
                         is com.example.data.chat.HandleEvent.Done -> {
                             // 2026-07-07 (Fix #1) — clear typing indicator the
                             // moment the text lands, not on flow completion.
@@ -4254,6 +4265,17 @@ class ChatViewModel(
                         }
                         is com.example.data.chat.HandleEvent.Partial -> {
                             _streamingText.value = event.accumulatedText
+                        }
+                        is com.example.data.chat.HandleEvent.Reset -> {
+                            // 2026-09-08 (Phase 6, §13) — same as the primary
+                            // send path: discard the abandoned partial on a
+                            // mid-stream router failover so the fallback
+                            // re-renders cleanly. Edit-resubmits share the flow.
+                            android.util.Log.i(
+                                "CHAT_ROUTER",
+                                "VM Reset (edit): ${event.from} -> ${event.to} (clearing partial)"
+                            )
+                            _streamingText.value = ""
                         }
                         is com.example.data.chat.HandleEvent.Done -> {
                             // 2026-07-07 (Fix #1) — same reasoning as the

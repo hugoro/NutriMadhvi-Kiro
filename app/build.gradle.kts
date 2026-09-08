@@ -52,6 +52,15 @@ android {
 
     buildConfigField("String", "BUILD_DATE", "\"$buildDateString\"")
 
+    // Chat provider router (plan Phase 6). When false — the default,
+    // everywhere — the chat send path is byte-for-byte today's Gemini-only
+    // fleet cascade (`streamReply` + `blockingReply`). When true, a normal
+    // chat turn routes through `ChatProviderRouter` (Groq → RunInfra →
+    // Gemini-cascade). Flipping this flag off is the instant rollback: no
+    // data touched, no schema change. Keys are seeded on-device via adb, so
+    // this flag — not key presence — is the gate.
+    buildConfigField("boolean", "CHAT_ROUTER_ENABLED", "false")
+
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 

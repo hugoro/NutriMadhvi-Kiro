@@ -1133,7 +1133,137 @@ class ChatOrchestrator(
         // failure row) can record which LLM actually answered / was being
         // attempted. See [ChatMessage.analysisModel].
         var resolvedModel: String? = null
-        val replyText: String = if (streaming) {
+        val replyText: String = if (com.example.BuildConfig.CHAT_ROUTER_ENABLED && streaming) {
+            // ---------------------------------------------------------------
+            // Phase 6 — router send path (plan §11: Groq → RunInfra → Gemini).
+            //
+            // A failover CHAIN, not an ensemble: one turn is served by exactly
+            // one provider. The chain is assembled per-turn because its Gemini
+            // link is backed by THIS turn's `streamReply` engine (which closes
+            // over modelToUse/apiKey/request/language and the fast-tier
+            // callbacks). Groq and RunInfra are cheap, key-lazy objects.
+            //
+            // The router keeps output transient until `Completed` and wipes it
+            // on a mid-stream `Reset`, so "one turn = one persisted answer"
+            // (§13) holds structurally — nothing here persists; the shared
+            // insert at the end of `handle` is the single write site.
+            //
+            // The existing `circuitBreaker` field (line ~100) is REUSED so
+            // Gemini-model breaker state is shared with the flag-off cascade,
+            // not forked.
+            val geminiCascadeProvider = com.example.data.ai.provider.gemini.GeminiCascadeChatProvider(
+                defaultModel = modelToUse,
+                apiKeyProvider = { com.example.BuildConfig.GEMINI_API_KEY },
+                engine = { cb ->
+                    streamReply(
+                        modelToUse, apiKey, request, language,
+                        onModelResolved = { cb.onModelResolved(it); resolvedModel = it },
+                        onPartial = { partial -> cb.onPartial(partial) },
+                        onPhase = { phase -> emit(HandleEvent.Phase(phase)) },
+                        onFirstToken = { cb.onFirstToken() },
+                        fullSystemInstructionForCacheFallback = fullSystemInstructionFallback,
+                        onCacheRejected = { rejectedName ->
+                            runCatching {
+                                chatDao.getSessionById(sessionId)?.let {
+                                    chatDao.updateSession(it.copy(cachedContentName = null))
+                                }
+                            }
+                            android.util.Log.d(
+                                "CHAT_CACHE",
+                                "cleared sessionId=$sessionId cachedContentName (was $rejectedName)"
+                            )
+                        }
+                    )
+                },
+            )
+            val chain: List<com.example.data.ai.provider.ChatProvider> = listOf(
+                com.example.data.ai.provider.groq.GroqChatProvider(
+                    apiKeyProvider = { com.example.BuildConfig.GROQ_API_KEY },
+                ),
+                com.example.data.ai.provider.runinfra.RunInfraChatProvider(
+                    apiKeyProvider = { com.example.BuildConfig.RUNINFRA_API_KEY },
+                ),
+                geminiCascadeProvider,
+            )
+            val router = com.example.data.ai.provider.ChatProviderRouter(
+                chain = chain,
+                breaker = circuitBreaker,
+                onRouteEvent = { trace ->
+                    // Observability only — never carries keys or image bytes.
+                    android.util.Log.i("CHAT_ROUTER", trace.toString())
+                },
+            )
+
+            val chatRequest = buildChatRequest(request)
+
+            // Consume the neutral router stream through the pure seam
+            // (unit-tested in RouterStreamConsumptionTest). The seam owns the
+            // Delta/Reset/Completed/Failed → HandleEvent mapping and the §13
+            // one-answer invariant; the DAO-touching tail (fast-reply fallback
+            // insert / durable error row) stays here where the DAOs live.
+            val outcome = consumeRouterStream(
+                events = router.stream(chatRequest),
+                emit = { ev -> emit(ev) },
+                onFirstDelta = {
+                    // Same fast-tier resolution as the Gemini path: the first
+                    // real token means deep won the race.
+                    if (!fastReplyEmitted) {
+                        fastReplyEmitted = true
+                        if (!firstDeepPartialLatch.isCompleted) {
+                            firstDeepPartialLatch.complete(Unit)
+                        }
+                        val fastText = pendingFastReply.await()
+                        if (!fastText.isNullOrBlank()) {
+                            emit(HandleEvent.FastReply(fastText))
+                        }
+                    }
+                },
+                resolvedModelSoFar = resolvedModel,
+                geminiProviderName = com.example.data.ai.provider.gemini.GeminiCascadeChatProvider.PROVIDER,
+            )
+
+            when (outcome) {
+                is RouterOutcome.Answer -> {
+                    // The Gemini cascade sets resolvedModel via onModelResolved;
+                    // for Groq/RunInfra the seam resolved it from Completed. Adopt
+                    // whichever the seam determined so the badge is correct.
+                    outcome.resolvedModel?.let { resolvedModel = it }
+                    outcome.text
+                }
+                is RouterOutcome.Exhausted -> {
+                    // Whole chain failed / exhausted (§11 last resort already
+                    // tried). Mirror the flag-off total-failure branch: keep a
+                    // usable fast reply if the race produced one, else persist a
+                    // durable error row so the failure + retry affordance survive
+                    // process death.
+                    val routerFailure = outcome.failure
+                    val cause: Throwable = routerFailure?.cause
+                        ?: IllegalStateException(routerFailure?.message ?: "Chat router produced no answer")
+                    android.util.Log.w(
+                        "CHAT_ROUTER",
+                        "chain exhausted: kind=${routerFailure?.kind} msg=${routerFailure?.message?.take(120)}"
+                    )
+                    val fastFallback = runCatching {
+                        if (pendingFastReply.isCompleted) pendingFastReply.getCompleted() else null
+                    }.getOrNull()
+                    if (!fastFallback.isNullOrBlank()) {
+                        android.util.Log.i("CHAT_TWO_TIER", "router_failed_kept_fast len=${fastFallback.length}")
+                        val fallbackId = chatDao.insertMessage(
+                            ChatMessage(
+                                sessionId = sessionId,
+                                sender = "gemini",
+                                text = fastFallback,
+                            )
+                        )
+                        emit(HandleEvent.Done(fastFallback, insertedMessageId = fallbackId))
+                        return@flow
+                    }
+                    persistDurableSendFailure(sessionId, cause, language, attemptedModel = resolvedModel ?: modelToUse)
+                    emit(HandleEvent.Error(cause))
+                    return@flow
+                }
+            }
+        } else if (streaming) {
             try {
                 streamReply(
                     modelToUse, apiKey, request, language,
@@ -1774,6 +1904,97 @@ class ChatOrchestrator(
             },
         )
         return StreamAttemptResult(accumulated = result.fullText, error = result.error)
+    }
+
+    /**
+     * Map the orchestrator's already-built [GeminiRequest] onto the
+     * provider-neutral [com.example.data.ai.provider.ChatRequest] the
+     * [com.example.data.ai.provider.ChatProviderRouter] consumes (plan §7,
+     * Phase 6). This is the inverse of
+     * [com.example.data.ai.provider.gemini.GeminiChatProvider.buildRequest]:
+     * the orchestrator keeps building its Gemini context (contents, system
+     * instruction, cache reference, thinking level) exactly as today, and this
+     * mapper hands the *neutral* view of it to the chain so Groq / RunInfra can
+     * translate it onto their OpenAI-style transports while the Gemini-cascade
+     * link reads back the pass-through hints.
+     *
+     * ### Faithful, lossless where it matters
+     *   - Each [Content] becomes one [ChatMessagePart]; role `"model"` → ASSISTANT,
+     *     anything else (incl. `null`) → USER (Gemini's default role is user).
+     *     Text parts are concatenated (a Content may split text across parts).
+     *   - Inline image parts (`inlineData`, base64) are **decoded back to raw
+     *     bytes** into [ChatImage] so the request is transport-neutral — a
+     *     text-only provider is *skipped* (§18) rather than being handed
+     *     un-renderable base64 in a text field, and the Gemini link re-encodes
+     *     them. Bytes stay transient/in-memory; nothing is persisted or pathed.
+     *   - `systemInstruction` (a Gemini [Content]) is flattened to its text.
+     *   - `cachedContent` + the thinking level ride in [GeminiPassThrough];
+     *     Groq/RunInfra ignore them, the Gemini cascade honours them (§10).
+     *   - `generationConfig` maps to [ChatGeneration] (temperature/topP/maxTokens;
+     *     `structured` when `responseMimeType == "application/json"`).
+     *
+     * Never logs bytes or keys.
+     */
+    private fun buildChatRequest(request: GeminiRequest): com.example.data.ai.provider.ChatRequest {
+        val messages = mutableListOf<com.example.data.ai.provider.ChatMessagePart>()
+        val images = mutableListOf<com.example.data.ai.provider.ChatImage>()
+
+        request.contents.forEach { content ->
+            val role = when (content.role) {
+                "model" -> com.example.data.ai.provider.ChatRole.ASSISTANT
+                else -> com.example.data.ai.provider.ChatRole.USER
+            }
+            val text = content.parts.mapNotNull { it.text }.joinToString("\n").trim()
+            content.parts.forEach { part ->
+                part.inlineData?.let { inline ->
+                    val bytes = runCatching {
+                        android.util.Base64.decode(inline.data, android.util.Base64.DEFAULT)
+                    }.getOrNull()
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        images.add(
+                            com.example.data.ai.provider.ChatImage(
+                                bytes = bytes,
+                                mimeType = inline.mimeType,
+                            )
+                        )
+                    }
+                }
+            }
+            // Emit a message part even when text is blank IF this turn carried
+            // no images either — an empty user turn is degenerate but we never
+            // silently drop a conversation slot. When the part is a pure image
+            // carrier (blank text), skip the empty text bubble; the image is
+            // already captured above and reattached to the last user turn by
+            // the multimodal adapters.
+            if (text.isNotEmpty()) {
+                messages.add(com.example.data.ai.provider.ChatMessagePart(role = role, text = text))
+            }
+        }
+
+        val gen = request.generationConfig
+        val generation = com.example.data.ai.provider.ChatGeneration(
+            temperature = gen?.temperature,
+            topP = gen?.topP,
+            maxOutputTokens = gen?.maxOutputTokens,
+            structured = gen?.responseMimeType == "application/json",
+        )
+
+        val thinkingLevel = gen?.thinkingConfig?.thinkingLevel
+        val hints = if (request.cachedContent != null || thinkingLevel != null) {
+            com.example.data.ai.provider.GeminiPassThrough(
+                cachedContent = request.cachedContent,
+                thinkingLevel = thinkingLevel,
+            )
+        } else null
+
+        return com.example.data.ai.provider.ChatRequest(
+            systemInstruction = request.systemInstruction?.parts
+                ?.mapNotNull { it.text }?.joinToString("\n")?.takeIf { it.isNotBlank() },
+            messages = messages,
+            images = images,
+            generation = generation,
+            geminiHints = hints,
+        )
     }
 
     private suspend fun streamReply(
@@ -2772,6 +2993,140 @@ class ChatOrchestrator(
     }
 
     companion object {
+        /**
+         * The terminal decision of one router-served turn (Phase 6). Pure data —
+         * no Room I/O — so [consumeRouterStream] can be unit-tested without the
+         * orchestrator's DAO surface. The caller ([handle]) maps this onto the
+         * single persist site.
+         */
+        sealed interface RouterOutcome {
+            /** The chain produced a non-blank answer. [resolvedModel] is the
+             *  `provider:model` that actually answered, for [ChatMessage.analysisModel]. */
+            data class Answer(val text: String, val resolvedModel: String?) : RouterOutcome
+
+            /** The whole chain failed / returned blank / threw a recoverable error.
+             *  [failure] is the last error the chain reported (null only if the
+             *  stream completed with neither a Completed nor a Failed, which the
+             *  adapters' sequencing contract forbids — defensive). */
+            data class Exhausted(val failure: com.example.data.ai.provider.ChatError?) : RouterOutcome
+        }
+
+        /**
+         * Consume the neutral [com.example.data.ai.provider.ChatEvent] stream from
+         * [com.example.data.ai.provider.ChatProviderRouter] and translate it into
+         * the orchestrator's [HandleEvent] surface, returning a pure [RouterOutcome]
+         * (Phase 6, plan §11/§13). Extracted verbatim from the former inline block in
+         * [handle] so the mapping is unit-testable against a real router + fake
+         * providers (see `RouterStreamConsumptionTest`), while the DAO-touching tail
+         * (fast-reply fallback insert / durable error row) stays in [handle].
+         *
+         * A companion function (not an instance method) precisely because it uses
+         * no orchestrator state — that is what makes it testable without wiring the
+         * 13-DAO constructor. [handle] calls it unqualified.
+         *
+         * Contract mapping (unchanged from the inline version):
+         *   - [com.example.data.ai.provider.ChatEvent.Delta] → on the FIRST delta run
+         *     [onFirstDelta] (the fast-tier gate: complete the deep latch, await the
+         *     race, emit any [HandleEvent.FastReply]); then emit
+         *     [HandleEvent.Partial] with the cumulative text.
+         *   - [com.example.data.ai.provider.ChatEvent.Reset] → §13 mid-stream failover
+         *     boundary: wipe the transient buffer and emit [HandleEvent.Reset]. Nothing
+         *     was persisted, so no duplicate answer is possible.
+         *   - [com.example.data.ai.provider.ChatEvent.Completed] → record the answer
+         *     and the resolved `provider:model`. The Gemini cascade already set the
+         *     model via `onModelResolved`; only overwrite for non-Gemini links (whose
+         *     model resolves only at Completed) — governed by [geminiProviderName].
+         *   - [com.example.data.ai.provider.ChatEvent.Failed] → capture the error.
+         *   - A non-[CancellationException] throwable escaping the router → synthesise
+         *     an [RouterOutcome.Exhausted]. Genuine outer cancellation is rethrown so
+         *     structured concurrency is honoured (§8, §13).
+         *
+         * Never logs keys or image bytes.
+         *
+         * @param events the router's event flow for this turn.
+         * @param emit forwards a [HandleEvent] into the orchestrator's outer flow.
+         * @param onFirstDelta the fast-tier gate, run once before the first
+         *   [HandleEvent.Partial]; it may itself emit a [HandleEvent.FastReply].
+         * @param resolvedModelSoFar the model the Gemini cascade may have already
+         *   resolved via `onModelResolved` (so Completed doesn't clobber it).
+         * @param geminiProviderName the provider id of the Gemini-cascade link, so a
+         *   Gemini `Completed` does not overwrite the already-resolved concrete model.
+         */
+        internal suspend fun consumeRouterStream(
+            events: kotlinx.coroutines.flow.Flow<com.example.data.ai.provider.ChatEvent>,
+            emit: suspend (HandleEvent) -> Unit,
+            onFirstDelta: suspend () -> Unit,
+            resolvedModelSoFar: String?,
+            geminiProviderName: String,
+        ): RouterOutcome {
+            var accumulated = ""
+            var sawFirstDelta = false
+            var resolvedModel: String? = resolvedModelSoFar
+            var routerReply: String? = null
+            var routerFailure: com.example.data.ai.provider.ChatError? = null
+            try {
+                events.collect { event ->
+                    when (event) {
+                        is com.example.data.ai.provider.ChatEvent.Delta -> {
+                            if (!sawFirstDelta) {
+                                sawFirstDelta = true
+                                onFirstDelta()
+                            }
+                            accumulated = event.accumulated
+                            emit(HandleEvent.Partial(accumulated))
+                        }
+                        is com.example.data.ai.provider.ChatEvent.Reset -> {
+                            // §13 mid-stream failover boundary: discard the transient
+                            // buffer the UI is showing; the fallback re-streams from
+                            // scratch. Nothing was persisted → no duplicate answer.
+                            android.util.Log.i(
+                                "CHAT_ROUTER",
+                                "reset ${event.fromProviderModel.value} -> ${event.toProviderModel.value} (discarding partial len=${accumulated.length})"
+                            )
+                            accumulated = ""
+                            emit(HandleEvent.Reset(event.fromProviderModel.value, event.toProviderModel.value))
+                        }
+                        is com.example.data.ai.provider.ChatEvent.Completed -> {
+                            routerReply = event.fullText
+                            // The provider id (e.g. "groq:qwen/qwen3.8-27b") is who
+                            // actually answered — record it for the badge. The Gemini
+                            // cascade already set resolvedModel via onModelResolved;
+                            // only overwrite for non-Gemini links (whose model
+                            // resolves only at Completed).
+                            if (resolvedModel == null ||
+                                event.providerModel.provider != geminiProviderName
+                            ) {
+                                resolvedModel = event.providerModel.value
+                            }
+                        }
+                        is com.example.data.ai.provider.ChatEvent.Failed -> {
+                            routerFailure = event.error
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                // Genuine outer cancellation propagates (session switch, ✕, scope
+                // death) so structured concurrency is honoured (§8, §13). The router
+                // already converts the Gemini cascade's recoverable 90 s
+                // TimeoutCancellationException into a Failed event, so a
+                // CancellationException reaching here is a real teardown.
+                if (t is CancellationException) throw t
+                routerFailure = com.example.data.ai.provider.ChatError(
+                    kind = com.example.data.ai.provider.ChatErrorKind.UNKNOWN,
+                    message = t.message?.take(300) ?: t.javaClass.simpleName,
+                    providerModel = com.example.data.ai.provider.ProviderModelId.of("router", "none"),
+                    cause = t,
+                )
+            }
+
+            val ok = routerReply
+            return if (ok != null && ok.isNotBlank()) {
+                RouterOutcome.Answer(text = ok, resolvedModel = resolvedModel)
+            } else {
+                RouterOutcome.Exhausted(failure = routerFailure)
+            }
+        }
+
         /** 2026-07-06 (Frente E) — Time-To-First-Token watchdog. If a
          *  given model doesn't emit any `StreamChunk.Partial` within
          *  this window, the stream is cancelled and the fleet loop
@@ -2890,6 +3245,23 @@ sealed class HandleEvent {
     ) : HandleEvent()
 
     data class Error(val cause: Throwable) : HandleEvent()
+
+    /**
+     * 2026-09-08 (Phase 6, plan §13) — mid-stream failover boundary emitted
+     * only when the router path is active ([BuildConfig.CHAT_ROUTER_ENABLED]).
+     * A provider streamed partial deltas and then died; a healthy fallback is
+     * taking over. The ViewModel MUST discard the in-progress streamed text for
+     * the current turn (`_streamingText` / accumulated partial) so the fallback
+     * re-renders from scratch — the abandoned partial is never persisted. This
+     * is the UI half of [com.example.data.ai.provider.ChatEvent.Reset]; it
+     * guarantees "one user turn never produces two persisted assistant answers":
+     * text stays transient until [Done], and [Reset] wipes the transient buffer.
+     *
+     * [from]/[to] name the dying and taking-over `provider:model` for the log
+     * line only — never carries keys or image bytes.
+     */
+    data class Reset(val from: String, val to: String) : HandleEvent()
+
 
     /**
      * 2026-07-06 (Frente H) — instant short answer emitted BEFORE the
