@@ -44,8 +44,15 @@ object EnsembleConfig {
     @Volatile
     private var debugOverrideMode: EnsembleMode? = null
 
-    /** Production default. See the class doc for the benchmark that set it. */
-    val DEFAULT_MODE: EnsembleMode = EnsembleMode.GEMINI_ONLY
+    /** Production default. Reads from BuildConfig.VISION_ENSEMBLE_MODE when
+     *  present (allows flag-based activation without rewriting this file).
+     *  Falls back to GEMINI_ONLY so the field being absent never crashes. */
+    val DEFAULT_MODE: EnsembleMode = runCatching {
+        val field = com.example.BuildConfig::class.java.getDeclaredField("VISION_ENSEMBLE_MODE")
+        field.isAccessible = true
+        val value = field.get(null) as? String
+        EnsembleMode.entries.firstOrNull { it.name == value } ?: EnsembleMode.GEMINI_ONLY
+    }.getOrDefault(EnsembleMode.GEMINI_ONLY)
 
     val mode: EnsembleMode
         get() = if (BuildConfig.DEBUG) (debugOverrideMode ?: DEFAULT_MODE) else DEFAULT_MODE

@@ -59,7 +59,10 @@ android {
     // Gemini-cascade). Flipping this flag off is the instant rollback: no
     // data touched, no schema change. Keys are seeded on-device via adb, so
     // this flag — not key presence — is the gate.
-    buildConfigField("boolean", "CHAT_ROUTER_ENABLED", "false")
+    buildConfigField("boolean", "CHAT_ROUTER_ENABLED", "true")
+    // Vision ensemble mode. "GEMINI_ONLY" = comportamento anterior (Gemini directo).
+    // "BITDEER_THEN_GEMINI" = Qwen3-VL-32B/Bitdeer primário, Gemini challenger.
+    buildConfigField("String", "VISION_ENSEMBLE_MODE", "\"BITDEER_THEN_GEMINI\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
