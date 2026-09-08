@@ -99,14 +99,13 @@ class RouterStreamConsumptionTest {
     // --- (a) flag off → router never consumed ------------------------------
 
     @Test
-    fun flagOff_routerBranchNotTaken() {
-        // In unit tests BuildConfig.CHAT_ROUTER_ENABLED is the default (false).
-        // The fork guard is `CHAT_ROUTER_ENABLED && streaming`; with the flag
-        // false the router branch is unreachable and `consumeRouterStream` is
-        // never entered. Asserting the flag documents that today's shipped
-        // build routes through the untouched Gemini `streamReply` path.
-        assertFalse(
-            "CHAT_ROUTER_ENABLED must default false so shipped builds are unchanged",
+    fun flagEnabled_routerBranchActive() {
+        // CHAT_ROUTER_ENABLED=true: the router branch (Groq→RunInfra→Gemini)
+        // is active for streaming turns. Asserting the flag here documents the
+        // intentional activation (2026-09-08, Pixel validation).
+        // Rollback: set CHAT_ROUTER_ENABLED=false in build.gradle.kts.
+        assertTrue(
+            "CHAT_ROUTER_ENABLED should be true (activated 2026-09-08)",
             BuildConfig.CHAT_ROUTER_ENABLED,
         )
     }

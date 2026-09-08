@@ -159,7 +159,7 @@ class BitdeerFoodVisionProvider internal constructor(
 
     private companion object {
         const val PROVIDER_ID = "bitdeer-qwen3vl"
-        const val DEFAULT_MODEL = "Qwen/Qwen3-VL-32B"
+        const val DEFAULT_MODEL = "Qwen/Qwen3-VL-32B-Instruct"
         const val PLACEHOLDER_KEY = "MY_BITDEER_API_KEY"
         const val DEFAULT_TIMEOUT_MS = 90_000L
 

@@ -52,7 +52,8 @@ class EnsembleAnalysisOrchestrator(
             // Primary failed outright: go straight to the challenger rather
             // than failing the whole analysis. This is the "Qwen fails ->
             // Gemini directly" rule.
-            logger("primary ${primary.id} failed; falling back to ${challenger.id}")
+            val failDetail = attempts.lastOrNull()?.let { "${it.provider}:${it.kind} ${it.message}" } ?: "unknown"
+            logger("primary ${primary.id} failed ($failDetail); falling back to ${challenger.id}")
             val fallback = runProvider(challenger, request, attempts)
             return (fallback as? FoodVisionOutcome.Success)?.let {
                 EnsembleResult(

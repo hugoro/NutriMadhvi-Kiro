@@ -83,7 +83,7 @@ class BitdeerFoodVisionProviderTest {
 
         assertTrue(outcome is FoodVisionOutcome.Success)
         val result = (outcome as FoodVisionOutcome.Success).evidence.result
-        assertEquals("Qwen/Qwen3-VL-32B", result.analysisModel)
+        assertEquals("Qwen/Qwen3-VL-32B-Instruct", result.analysisModel)
     }
 
     @Test
