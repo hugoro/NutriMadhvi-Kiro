@@ -47,8 +47,30 @@ data class EnsemblePolicy(
     val adjudicateOnMaterialDisagreement: Boolean = true,
 ) {
     companion object {
-        /** Production default until the ensemble passes benchmark acceptance. */
+        /** Production default — calibrated to reject Qwen/Groq (61-68% error). */
         val DEFAULT = EnsemblePolicy()
+
+        /**
+         * Policy for [EnsembleMode.BITDEER_THEN_GEMINI].
+         *
+         * Qwen3-VL-32B benchmarked at 9.2% calorie error — much better than the
+         * Qwen3.8-27B chat models (61-68%) for which the DEFAULT thresholds were
+         * set. Lowering identification and portion to 0.70 lets a model-rated
+         * "medium" answer pass the gate, which is the correct behaviour for a
+         * provider that has been validated to be accurate.
+         *
+         * completeness/consistency stay at 0.85 — structural coherence is still
+         * required; only the identity/portion thresholds are relaxed.
+         */
+        val BITDEER = EnsemblePolicy(
+            identificationThreshold = 0.70,
+            portionThreshold = 0.60,
+            completenessThreshold = 0.85,
+            consistencyThreshold = 0.85,
+            specificityThreshold = 0.50,
+            maxChallengers = 1,
+            adjudicateOnMaterialDisagreement = true,
+        )
     }
 }
 

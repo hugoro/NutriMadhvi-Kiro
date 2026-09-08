@@ -275,7 +275,7 @@ class MealAnalysisOrchestrator(
                         promptHint = req.promptHint,
                         language = req.language,
                         habitsBlock = req.habitsBlock.orEmpty(),
-                    )
+                    ) + EnsemblePrompts.CANONICAL_NAMING_RULES
                 }
             }
             else -> {

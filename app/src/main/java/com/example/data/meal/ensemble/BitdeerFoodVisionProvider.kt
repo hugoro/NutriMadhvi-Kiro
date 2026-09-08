@@ -106,6 +106,13 @@ class BitdeerFoodVisionProvider internal constructor(
             appliedHabitIds = safeApplied,
             analysisModel = model,
             escalated = false,
+            // Qwen3-VL echoes <PLACEHOLDER> tokens literally instead of
+            // substituting them. Resolve them here so the fullSummary the
+            // user reads is clean ("Ingredientes visíveis: …" not
+            // "<INGREDIENTS_LABEL>: …").
+            fullSummary = parsed.fullSummary?.let {
+                resolveSummaryPlaceholders(it, request.language)
+            },
         )
 
         return FoodVisionOutcome.Success(
@@ -155,6 +162,23 @@ class BitdeerFoodVisionProvider internal constructor(
         code == 413 -> FoodVisionErrorKind.PAYLOAD_TOO_LARGE
         code in 500..599 -> FoodVisionErrorKind.UNAVAILABLE
         else -> FoodVisionErrorKind.REQUEST_FAILED
+    }
+
+    /**
+     * Qwen3-VL echoes prompt placeholders literally. Replace them with the
+     * values the prompt defined for the given language, mirroring
+     * GeminiRepository.summaryLabelInstruction.
+     */
+    private fun resolveSummaryPlaceholders(summary: String, language: String): String {
+        val (ingr, assumed, conf) = when (language) {
+            "pt-PT", "pt" -> Triple("Ingredientes visíveis", "Assumido", "confiança")
+            "gu"          -> Triple("દૃશ્યમાન ઘટકો", "ધારણા", "વિશ્વાસ")
+            else          -> Triple("Visible ingredients", "Assumed", "confidence")
+        }
+        return summary
+            .replace("<INGREDIENTS_LABEL>", ingr)
+            .replace("<ASSUMED_LABEL>", assumed)
+            .replace("<CONFIDENCE_LABEL>", conf)
     }
 
     private companion object {

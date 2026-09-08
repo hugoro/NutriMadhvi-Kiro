@@ -106,10 +106,11 @@ class GroqChatProvider(
     private fun buildRequest(request: ChatRequest): GroqStreamRequest {
         val messages = mutableListOf<GroqStreamMessage>()
         // System instruction becomes an OpenAI `system` message rather than a
-        // separate field. Preserved verbatim (§16 — model change must not
-        // rewrite the prompt).
+        // separate field. Truncated to MAX_SYSTEM_CHARS to stay within Groq's
+        // Tier-1 token budget (~6000 TPM): the persona and tone rules are at
+        // the top; the rolling data snapshot at the end is trimmed first.
         request.systemInstruction?.takeIf { it.isNotBlank() }?.let {
-            messages.add(GroqStreamMessage(role = "system", content = it))
+            messages.add(GroqStreamMessage(role = "system", content = it.take(MAX_SYSTEM_CHARS)))
         }
         request.messages.forEach { msg ->
             messages.add(GroqStreamMessage(role = msg.role.toOpenAiRole(), content = msg.text))
@@ -180,5 +181,13 @@ class GroqChatProvider(
          *  router configuration and validated live before promotion (§6). */
         const val DEFAULT_MODEL = "qwen/qwen3.8-27b"
         private const val PLACEHOLDER_KEY = "MY_GROQ_API_KEY"
+        /**
+         * Groq Tier-1 allows ~6000 tokens/min. The NutriMadhvi system prompt
+         * (persona + snapshot + KB) easily exceeds that. Cap the system message
+         * at ~4000 tokens (≈16000 chars at ~4 chars/token) so the persona and
+         * tone rules at the top are preserved and the variable data snapshot at
+         * the bottom is trimmed. RunInfra and Gemini receive the full prompt.
+         */
+        private const val MAX_SYSTEM_CHARS = 16_000
     }
 }

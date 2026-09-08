@@ -62,7 +62,7 @@ android {
     buildConfigField("boolean", "CHAT_ROUTER_ENABLED", "true")
     // Vision ensemble mode. "GEMINI_ONLY" = comportamento anterior (Gemini directo).
     // "BITDEER_THEN_GEMINI" = Qwen3-VL-32B/Bitdeer primário, Gemini challenger.
-    buildConfigField("String", "VISION_ENSEMBLE_MODE", "\"BITDEER_THEN_GEMINI\"")
+    buildConfigField("String", "VISION_ENSEMBLE_MODE", "\"GEMINI_ONLY\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

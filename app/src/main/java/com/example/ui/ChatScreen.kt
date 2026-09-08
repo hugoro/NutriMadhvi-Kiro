@@ -9836,6 +9836,22 @@ fun MessageBubbleItem(
                         color = Color(0xFF64748B),
                         style = MaterialTheme.typography.labelSmall
                     )
+                    // Model badge: shown when a non-Gemini provider answered
+                    // (e.g. RunInfra/Qwen, Groq). Gemini is the expected default
+                    // so we only surface the label when something else ran.
+                    val chatModel = message.analysisModel
+                    if (!chatModel.isNullOrBlank() &&
+                        !chatModel.startsWith("gemini") &&
+                        !chatModel.startsWith("MY_")
+                    ) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "· ${com.example.ui.components.modelDisplayName(chatModel)}",
+                            color = Color(0xFF6366F1),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
                     Spacer(Modifier.weight(1f))
                     if (canRead) {
                         IconButton(

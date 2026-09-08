@@ -98,7 +98,7 @@ fun ConfidenceChip(
                 fontWeight = FontWeight.SemiBold
             )
         }
-        if (escalated) {
+        if (escalated || isNonGeminiModel(modelName)) {
             Spacer(Modifier.width(6.dp))
             // Indigo-violet pill matching AccentPrimary; Color.White as
             // contentColor is set explicitly (the auto-derive on top of a
@@ -122,6 +122,20 @@ fun ConfidenceChip(
     // borderColor reserved for a future outlined variant — kept in the
     // tuple to make adding a tonal background straightforward later.
     @Suppress("UNUSED_EXPRESSION") borderColor
+}
+
+/**
+ * True when [rawModel] identifies a non-Gemini provider (Bitdeer, Groq,
+ * RunInfra, or any provider:model id containing those tokens). Used by
+ * [ConfidenceChip] to show the model badge even when [escalated] is false —
+ * ensemble winners are not escalations but the user still deserves to know
+ * which model ran.
+ */
+internal fun isNonGeminiModel(rawModel: String?): Boolean {
+    val m = rawModel?.trim()?.lowercase() ?: return false
+    return m.contains("bitdeer") || m.contains("qwen") ||
+        m.contains("runinfra") || m.contains("groq") ||
+        m.contains("grok") || (m.contains(":") && !m.startsWith("gemini"))
 }
 
 private data class Quad(
@@ -153,6 +167,16 @@ internal fun modelDisplayName(rawModel: String?): String {
         }
         model.contains("qwen") -> {
             val version = Regex("qwen(\\d+\\.\\d+)").find(model)?.groupValues?.get(1)
+            val tier = when {
+                model.contains("vl") -> "VL"
+                else -> null
+            }
+            listOfNotNull("Qwen", version, tier).joinToString(" ")
+        }
+        model.startsWith("runinfra:") || model.startsWith("groq:") -> {
+            // "runinfra:qwen3-8-27b" → "Qwen 3.8", "groq:qwen/qwen3.8-27b" → "Qwen 3.8"
+            val modelPart = rawModel!!.substringAfter(":").substringAfterLast("/").trim()
+            val version = Regex("qwen(\\d+\\.\\d+)").find(modelPart.lowercase())?.groupValues?.get(1)
             listOfNotNull("Qwen", version).joinToString(" ")
         }
         else -> rawModel!!

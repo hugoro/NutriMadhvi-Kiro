@@ -62,7 +62,11 @@ object EnsembleConfig {
         if (BuildConfig.DEBUG) debugOverrideMode = value
     }
 
-    val policy: EnsemblePolicy get() = EnsemblePolicy.DEFAULT.copy(mode = mode)
+    val policy: EnsemblePolicy
+        get() = when (mode) {
+            EnsembleMode.BITDEER_THEN_GEMINI -> EnsemblePolicy.BITDEER.copy(mode = mode)
+            else -> EnsemblePolicy.DEFAULT.copy(mode = mode)
+        }
 
     /** True when the ensemble should take over the provider decision layer. */
     val isEnsembleActive: Boolean get() = mode != EnsembleMode.GEMINI_ONLY
