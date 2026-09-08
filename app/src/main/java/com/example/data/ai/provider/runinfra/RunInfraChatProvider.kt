@@ -161,9 +161,13 @@ class RunInfraChatProvider(
 
     companion object {
         const val PROVIDER = "runinfra"
-        /** Default RunInfra-hosted Qwen chat model. Pinned by router config;
-         *  validated live before promotion (§9). */
-        const val DEFAULT_MODEL = "qwen3.8-27b"
+        /** Default RunInfra-hosted Qwen chat model. Pinned by router config.
+         *  §9 live validation (2026-09-08, paid account): the served id is
+         *  `qwen3-8-27b` (dashes) — the dotted `qwen3.8-27b` is NOT served and
+         *  would fail every request with an unknown-model error. Confirmed via
+         *  GET /v1/models + a non-streaming and a streaming completion
+         *  (finish_reason=stop, TTFT ~1.4–2.0s). */
+        const val DEFAULT_MODEL = "qwen3-8-27b"
         private const val PLACEHOLDER_KEY = "MY_RUNINFRA_API_KEY"
     }
 }

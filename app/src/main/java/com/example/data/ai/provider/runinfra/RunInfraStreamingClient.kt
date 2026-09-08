@@ -26,9 +26,15 @@ import java.util.concurrent.TimeUnit
  * [baseUrl] and the model id are **injected** and validated against the live
  * paid account before promotion (§9 items 1–2: load credit, validate
  * endpoint/model, validate streaming, measure TTFT). The [DEFAULT_BASE_URL]
- * here is the documented OpenAI-compatible convention and a starting point for
- * that validation — it MUST be confirmed live before Phase 6 flips RunInfra
- * into the active failover slot. Until then RunInfra stays wired but dormant.
+ * here is the documented OpenAI-compatible convention.
+ *
+ * §9 live validation done 2026-09-08 against the paid account:
+ *   - `https://api.runinfra.ai/` + `v1/chat/completions`, Bearer auth → HTTP 200;
+ *   - served model id is `qwen3-8-27b` (dashes; the dotted form is NOT served);
+ *   - non-streaming and streaming completions both return `finish_reason==stop`;
+ *   - streaming emits `data: {…}` SSE chunks + a `[DONE]` sentinel; TTFT ~1.4–2.0s.
+ * The base URL / path / auth scheme are therefore confirmed correct; RunInfra
+ * remains gated behind `CHAT_ROUTER_ENABLED` (default false) until the flag flips.
  *
  * Cancellation: cancelling the collector cancels the OkHttp `Call` via
  * `awaitClose` (§8 cancellation). Never logs the request body or Authorization
