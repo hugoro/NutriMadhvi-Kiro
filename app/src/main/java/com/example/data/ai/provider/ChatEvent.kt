@@ -15,6 +15,13 @@ package com.example.data.ai.provider
  *   Delta* (Completed | Failed)
  * — zero or more deltas, then exactly one terminal event, then the flow
  * completes. Never two terminals.
+ *
+ * The [ChatProviderRouter] may additionally emit [Reset] between a
+ * mid-stream failover boundary (§13): the sequence it produces is
+ *   (Delta* Reset)* Delta* (Completed | Failed)
+ * i.e. zero or more "attempts", each a run of deltas that a [Reset] discards,
+ * followed by one final run that ends in a single terminal. Individual
+ * providers never emit [Reset]; only the router does.
  */
 sealed interface ChatEvent {
 
@@ -24,6 +31,25 @@ sealed interface ChatEvent {
     data class Delta(
         val text: String,
         val accumulated: String,
+    ) : ChatEvent
+
+    /**
+     * A mid-stream failover boundary (plan §13 "replace the transient buffer").
+     * Emitted ONLY by [ChatProviderRouter] when a provider dies *after* it had
+     * already streamed partial output and a healthy fallback exists. The
+     * consumer MUST discard everything buffered for this turn so far and
+     * re-render from the [Delta]s that follow — the previous provider's partial
+     * text is abandoned, never appended to the fallback's answer. This is what
+     * guarantees "one user turn never produces two persisted assistant answers":
+     * output stays transient until [Completed], and a [Reset] wipes the transient
+     * buffer rather than committing it.
+     *
+     * [fromProviderModel] is who died; [toProviderModel] is who is taking over —
+     * for the observability/fallback record (never carries keys or image bytes).
+     */
+    data class Reset(
+        val fromProviderModel: ProviderModelId,
+        val toProviderModel: ProviderModelId,
     ) : ChatEvent
 
     /** Clean terminal success. [fullText] is the complete answer; [usage] is

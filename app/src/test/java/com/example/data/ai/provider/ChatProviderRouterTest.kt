@@ -222,9 +222,47 @@ class ChatProviderRouterTest {
     }
 
     @Test
-    fun post_partial_failure_surfaces_and_does_not_start_second_provider() = runTest {
-        // §13 Phase-4 guard: once a Delta is forwarded, a later Failed is
-        // surfaced (not silently replaced by a second provider's answer).
+    fun mid_stream_death_with_fallback_emits_reset_then_completes_from_fallback() = runTest {
+        // §13 Phase-5: a provider that dies AFTER partial output does not
+        // append a second answer. The router emits Reset (discard the buffer)
+        // and re-renders from the healthy fallback → still one persisted answer.
+        val groqId = ProviderModelId.of("groq", "q")
+        val groq = FakeProvider("groq", "q") {
+            flow {
+                emit(ChatEvent.Delta("meia ", "meia "))
+                emit(ChatEvent.Failed(ChatError(ChatErrorKind.NETWORK, "drop", groqId, partialText = "meia ")))
+            }
+        }
+        val runinfra = FakeProvider("runinfra", "q") { completedFor("runinfra:q", "resposta completa") }
+        val router = ChatProviderRouter(listOf(groq, runinfra), breaker())
+
+        val events = router.stream(textRequest()).toList()
+
+        // Exactly one Reset, naming who died and who took over.
+        val resets = events.filterIsInstance<ChatEvent.Reset>()
+        assertEquals(1, resets.size)
+        assertEquals("groq:q", resets[0].fromProviderModel.value)
+        assertEquals("runinfra:q", resets[0].toProviderModel.value)
+
+        // Reset comes AFTER groq's delta and BEFORE runinfra's deltas.
+        val resetIdx = events.indexOfFirst { it is ChatEvent.Reset }
+        assertTrue(events.take(resetIdx).any { it is ChatEvent.Delta }) // groq partial before
+        assertTrue(events.drop(resetIdx + 1).any { it is ChatEvent.Delta }) // fallback deltas after
+
+        // Exactly one terminal, and it is the fallback's Completed.
+        val terminals = events.filter { it is ChatEvent.Completed || it is ChatEvent.Failed }
+        assertEquals(1, terminals.size)
+        val done = terminals.single() as ChatEvent.Completed
+        assertEquals("runinfra:q", done.providerModel.value)
+        assertEquals("resposta completa", done.fullText)
+        assertEquals(1, runinfra.streamCalls)
+    }
+
+    @Test
+    fun mid_stream_death_with_no_fallback_surfaces_controlled_failure_with_partial() = runTest {
+        // §13: "otherwise show a controlled failure." No healthy fallback left
+        // → surface Failed carrying the partial; never invent an answer, never
+        // emit a spurious Reset.
         val groqId = ProviderModelId.of("groq", "q")
         val groq = FakeProvider("groq", "q") {
             flow {
@@ -232,14 +270,16 @@ class ChatProviderRouterTest {
                 emit(ChatEvent.Failed(ChatError(ChatErrorKind.NETWORK, "drop", groqId, partialText = "parcial")))
             }
         }
-        val runinfra = FakeProvider("runinfra", "q") { error("must not start after partial output") }
-        val router = ChatProviderRouter(listOf(groq, runinfra), breaker())
+        // Only fallback is unavailable → nowhere healthy to go.
+        val gemini = FakeProvider("gemini", "flash", available = false) { error("skip") }
+        val router = ChatProviderRouter(listOf(groq, gemini), breaker())
 
         val events = router.stream(textRequest()).toList()
+        assertTrue(events.none { it is ChatEvent.Reset })
         assertTrue(events.any { it is ChatEvent.Delta })
         val failed = events.last() as ChatEvent.Failed
         assertEquals("parcial", failed.error.partialText)
-        assertEquals(0, runinfra.streamCalls)
+        assertEquals(0, gemini.streamCalls)
     }
 
     @Test

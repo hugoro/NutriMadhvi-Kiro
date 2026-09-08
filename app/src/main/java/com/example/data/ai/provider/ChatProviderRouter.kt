@@ -23,17 +23,23 @@ import kotlinx.coroutines.flow.flow
  *     to the next candidate (every [ChatErrorKind] is fail-over-able; the kind
  *     is preserved for logging/metrics, not to gate the decision).
  *
- * ### Phase 4 scope: pre-token failover only
- * This router performs **pre-first-token** failover: if a provider fails
- * before emitting any [ChatEvent.Delta], the next candidate is tried and the
- * consumer never saw output. If a provider fails *after* partial output, the
- * §13 hard requirement — "one user turn must never produce two persisted
- * assistant answers" — governs, and safe mid-stream restart is Phase 5. To
- * keep that invariant impossible to violate here, once this router has
- * forwarded a [ChatEvent.Delta] from a provider it will NOT silently start a
- * second provider: a subsequent [ChatEvent.Failed] is forwarded as-is (carrying
- * any partial text) so the caller decides. Phase 5 replaces that terminal
- * forward with a transient-buffer restart. Nothing here persists anything.
+ * ### Streaming failover safety (Phase 5, plan §13)
+ * The router serves one turn from one provider, but two failure timings differ:
+ *   - **Pre-first-token failure** (no [ChatEvent.Delta] emitted yet): the next
+ *     candidate is tried transparently; the consumer never saw output.
+ *   - **Mid-stream failure** (failure *after* partial deltas): §13 forbids
+ *     appending a second full answer. The router emits a [ChatEvent.Reset]
+ *     naming the dying and taking-over providers, then streams the fallback.
+ *     [Reset] instructs the consumer to **discard the transient buffer** and
+ *     re-render from the deltas that follow — the abandoned partial is never
+ *     persisted, so "one turn = one persisted answer" holds. If no healthy
+ *     fallback remains after a mid-stream death, the router surfaces a
+ *     controlled [ChatEvent.Failed] carrying the partial text (§13 "otherwise
+ *     show a controlled failure") — it does NOT invent an answer.
+ *
+ * Because output stays transient until [ChatEvent.Completed] and a [Reset]
+ * wipes it, the duplicate-answer invariant is structurally impossible to
+ * violate here. Nothing in the router persists anything.
  *
  * Cancellation propagates: a [CancellationException] from the collected
  * provider flow is rethrown, tearing down the provider call (§8, §13).
@@ -64,13 +70,15 @@ class ChatProviderRouter(
      * Emits neutral [ChatEvent]s so the orchestrator consumes the router
      * exactly as it would a single provider. Terminates with exactly one of:
      *   - [ChatEvent.Completed] (some provider succeeded), or
-     *   - [ChatEvent.Failed] (all candidates skipped/failed, or a provider
-     *     failed after already streaming partial output — see class docs).
+     *   - [ChatEvent.Failed] (all candidates skipped/failed, or a mid-stream
+     *     death with no healthy fallback — see class docs).
+     * May emit [ChatEvent.Reset] at a mid-stream failover boundary (§13).
      */
     fun stream(request: ChatRequest): Flow<ChatEvent> = flow {
         var lastFailure: ChatError? = null
 
-        for (provider in chain) {
+        for (index in chain.indices) {
+            val provider = chain[index]
             val idValue = provider.id.value
 
             val skip = skipReason(provider, request)
@@ -100,6 +108,9 @@ class ChatProviderRouter(
                             // Do not emit yet: a pre-token failure should fail
                             // over silently. Only surface it if we can't recover.
                         }
+                        // Providers never emit Reset (only the router does); if
+                        // one somehow did, forward it — the consumer handles it.
+                        is ChatEvent.Reset -> emit(event)
                     }
                 }
             } catch (ce: CancellationException) {
@@ -118,42 +129,41 @@ class ChatProviderRouter(
                 )
             }
 
-            when (val t = terminal) {
+            // Reduce a "no terminal event" close to an INVALID_RESPONSE failure
+            // so both the failed and the silent-close paths share one handler.
+            val failure: ChatError = when (val t = terminal) {
                 is ChatEvent.Completed -> {
                     breaker.recordSuccess(idValue)
                     onRouteEvent(RouteTrace.Succeeded(idValue))
                     return@flow
                 }
-                is ChatEvent.Failed -> {
-                    breaker.recordFailure(idValue)
-                    lastFailure = t.error
-                    onRouteEvent(RouteTrace.Failed(idValue, t.error.kind, afterPartial = sawDelta))
-                    if (sawDelta) {
-                        // Post-partial failure: §13 forbids starting a second
-                        // provider here in Phase 4 (would risk a duplicate
-                        // answer). Surface the failure with its partial text.
-                        emit(t)
-                        return@flow
-                    }
-                    // Pre-token failure → try the next candidate.
-                }
-                else -> {
-                    // Provider completed the flow without any terminal event.
-                    // Treat as an invalid (empty) response and advance.
-                    val err = ChatError(
-                        kind = ChatErrorKind.INVALID_RESPONSE,
-                        message = "Provider closed stream without a terminal event",
-                        providerModel = provider.id,
-                    )
-                    breaker.recordFailure(idValue)
-                    lastFailure = err
-                    onRouteEvent(RouteTrace.Failed(idValue, err.kind, afterPartial = sawDelta))
-                    if (sawDelta) {
-                        emit(ChatEvent.Failed(err))
-                        return@flow
-                    }
-                }
+                is ChatEvent.Failed -> t.error
+                else -> ChatError(
+                    kind = ChatErrorKind.INVALID_RESPONSE,
+                    message = "Provider closed stream without a terminal event",
+                    providerModel = provider.id,
+                )
             }
+
+            breaker.recordFailure(idValue)
+            lastFailure = failure
+            onRouteEvent(RouteTrace.Failed(idValue, failure.kind, afterPartial = sawDelta))
+
+            if (sawDelta) {
+                // Mid-stream death (§13). We may only continue to a fallback by
+                // telling the consumer to discard the abandoned partial first.
+                val next = nextServable(startIndex = index + 1, request = request)
+                if (next != null) {
+                    emit(ChatEvent.Reset(fromProviderModel = provider.id, toProviderModel = next.id))
+                    // Fall through: the loop advances and will reach `next`,
+                    // tracing the intervening unservable candidates as Skipped.
+                    continue
+                }
+                // No healthy fallback → controlled failure carrying the partial.
+                emit(ChatEvent.Failed(failure))
+                return@flow
+            }
+            // Pre-token failure → try the next candidate transparently.
         }
 
         // Chain exhausted with no success.
@@ -172,6 +182,19 @@ class ChatProviderRouter(
                 )
             )
         )
+    }
+
+    /**
+     * First candidate at or after [startIndex] that would not be skipped for
+     * [request] — the look-ahead a mid-stream failover uses to decide whether a
+     * [ChatEvent.Reset] is warranted (there is somewhere to go) versus a
+     * controlled failure (nowhere healthy left). Read-only: mutates nothing.
+     */
+    private fun nextServable(startIndex: Int, request: ChatRequest): ChatProvider? {
+        for (i in startIndex until chain.size) {
+            if (skipReason(chain[i], request) == null) return chain[i]
+        }
+        return null
     }
 
     private fun skipReason(provider: ChatProvider, request: ChatRequest): SkipReason? = when {
