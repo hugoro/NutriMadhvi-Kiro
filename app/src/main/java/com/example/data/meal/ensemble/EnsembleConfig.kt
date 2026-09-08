@@ -61,6 +61,25 @@ object EnsembleConfig {
     val isEnsembleActive: Boolean get() = mode != EnsembleMode.GEMINI_ONLY
 
     /**
+     * Bitdeer key, sourced from the same `.env` → BuildConfig mechanism as the
+     * other keys. Returns blank when the field is absent or still the
+     * placeholder, which makes the Bitdeer provider report itself unavailable
+     * and the ensemble degrade cleanly to Gemini-only.
+     *
+     * Read reflectively so the code compiles whether or not `BITDEER_API_KEY`
+     * is present in `.env` — a missing field must never crash at startup.
+     */
+    val bitdeerApiKey: String by lazy {
+        runCatching {
+            val field = BuildConfig::class.java.getDeclaredField("BITDEER_API_KEY")
+            field.isAccessible = true
+            (field.get(null) as? String).orEmpty()
+        }.getOrDefault("").let { key ->
+            if (key.isBlank() || key == "MY_BITDEER_API_KEY") "" else key
+        }
+    }
+
+    /**
      * Groq key, sourced from the same `.env` → BuildConfig mechanism as the
      * Gemini key. Returns blank when the field is absent or still the
      * placeholder, which makes the Qwen provider report itself unavailable

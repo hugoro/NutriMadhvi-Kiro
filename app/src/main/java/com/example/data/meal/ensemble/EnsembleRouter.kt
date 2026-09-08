@@ -13,6 +13,17 @@ enum class EnsembleMode {
 
     /** Full pipeline: Qwen primary → selective Gemini challenger → Qwen adjudication. */
     QWEN_ENSEMBLE,
+
+    /**
+     * Bitdeer Qwen3-VL-32B as primary, Gemini as fallback on failure / low
+     * confidence. The ensemble gate and challenger machinery applies normally —
+     * when Bitdeer clears the gate the result is accepted; otherwise Gemini runs
+     * as challenger.
+     *
+     * Phase 9 of the multimodel plan. Default remains [GEMINI_ONLY] until
+     * Bitdeer is validated on real photos.
+     */
+    BITDEER_THEN_GEMINI,
 }
 
 /**

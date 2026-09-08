@@ -10,6 +10,7 @@ import com.example.data.meal.ensemble.EnsembleMode
 import com.example.data.meal.ensemble.EnsemblePrompts
 import com.example.data.meal.ensemble.FoodVisionRequest
 import com.example.data.meal.ensemble.GeminiFoodVisionProvider
+import com.example.data.meal.ensemble.createBitdeerProvider
 import com.example.data.meal.ensemble.createQwenGroqProvider
 import com.example.data.remote.ActivityAnalysisResult
 import com.example.data.remote.Content
@@ -254,9 +255,6 @@ class MealAnalysisOrchestrator(
         // second opinion on; text-only re-analysis keeps its existing path.
         if (base64Image.isNullOrBlank()) return false
 
-        val groqKey = EnsembleConfig.groqApiKey
-        if (groqKey.isBlank()) return false
-
         val visionRequest = FoodVisionRequest(
             base64Image = base64Image,
             mimeType = mimeType,
@@ -266,12 +264,39 @@ class MealAnalysisOrchestrator(
             offeredHabitIds = offeredHabitIds,
         )
 
-        val qwen = createQwenGroqProvider(apiKey = groqKey) { req ->
-            buildAnalysisPrompt(
-                promptHint = req.promptHint,
-                language = req.language,
-                habitsBlock = req.habitsBlock.orEmpty(),
-            ) + EnsemblePrompts.CANONICAL_NAMING_RULES
+        // Build the primary provider based on the active ensemble mode.
+        // Gemini is always the challenger/fallback regardless of which primary runs.
+        val primary = when (EnsembleConfig.mode) {
+            EnsembleMode.BITDEER_THEN_GEMINI -> {
+                val bitdeerKey = EnsembleConfig.bitdeerApiKey
+                if (bitdeerKey.isBlank()) return false
+                createBitdeerProvider(apiKey = bitdeerKey) { req ->
+                    buildAnalysisPrompt(
+                        promptHint = req.promptHint,
+                        language = req.language,
+                        habitsBlock = req.habitsBlock.orEmpty(),
+                    )
+                }
+            }
+            else -> {
+                val groqKey = EnsembleConfig.groqApiKey
+                if (groqKey.isBlank()) return false
+                createQwenGroqProvider(apiKey = groqKey) { req ->
+                    buildAnalysisPrompt(
+                        promptHint = req.promptHint,
+                        language = req.language,
+                        habitsBlock = req.habitsBlock.orEmpty(),
+                    ) + EnsemblePrompts.CANONICAL_NAMING_RULES
+                }
+            }
+        }
+
+        // Qwen adjudication only applies when Qwen-Groq is the primary.
+        // For Bitdeer mode there is no adjudicator — the challenger (Gemini) is
+        // already the strongest option we have for a third opinion.
+        val adjudicator = when (EnsembleConfig.mode) {
+            EnsembleMode.QWEN_ENSEMBLE -> primary // primary IS qwen in this branch
+            else -> null
         }
 
         // Reuses the repository's existing blocking Gemini path (5-model
@@ -283,9 +308,9 @@ class MealAnalysisOrchestrator(
         )
 
         val ensemble = EnsembleAnalysisOrchestrator(
-            primary = qwen,
+            primary = primary,
             challenger = gemini,
-            adjudicator = if (EnsembleConfig.mode == EnsembleMode.QWEN_ENSEMBLE) qwen else null,
+            adjudicator = adjudicator,
             policy = EnsembleConfig.policy,
         )
 
