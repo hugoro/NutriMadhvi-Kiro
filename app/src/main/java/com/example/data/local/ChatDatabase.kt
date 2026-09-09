@@ -21,9 +21,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         DailyActivitySnapshotEntity::class,
         UserInsight::class,
         PredictedQaEntity::class,
-        IngredientNutritionEntity::class
+        IngredientNutritionEntity::class,
+        MealCorrectionEntity::class
     ],
-    version = 33,
+    version = 34,
     exportSchema = true
 )
 @androidx.room.TypeConverters(Converters::class)
@@ -39,6 +40,7 @@ abstract class ChatDatabase : RoomDatabase() {
     abstract val userInsightDao: UserInsightDao
     abstract val predictedQaDao: PredictedQaDao
     abstract val ingredientNutritionDao: IngredientNutritionDao
+    abstract val mealCorrectionDao: MealCorrectionDao
 
     companion object {
         @Volatile
@@ -664,6 +666,49 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Adds the `meal_corrections` table — an append-only record of the gap
+         * between the AI's meal-analysis estimate and what the user actually
+         * saved. Powers [com.example.data.nutrition.CorrectionCalibrator], which
+         * derives a directional calibration (macro bias + recurrent ingredient
+         * substitutions) injected into future analysis prompts so the model
+         * stops repeating the same interpretation errors.
+         *
+         * Purely additive `CREATE TABLE IF NOT EXISTS` — no existing table is
+         * touched. New + existing installs hit this with an empty table; it
+         * fills organically as the user corrects meals. See
+         * [MealCorrectionEntity] for the append-only / nullable rationale.
+         */
+        val MIGRATION_33_34 = object : Migration(33, 34) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `meal_corrections` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `createdAtMs` INTEGER NOT NULL,
+                        `mealCategory` TEXT,
+                        `model` TEXT,
+                        `initialConfidence` TEXT,
+                        `aiName` TEXT,
+                        `userName` TEXT,
+                        `aiCalories` INTEGER,
+                        `userCalories` INTEGER,
+                        `aiProtein` REAL,
+                        `userProtein` REAL,
+                        `aiCarbs` REAL,
+                        `userCarbs` REAL,
+                        `aiFat` REAL,
+                        `userFat` REAL,
+                        `aiIngredientsJson` TEXT,
+                        `userIngredientsJson` TEXT
+                    )
+                """.trimIndent())
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_meal_corrections_createdAtMs` " +
+                        "ON `meal_corrections`(`createdAtMs`)"
+                )
+            }
+        }
+
         val MIGRATION_28_29 = object : Migration(28, 29) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // Ingredient nutrition cache — grows organically as the user
@@ -758,7 +803,8 @@ abstract class ChatDatabase : RoomDatabase() {
                     MIGRATION_29_30,
                     MIGRATION_30_31,
                     MIGRATION_31_32,
-                    MIGRATION_32_33
+                    MIGRATION_32_33,
+                    MIGRATION_33_34
                 )
                 // Hard guarantee that v9→v10 (and later) NEVER nukes user data:
                 // if a defined migration throws, the app crashes loudly instead of

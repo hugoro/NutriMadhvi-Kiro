@@ -1777,6 +1777,16 @@ class ChatViewModel(
                         withLog.copy(id = newId)
                     }
                     savedEntries += saved
+
+                    // Capture the AI-vs-user gap for the correction calibrator.
+                    // `_lastAnalyzedResult` still holds the pristine AI estimate
+                    // (never cleared during editing); `saved` is what the user
+                    // committed. Only record when there is a real correction —
+                    // a pristine ADDED save with no edits records nothing.
+                    maybeRecordCorrection(
+                        aiResult = _lastAnalyzedResult.value,
+                        savedEntry = saved,
+                    )
                 }
                 // One line per save cycle. Enough to reason about: did it fire,
                 // how many rows, did ids come back, was it insert vs update.
@@ -1810,6 +1820,72 @@ class ChatViewModel(
                 _foodAnalysisProgress.value = com.example.data.meal.FoodAnalysisProgress()
             }
         }
+    }
+
+    /**
+     * Record the gap between the AI's original estimate ([aiResult]) and what
+     * the user actually saved ([savedEntry]) for the correction calibrator —
+     * but only when there is a *material* correction. A pristine save where the
+     * user accepted the AI's numbers verbatim records nothing (no signal).
+     *
+     * "Material" = the dish name changed, OR any macro moved beyond a small
+     * relative epsilon, OR the ingredient list changed. Rounding-level noise is
+     * ignored so accepting-with-a-tiny-nudge doesn't pollute the bias.
+     *
+     * Never throws — capture is best-effort and must not break a save. The
+     * heavy lifting (insert + trim + cache invalidation) lives in
+     * [GeminiRepository.recordMealCorrection].
+     */
+    private suspend fun maybeRecordCorrection(
+        aiResult: FoodAnalysisResult?,
+        savedEntry: FoodEntry,
+    ) {
+        val ai = aiResult ?: return
+
+        fun macroMoved(aiVal: Double?, userVal: Double): Boolean {
+            if (aiVal == null) return false
+            val denom = maxOf(userVal, aiVal, 1.0)
+            return kotlin.math.abs(aiVal - userVal) / denom > MACRO_EPSILON
+        }
+
+        val nameChanged = !ai.name.isNullOrBlank() &&
+            ai.name.trim().lowercase() != savedEntry.name.trim().lowercase()
+        val caloriesMoved = ai.calories != null &&
+            kotlin.math.abs(ai.calories - savedEntry.calories) >
+                maxOf(savedEntry.calories, ai.calories, 1) * MACRO_EPSILON
+        val macrosMoved = macroMoved(ai.protein, savedEntry.protein) ||
+            macroMoved(ai.carbs, savedEntry.carbs) ||
+            macroMoved(ai.fat, savedEntry.fat)
+
+        val aiIngredientsJson = com.example.data.remote.encodeIngredients(ai.ingredients)
+        val ingredientsChanged = (aiIngredientsJson ?: "") != (savedEntry.ingredientsJson ?: "") &&
+            !(aiIngredientsJson.isNullOrBlank() && savedEntry.ingredientsJson.isNullOrBlank())
+
+        if (!nameChanged && !caloriesMoved && !macrosMoved && !ingredientsChanged) return
+
+        repository.recordMealCorrection(
+            com.example.data.local.MealCorrectionEntity(
+                mealCategory = savedEntry.mealCategory.name,
+                model = ai.analysisModel ?: savedEntry.analysisModel,
+                initialConfidence = ai.confidence,
+                aiName = ai.name,
+                userName = savedEntry.name,
+                aiCalories = ai.calories,
+                userCalories = savedEntry.calories,
+                aiProtein = ai.protein,
+                userProtein = savedEntry.protein,
+                aiCarbs = ai.carbs,
+                userCarbs = savedEntry.carbs,
+                aiFat = ai.fat,
+                userFat = savedEntry.fat,
+                aiIngredientsJson = aiIngredientsJson,
+                userIngredientsJson = savedEntry.ingredientsJson,
+            )
+        )
+        android.util.Log.i(
+            "MealCorrection",
+            "captured gap name=$nameChanged kcal=$caloriesMoved macros=$macrosMoved ingr=$ingredientsChanged"
+        )
     }
 
     fun confirmAndSaveActivitySession() {
@@ -4363,6 +4439,13 @@ class ChatViewModel(
         _pendingHabitWarnings.update { it - s }
         _proposalReceipts.update { it - s }
         _cleanedMessageText.update { it - s }
+    }
+
+    private companion object {
+        /** Relative macro tolerance below which an AI-vs-user difference is
+         *  treated as rounding noise, not a correction (see
+         *  [maybeRecordCorrection]). 5%. */
+        const val MACRO_EPSILON = 0.05
     }
 }
 

@@ -11,6 +11,7 @@ import com.example.data.meal.ensemble.EnsemblePrompts
 import com.example.data.meal.ensemble.FoodVisionRequest
 import com.example.data.meal.ensemble.GeminiFoodVisionProvider
 import com.example.data.meal.ensemble.createBitdeerProvider
+import com.example.data.meal.ensemble.createMealResultJudge
 import com.example.data.meal.ensemble.createQwenGroqProvider
 import com.example.data.remote.ActivityAnalysisResult
 import com.example.data.remote.Content
@@ -135,7 +136,41 @@ class MealAnalysisOrchestrator(
         if (enriched == null) {
             android.util.Log.w("NutritionEnrich", "enrichment timed out (>4s) — using LLM macros unchanged")
         }
-        return enriched ?: result
+        val afterEnrich = enriched ?: result
+        return judgeIfUncertain(afterEnrich)
+    }
+
+    /**
+     * Confidence-gated correction judge. Runs a fast text-only Qwen review of
+     * the result against the user's [CorrectionCalibrator] history — but ONLY
+     * when the model admitted uncertainty (`low`/`medium` confidence) and there
+     * is actual correction history to check against. A confident result, or a
+     * user with no corrections yet, is returned unchanged with zero added
+     * latency.
+     *
+     * Fail-open at every step: no Groq key, empty calibration, or any judge
+     * error leaves the result exactly as it came in. The judge is
+     * plausibility-gated internally so it can never push inconsistent numbers.
+     */
+    private suspend fun judgeIfUncertain(result: FoodAnalysisResult): FoodAnalysisResult {
+        val confidence = result.confidence?.trim()?.lowercase()
+        val uncertain = confidence == "low" || confidence == "medium" ||
+            confidence == "baixa" || confidence == "média" || confidence == "media"
+        if (!uncertain) return result
+
+        val calibrator = repository.correctionCalibrator ?: return result
+        val judge = createMealResultJudge(EnsembleConfig.groqApiKey) ?: return result
+
+        return runCatching {
+            val calibration = calibrator.getCalibration()
+            if (calibration.isEmpty) return result
+            // The judge self-limits via its own withTimeout and is fail-open.
+            judge.review(result, calibration)
+        }.getOrElse {
+            if (it is kotlinx.coroutines.CancellationException) throw it
+            android.util.Log.w("MealResultJudge", "judge stage failed — keeping original")
+            result
+        }
     }
 
     /**
@@ -174,10 +209,19 @@ class MealAnalysisOrchestrator(
         val habitsBlock = repository.buildHabitsPromptBlock(habits, promptHint)
         val offeredIds = habits.map { it.id }.toSet()
 
+        // Correction calibration — measured from the user's own past corrections
+        // (AI estimate vs saved value). Empty until enough corrections accrue,
+        // in which case the prompt is byte-identical to before. See
+        // [com.example.data.nutrition.CorrectionCalibrator].
+        val calibrationBlock = runCatching {
+            repository.correctionCalibrator?.getCalibration()?.toPromptBlock().orEmpty()
+        }.getOrDefault("")
+
         val promptText = buildAnalysisPrompt(
             promptHint = promptHint,
             language = language,
-            habitsBlock = habitsBlock
+            habitsBlock = habitsBlock,
+            calibrationBlock = calibrationBlock
         )
 
         val parts = mutableListOf<Part>()
@@ -210,6 +254,7 @@ class MealAnalysisOrchestrator(
                 habitsBlock = habitsBlock,
                 offeredHabitIds = offeredIds,
                 language = language,
+                calibrationBlock = calibrationBlock,
             )
         ) {
             return@flow
@@ -249,6 +294,7 @@ class MealAnalysisOrchestrator(
         habitsBlock: String,
         offeredHabitIds: Set<Long>,
         language: String,
+        calibrationBlock: String = "",
     ): Boolean {
         if (!EnsembleConfig.isEnsembleActive) return false
         // Ensemble routing is only meaningful when there is an image to get a
@@ -275,6 +321,7 @@ class MealAnalysisOrchestrator(
                         promptHint = req.promptHint,
                         language = req.language,
                         habitsBlock = req.habitsBlock.orEmpty(),
+                        calibrationBlock = calibrationBlock,
                     ) + EnsemblePrompts.CANONICAL_NAMING_RULES
                 }
             }
@@ -286,6 +333,7 @@ class MealAnalysisOrchestrator(
                         promptHint = req.promptHint,
                         language = req.language,
                         habitsBlock = req.habitsBlock.orEmpty(),
+                        calibrationBlock = calibrationBlock,
                     ) + EnsemblePrompts.CANONICAL_NAMING_RULES
                 }
             }
@@ -764,12 +812,16 @@ class MealAnalysisOrchestrator(
     private fun buildAnalysisPrompt(
         promptHint: String?,
         language: String,
-        habitsBlock: String
+        habitsBlock: String,
+        /** Correction-calibration block from [CorrectionCalibrator]; appended
+         *  after the shared core so the model calibrates its estimate to the
+         *  user's own correction history. Empty string → no-op. */
+        calibrationBlock: String = "",
     ): String = repository.buildFoodAnalysisPromptCore(
         language = language,
         promptHint = promptHint,
         habitsBlock = habitsBlock
-    )
+    ) + calibrationBlock
 
     /**
      * Apply a [FoodAnalysisResult] (from streaming Done or salvage) onto a

@@ -166,7 +166,36 @@ class GeminiRepository(
      *  (defaults null so any existing test that constructs the
      *  repository directly keeps working). */
     private val predictedQaDao: com.example.data.local.PredictedQaDao? = null,
+    /** Append-only correction-gap DAO (schema v34). Optional/defaulted so
+     *  existing test constructors keep compiling. Drives
+     *  [correctionCalibrator]; null → no capture, empty calibration. */
+    private val mealCorrectionDao: com.example.data.local.MealCorrectionDao? = null,
 ) {
+
+    /** Aggregates the correction-gap history into a directional calibration
+     *  injected into future analysis prompts. Lazily built; null when no
+     *  [mealCorrectionDao] was provided. Shared instance so its in-memory
+     *  cache survives across analyses. */
+    val correctionCalibrator: com.example.data.nutrition.CorrectionCalibrator? by lazy {
+        mealCorrectionDao?.let { com.example.data.nutrition.CorrectionCalibrator(it) }
+    }
+
+    /** Persist one AI-vs-user correction gap and invalidate the calibrator
+     *  cache so the next analysis sees the updated bias. No-op when the DAO
+     *  was not wired. Trims the table to the most recent [CORRECTION_CAP]
+     *  rows. Never throws — a failed capture must not break a save. */
+    suspend fun recordMealCorrection(correction: com.example.data.local.MealCorrectionEntity) {
+        val dao = mealCorrectionDao ?: return
+        runCatching {
+            dao.insert(correction)
+            // Keep the table bounded — the calibrator only needs a recent
+            // window to derive a stable bias.
+            dao.trimTo(CORRECTION_CAP)
+            correctionCalibrator?.invalidate()
+        }.onFailure {
+            android.util.Log.w("MealCorrection", "capture failed: ${it.javaClass.simpleName}")
+        }
+    }
 
     /** Factory: build a [com.example.data.chat.ChatOrchestrator] wired with
      *  the same DAOs this repository owns. The orchestrator is the new
@@ -1947,6 +1976,13 @@ If you used any of the patterns above, return their numeric ids in an "appliedHa
             )
             Result.failure(exception)
         }
+    }
+
+    companion object {
+        /** Upper bound on the append-only `meal_corrections` table. The
+         *  calibrator derives a stable bias from a recent window, so an
+         *  unbounded table would only slow the full-scan aggregation. */
+        private const val CORRECTION_CAP = 200
     }
 }
 

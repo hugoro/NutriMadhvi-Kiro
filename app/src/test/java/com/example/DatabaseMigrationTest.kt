@@ -1814,6 +1814,111 @@ class DatabaseMigrationTest {
         db33.close()
     }
 
+    /**
+     * v33 → v34: adds the append-only `meal_corrections` table. Purely
+     * additive `CREATE TABLE IF NOT EXISTS` + index — no existing table is
+     * touched. The test pre-loads a v33-shaped `food_entries` row, runs the
+     * migration, and asserts:
+     *  1. The pre-existing food row survives byte-identical.
+     *  2. `meal_corrections` exists, starts empty, and its index is present.
+     *  3. A correction row can be inserted (schema reachable from outside).
+     *  4. The DB lands at user_version = 34.
+     */
+    @Test
+    fun testMigration33To34AddsMealCorrectionsAndPreservesData() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val dbFile = context.getDatabasePath("test_migration_v33_v34")
+        if (dbFile.exists()) dbFile.delete()
+
+        val db33 = SQLiteDatabase.openOrCreateDatabase(dbFile.absolutePath, null)
+        db33.version = 33
+        db33.execSQL("""
+            CREATE TABLE IF NOT EXISTS `food_entries` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `name` TEXT NOT NULL,
+                `calories` INTEGER NOT NULL,
+                `protein` REAL NOT NULL,
+                `carbs` REAL NOT NULL,
+                `fat` REAL NOT NULL,
+                `timestamp` INTEGER NOT NULL,
+                `imagePath` TEXT,
+                `analysisSummary` TEXT,
+                `fullSummary` TEXT NOT NULL,
+                `lastAiAnalyzedSummary` TEXT,
+                `mealCategory` TEXT NOT NULL,
+                `appliedHabitIds` TEXT,
+                `groupId` TEXT,
+                `ingredientsJson` TEXT,
+                `freeSugarsG` REAL,
+                `saturatedFatG` REAL,
+                `editLogJson` TEXT,
+                `analysisModel` TEXT
+            )
+        """.trimIndent())
+        db33.execSQL(
+            """INSERT INTO food_entries
+                (id, name, calories, protein, carbs, fat, timestamp,
+                 fullSummary, mealCategory)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                501L, "caril de peixe com arroz", 590, 34.0, 62.0, 18.0,
+                1_700_020_000_000L, "caril de peixe com arroz basmati", "LUNCH"
+            )
+        )
+        db33.close()
+
+        val db34 = openWithMigration("test_migration_v33_v34", 34) { db, oldV, newV ->
+            if (oldV == 33 && newV == 34) ChatDatabase.MIGRATION_33_34.migrate(db)
+        }
+
+        // 1. Pre-existing food row survives.
+        db34.query("SELECT name, calories FROM food_entries WHERE id = 501").use {
+            assertTrue("food_entries row vanished after migration", it.moveToFirst())
+            assertEquals("caril de peixe com arroz", it.getString(0))
+            assertEquals(590, it.getInt(1))
+        }
+
+        // 2. meal_corrections exists, empty, indexed.
+        db34.query("SELECT COUNT(*) FROM meal_corrections").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("meal_corrections must start empty", 0, it.getInt(0))
+        }
+        db34.query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='index_meal_corrections_createdAtMs'"
+        ).use {
+            assertTrue("createdAtMs index missing", it.moveToFirst())
+        }
+
+        // 3. INSERT works (schema reachable).
+        db34.execSQL(
+            """INSERT INTO meal_corrections
+                (createdAtMs, mealCategory, model, initialConfidence,
+                 aiName, userName, aiCalories, userCalories,
+                 aiProtein, userProtein, aiCarbs, userCarbs, aiFat, userFat,
+                 aiIngredientsJson, userIngredientsJson)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                1_700_020_500_000L, "LUNCH", "gemini-3.6-flash", "medium",
+                "peixe assado", "caril de peixe", 720, 590,
+                40.0, 34.0, 50.0, 62.0, 30.0, 18.0,
+                "[{\"name\":\"peixe\",\"weightGrams\":180.0}]",
+                "[{\"name\":\"peixe\",\"weightGrams\":150.0}]"
+            )
+        )
+        db34.query("SELECT userName, userCalories FROM meal_corrections").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("caril de peixe", it.getString(0))
+            assertEquals(590, it.getInt(1))
+        }
+
+        // 4. DB lands at user_version 34.
+        db34.query("PRAGMA user_version").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("DB must end at user_version 34", 34, it.getInt(0))
+        }
+        db34.close()
+    }
+
     /** Shared assertions for the v33 end state: table + unique index exist,
      *  the reconcile columns exist, and user_version == 33. */
     private fun assertIngredientCacheAndColumns(db: androidx.sqlite.db.SupportSQLiteDatabase) {
