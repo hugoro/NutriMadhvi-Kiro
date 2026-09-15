@@ -439,6 +439,17 @@ private fun formatValue(v: Double): String {
     }
 }
 
+/** True when a delta would render as "0" at [formatValue]'s display precision
+ *  (e.g. −0.001 shows as "0.0"). Used to keep the arrow AND the colour neutral
+ *  when the visible number is zero — the tone must agree with what's shown, not
+ *  with a mathematically-nonzero delta the user can't see. Not an arbitrary
+ *  dead-zone: it is exactly "the printed value is 0". */
+private fun rendersAsZero(v: Double): Boolean {
+    if (!v.isFinite()) return true
+    val s = formatValue(kotlin.math.abs(v))
+    return s == "0" || s.all { it == '0' || it == '.' }
+}
+
 /* ─────────────────────────────────────────────────────────────────────────── *
  * MULTILINE — Phase 4 (2026-07-05)
  * ─────────────────────────────────────────────────────────────────────────── */
@@ -479,7 +490,9 @@ private data class ChartRange(val min: Double, val max: Double)
  *  pixel row (and sub-unit noise isn't dramatised). Empty line → (0,1). */
 private fun computeRanges(lines: List<com.example.data.remote.ChartLine>): List<ChartRange> =
     lines.map { line ->
-        val vals = line.values.filterNotNull()
+        // Include estimated (virtual) points so a back-extrapolated dashed point
+        // isn't clipped outside the band.
+        val vals = (line.values + (line.estimatedValues ?: emptyList())).filterNotNull()
         if (vals.isEmpty()) ChartRange(0.0, 1.0)
         else {
             val minV = vals.min()
@@ -586,17 +599,18 @@ internal fun MultilineChart(
  *  - No selection (`selIdx == null`) → the line's own [ChartKpi] (default:
  *    latest reading + full-window delta). Behaviour unchanged.
  *  - A point is selected and this line has a reading there → a KPI whose
- *    `latest` is the value AT that point and whose `delta` is
- *    (latest reading − value at point), i.e. "what changed from this point up
- *    to today". The returned Boolean (`forceShow`) tells the tile to show the
- *    absolute value even for delta-only callers.
+ *    `latest` is the value AT that point and whose `delta` is (value here − value
+ *    at the PREVIOUS reading), i.e. "how much this weigh-in moved". This matches
+ *    the segment tone (also prev→here) and the change the user reads off the chart.
+ *    The returned Boolean (`forceShow`) tells the tile to show the absolute value
+ *    even for delta-only callers.
  *  - Selected but this line has no reading at that index (gap / out of range)
  *    → fall back to the default KPI so the other tiles can still retarget.
  *
  * Delta semantics differ between the two modes: default = latest − oldest;
- * selected = latest − point. The sign can flip, but [ChartKpi.deltaTone] is the
- * LLM's editorial label about the metric's direction (losing fat is "good"),
- * so reusing it keeps the tile colour meaning stable across modes.
+ * selected = here − previous. The tone is derived from the selected-point delta's
+ * own sign (using the metric's polarity inferred from the base KPI) so the arrow
+ * and the colour always agree — e.g. fat ▲ shows red.
  */
 private fun effectiveKpi(
     line: com.example.data.remote.ChartLine,
@@ -608,9 +622,32 @@ private fun effectiveKpi(
     // selected-point delta stays in the KPI's unit, not the plotted one.
     val series = line.kpiValues ?: line.values
     val v = series.getOrNull(selIdx) ?: return line.kpi to false
+    // Delta AT the selected point = LATEST (most recent) reading − value here.
+    // Hugo's contract: "the KPI is the difference between the selected point and
+    // the last measured value" — i.e. how far this weigh-in was from where the
+    // user is today. Selecting an older, heavier weight (87.9 kg, latest 83.0 kg)
+    // → 83.0 − 87.9 = −4.9 kg → "▼ 4.9kg" green (weight down = good). Selecting the
+    // latest point → 0 → neutral "=". The sign this frame produces already AGREES
+    // with each metric's polarity via the upIsGood logic below (a past-higher fat
+    // yields a negative delta → green "dropped since then"), so no inversion is
+    // needed. (The earlier `v − prev` frame compared to the previous weigh-in and
+    // rendered near-zero for two similar consecutive days — that's the "= 0.0kg"
+    // bug this replaces.)
     val latest = series.lastOrNull { it != null }
     val delta = latest?.let { it - v }
-    val tone = line.kpi?.deltaTone ?: "neutral"
+    // Tone from THIS delta's sign, using the metric's polarity inferred from the
+    // base KPI (its deltaTone paired with its own delta sign → does up = good?).
+    val tone = run {
+        val baseDelta = line.kpi?.delta
+        val baseTone = line.kpi?.deltaTone
+        if (delta == null || rendersAsZero(delta)) "neutral"
+        else if (baseDelta == null || baseDelta == 0.0 || baseTone == null || baseTone == "neutral") {
+            baseTone ?: "neutral"
+        } else {
+            val upIsGood = (baseDelta > 0) == (baseTone == "good")
+            if ((delta > 0) == upIsGood) "good" else "bad"
+        }
+    }
     return com.example.data.remote.ChartKpi(latest = v, delta = delta, deltaTone = tone) to true
 }
 
@@ -630,7 +667,15 @@ private fun effectiveKpi(
 internal fun MultilineChartScrollable(
     lines: List<com.example.data.remote.ChartLine>,
     xLabels: List<String>,
+    /** Epoch-day per point (same length/order as [xLabels]). When present with
+     *  ≥2 distinct values the x-axis becomes calendar-proportional: horizontal
+     *  distance reflects real elapsed days (18 days looks wider than 1 day) and
+     *  the strip width scales with the date span. Null / <2 distinct → the old
+     *  index-based equal-slot layout. */
+    xEpochDays: List<Long>? = null,
     perPointDp: Int = 40,
+    /** Horizontal dp per calendar day when [xEpochDays] drives the layout. */
+    dpPerDay: Int = 7,
     palette: List<Color> = BODYCOMP_PALETTE
 ) {
     if (lines.isEmpty() || xLabels.isEmpty()) return
@@ -643,11 +688,27 @@ internal fun MultilineChartScrollable(
     val ranges = remember(lines) { computeRanges(lines) }
 
     val bandHeightDp = 72
-    val xAxisFooterDp = 22
+    // Two-tier x-axis footer (day numbers + month band) needs ~34dp; the extra
+    // room is harmless for the index-based fallback (single row of labels).
+    val xAxisFooterDp = 34
     val plotHeightDp = bandHeightDp * lines.size + xAxisFooterDp
     val gutterWidthDp = 44
     val nX = xLabels.size
-    val stripWidthDp = (perPointDp * nX).coerceAtLeast(1)
+    // Calendar-proportional layout when epoch-days are supplied and span >0.
+    // Width = spanDays × dpPerDay so the strip physically grows with the real
+    // date range; a dense burst of weigh-ins can't collapse below the index
+    // baseline (minW), and a multi-year history can't allocate a runaway
+    // canvas (maxW). Falls back to fixed per-point width otherwise.
+    val distinctDays = xEpochDays?.distinct()?.size ?: 0
+    val proportional = xEpochDays != null && xEpochDays.size == nX && distinctDays >= 2
+    val stripWidthDp = if (proportional) {
+        val spanDays = (xEpochDays!!.max() - xEpochDays.min()).coerceAtLeast(1L)
+        val minW = (perPointDp * nX) / 2
+        val maxW = 4000
+        (spanDays * dpPerDay).toInt().coerceIn(minW, maxW)
+    } else {
+        (perPointDp * nX).coerceAtLeast(1)
+    }
 
     // Start scrolled to the most recent reading (right edge). maxValue is set
     // after the strip is measured, so run this once the point count is known.
@@ -681,6 +742,7 @@ internal fun MultilineChartScrollable(
             AxisGutterCanvas(
                 ranges = ranges,
                 lineCount = lines.size,
+                palette = palette,
                 modifier = Modifier
                     .width(gutterWidthDp.dp)
                     .height(plotHeightDp.dp)
@@ -693,6 +755,7 @@ internal fun MultilineChartScrollable(
                 ScrollingPlotCanvas(
                     lines = lines,
                     xLabels = xLabels,
+                    xEpochDays = if (proportional) xEpochDays else null,
                     ranges = ranges,
                     palette = palette,
                     selectedIndex = selectedIndex,
@@ -719,12 +782,15 @@ internal fun MultilineChartScrollable(
 internal fun MultilineChartStatic(
     lines: List<com.example.data.remote.ChartLine>,
     xLabels: List<String>,
+    xEpochDays: List<Long>? = null,
     palette: List<Color> = BODYCOMP_PALETTE
 ) {
     if (lines.isEmpty() || xLabels.isEmpty()) return
     val ranges = remember(lines) { computeRanges(lines) }
     val bandHeightDp = 72
-    val xAxisFooterDp = 22
+    // Two-tier x-axis footer (day numbers + month band) needs ~34dp; the extra
+    // room is harmless for the index-based fallback (single row of labels).
+    val xAxisFooterDp = 34
     val plotHeightDp = bandHeightDp * lines.size + xAxisFooterDp
     val gutterWidthDp = 44
 
@@ -749,6 +815,7 @@ internal fun MultilineChartStatic(
             AxisGutterCanvas(
                 ranges = ranges,
                 lineCount = lines.size,
+                palette = palette,
                 modifier = Modifier
                     .width(gutterWidthDp.dp)
                     .height(plotHeightDp.dp)
@@ -756,6 +823,7 @@ internal fun MultilineChartStatic(
             ScrollingPlotCanvas(
                 lines = lines,
                 xLabels = xLabels,
+                xEpochDays = xEpochDays,
                 ranges = ranges,
                 palette = palette,
                 selectedIndex = null,
@@ -777,13 +845,13 @@ internal fun MultilineChartStatic(
 private fun AxisGutterCanvas(
     ranges: List<ChartRange>,
     lineCount: Int,
+    palette: List<Color>,
     modifier: Modifier = Modifier
 ) {
     val textMeasurer = rememberTextMeasurer()
-    val labelStyle = TextStyle(color = Color(0xFF64748B), fontSize = 9.sp)
     Canvas(modifier = modifier) {
         val paddingTop = 6.dp.toPx()
-        val xAxisFooter = 22.dp.toPx()
+        val xAxisFooter = 34.dp.toPx()
         val totalPlotH = size.height - paddingTop - xAxisFooter
         if (totalPlotH <= 0f || lineCount <= 0) return@Canvas
         val bandH = totalPlotH / lineCount
@@ -791,6 +859,14 @@ private fun AxisGutterCanvas(
             val range = ranges.getOrNull(idx) ?: continue
             val bandTop = paddingTop + bandH * idx
             val bandBottom = bandTop + bandH
+            // Each band's min/max are painted in that metric's own palette colour
+            // (Peso violeta, Gordura laranja, …) so the reader can tell which line
+            // each pair of numbers belongs to — the gutter doubles as the legend.
+            val labelStyle = TextStyle(
+                color = palette[idx % palette.size],
+                fontSize = 10.sp,
+                fontWeight = FontWeight.SemiBold
+            )
             val topLayout = textMeasurer.measure(formatValue(range.max), labelStyle)
             val botLayout = textMeasurer.measure(formatValue(range.min), labelStyle)
             drawText(
@@ -831,12 +907,23 @@ private fun ScrollingPlotCanvas(
     palette: List<Color>,
     selectedIndex: Int?,
     onSelectIndex: (Int?) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    // Epoch-day per point (same length as xLabels). When present with ≥2 distinct
+    // values, x is placed proportional to the calendar so elapsed time reads true;
+    // otherwise falls back to equal index-based slots (unchanged legacy behaviour).
+    xEpochDays: List<Long>? = null
 ) {
     val textMeasurer = rememberTextMeasurer()
     val labelStyle = TextStyle(color = Color(0xFF64748B), fontSize = 9.sp)
 
-    val tapModifier = modifier.pointerInput(xLabels.size, selectedIndex) {
+    // Proportional only when we have a valid, aligned, non-degenerate date axis.
+    val proportional = xEpochDays != null &&
+        xEpochDays.size == xLabels.size &&
+        xEpochDays.distinct().size >= 2
+    val d0 = if (proportional) xEpochDays!!.min() else 0L
+    val spanDays = if (proportional) (xEpochDays!!.max() - d0).coerceAtLeast(1L) else 1L
+
+    val tapModifier = modifier.pointerInput(xLabels.size, selectedIndex, proportional) {
         detectTapGestures { off ->
             val nX = xLabels.size
             if (nX <= 1) { onSelectIndex(null); return@detectTapGestures }
@@ -844,10 +931,18 @@ private fun ScrollingPlotCanvas(
             val paddingRight = 8.dp.toPx()
             val plotW = size.width - paddingLeft - paddingRight
             if (plotW <= 0f) { onSelectIndex(null); return@detectTapGestures }
-            fun xAt(i: Int) = paddingLeft + plotW * i / (nX - 1)
-            val raw = (off.x - paddingLeft) / plotW * (nX - 1)
-            val idx = raw.roundToInt().coerceIn(0, nX - 1)
-            val hit = abs(off.x - xAt(idx)) <= 24.dp.toPx()
+            fun xAt(i: Int): Float =
+                if (proportional) paddingLeft + plotW * (xEpochDays!![i] - d0).toFloat() / spanDays
+                else paddingLeft + plotW * i / (nX - 1)
+            // Non-linear (date) map has no closed-form inverse — find the nearest
+            // point by scanning. Keep the 24dp snap + tap-to-toggle-off behaviour.
+            var idx = 0
+            var best = Float.MAX_VALUE
+            for (i in 0 until nX) {
+                val d = abs(off.x - xAt(i))
+                if (d < best) { best = d; idx = i }
+            }
+            val hit = best <= 24.dp.toPx()
             onSelectIndex(if (!hit || idx == selectedIndex) null else idx)
         }
     }
@@ -856,18 +951,24 @@ private fun ScrollingPlotCanvas(
         val paddingLeft = 8.dp.toPx()
         val paddingRight = 8.dp.toPx()
         val paddingTop = 6.dp.toPx()
-        val xAxisFooter = 22.dp.toPx()
+        val xAxisFooter = 34.dp.toPx()
         val plotW = size.width - paddingLeft - paddingRight
         val totalPlotH = size.height - paddingTop - xAxisFooter
         if (plotW <= 0f || totalPlotH <= 0f || lines.isEmpty()) return@Canvas
 
         val bandH = totalPlotH / lines.size
         val gridColor = Color(0xFF1E293B)
-        val bandDivider = Color(0xFF334155).copy(alpha = 0.35f)
+        // Divider between metric bands (Peso | Músculo | Gordura | Água). Kept
+        // clearly visible so the four stacked series read as separate lanes
+        // (Hugo: "reforça a visibilidade das linhas horizontais a segmentar").
+        val bandDivider = Color(0xFF475569).copy(alpha = 0.85f)
         val nX = xLabels.size
 
-        fun xAt(i: Int): Float = if (nX <= 1) paddingLeft + plotW / 2f
-                                 else paddingLeft + plotW * i / (nX - 1)
+        fun xAt(i: Int): Float = when {
+            nX <= 1 -> paddingLeft + plotW / 2f
+            proportional -> paddingLeft + plotW * (xEpochDays!![i] - d0).toFloat() / spanDays
+            else -> paddingLeft + plotW * i / (nX - 1)
+        }
 
         val sel = selectedIndex?.takeIf { it in 0 until nX }
         if (sel != null) {
@@ -892,13 +993,24 @@ private fun ScrollingPlotCanvas(
             val span = (range.max - range.min).takeIf { it > 0.0 } ?: 1.0
             val bandTop = paddingTop + bandH * idx
             val bandBottom = bandTop + bandH
+            // Health-aware per-segment tone (body-comp strip): each segment/dot
+            // is coloured by direction-of-change (good/bad/neutral) instead of the
+            // flat metric palette. tones[i] = tone of the segment ARRIVING at i.
+            // Null (AI charts) → keep the palette colour throughout.
+            val tones = line.segmentTones?.takeIf { it.size == line.values.size }
+            fun toneColor(i: Int): Color = when (tones?.getOrNull(i)) {
+                "good" -> color        // positive change → metric's own palette colour
+                "bad" -> Color(0xFFEF4444)  // red — negative change
+                "neutral" -> Color(0xFF94A3B8) // light grey — no/first change
+                else -> color
+            }
 
             if (idx > 0) {
                 drawLine(
                     color = bandDivider,
                     start = Offset(paddingLeft, bandTop),
                     end = Offset(paddingLeft + plotW, bandTop),
-                    strokeWidth = 1f
+                    strokeWidth = 1.5.dp.toPx()
                 )
             }
 
@@ -923,13 +1035,15 @@ private fun ScrollingPlotCanvas(
 
             // Draw the line — BRIDGE null gaps (don't clear prev on null), so
             // the stroke connects consecutive readings even across missing x's.
+            // Each segment is coloured by the tone of the reading it ARRIVES at.
             var prev: Pair<Int, Double>? = null
             line.values.forEachIndexed { i, vNullable ->
                 val v = vNullable ?: return@forEachIndexed
                 val here = Offset(xAt(i), yAt(v))
+                val segColor = toneColor(i)
                 prev?.let { (pi, pv) ->
                     drawLine(
-                        color = color,
+                        color = segColor,
                         start = Offset(xAt(pi), yAt(pv)),
                         end = here,
                         strokeWidth = 2.dp.toPx(),
@@ -937,8 +1051,10 @@ private fun ScrollingPlotCanvas(
                     )
                 }
                 val isSel = sel != null && i == sel
+                // Dot follows its arriving-segment tone; the first point has no
+                // arriving segment → neutral grey (toneColor returns grey for i=0).
                 drawCircle(
-                    color = color,
+                    color = segColor,
                     radius = if (isSel) 4.5.dp.toPx() else 2.5.dp.toPx(),
                     center = here
                 )
@@ -952,29 +1068,171 @@ private fun ScrollingPlotCanvas(
                 }
                 prev = i to v
             }
+
+            // Estimated (virtual) leading points: drawn DASHED + HOLLOW so they
+            // read as "projected, not measured". Each connects to the next point
+            // (estimated or the first real reading) with a dashed segment in the
+            // metric's own colour; the marker is a hollow ring, not a filled dot.
+            line.estimatedValues?.let { estimates ->
+                if (estimates.size == line.values.size) {
+                    val dashEffect = PathEffect.dashPathEffect(floatArrayOf(4f, 4f), 0f)
+                    // Walk from the last estimated index forward to the first real
+                    // point, chaining dashed segments (i → i+1) wherever an endpoint
+                    // is defined by either an estimate or a real value.
+                    fun pointAt(i: Int): Double? = estimates.getOrNull(i) ?: line.values.getOrNull(i)
+                    estimates.forEachIndexed { i, e ->
+                        if (e == null) return@forEachIndexed
+                        val here = Offset(xAt(i), yAt(e))
+                        pointAt(i + 1)?.let { nextV ->
+                            drawLine(
+                                color = color,
+                                start = here,
+                                end = Offset(xAt(i + 1), yAt(nextV)),
+                                strokeWidth = 1.5.dp.toPx(),
+                                cap = StrokeCap.Round,
+                                pathEffect = dashEffect
+                            )
+                        }
+                        drawCircle(
+                            color = color,
+                            radius = 2.5.dp.toPx(),
+                            center = here,
+                            style = Stroke(width = 1.5.dp.toPx())
+                        )
+                    }
+                }
+            }
+        }
+        // the footer band (mirrors VitaDock). Independent of whether the point
+        // gets a text label, so density of readings is always visible.
+        val tickColor = Color(0xFF334155)
+        val footerY = paddingTop + totalPlotH
+        for (i in 0 until nX) {
+            drawLine(
+                color = tickColor,
+                start = Offset(xAt(i), footerY),
+                end = Offset(xAt(i), footerY + 3.dp.toPx()),
+                strokeWidth = 1f
+            )
         }
 
-        // Shared x-axis labels at the bottom. With fixed per-point spacing we
-        // can show more ticks; cap density so labels don't collide (~a tick
-        // every ~48dp), and always include the selected index.
-        val selLabelStyle = TextStyle(
-            color = Color(0xFF38BDF8),
-            fontSize = 9.sp,
-            fontWeight = FontWeight.Bold
-        )
-        val every = maxOf(1, (48.dp.toPx() / (plotW / maxOf(1, nX - 1))).roundToInt())
-        val tickIndices = (xLabels.indices.filter { it % every == 0 || it == nX - 1 } +
-            listOfNotNull(sel)).distinct()
-        for (i in tickIndices) {
-            val emphasised = sel != null && i == sel
-            val layout = textMeasurer.measure(xLabels[i], if (emphasised) selLabelStyle else labelStyle)
-            drawText(
-                textLayoutResult = layout,
-                topLeft = Offset(
-                    x = (xAt(i) - layout.size.width / 2f).coerceIn(0f, size.width - layout.size.width),
-                    y = paddingTop + totalPlotH + 4.dp.toPx()
-                )
+        if (proportional) {
+            // ── Two-tier calendar axis ──────────────────────────────────────
+            // Top row: day-of-month numbers (white, so they read); greedy anti-
+            // overlap so bunched days don't collide. Bottom row: month short name
+            // once per month, left-aligned at that month's first tick. Faint
+            // dashed verticals mark each month's FIRST and LAST measurement.
+            val ptMonths = arrayOf(
+                "Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
+                "Jul", "Ago", "Set", "Out", "Nov", "Dez"
             )
+            val dates = xEpochDays!!.map { java.time.LocalDate.ofEpochDay(it) }
+
+            val dayStyle = TextStyle(
+                color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Medium
+            )
+            val daySelStyle = TextStyle(
+                color = Color(0xFF38BDF8), fontSize = 9.sp, fontWeight = FontWeight.Bold
+            )
+            val monthStyle = TextStyle(
+                color = Color(0xFF94A3B8), fontSize = 9.sp, fontWeight = FontWeight.SemiBold
+            )
+
+            // Month boundaries: first index within each (year, month) run.
+            val firstOfMonth = LinkedHashMap<Int, Int>() // key = year*12+month → first idx
+            dates.forEachIndexed { i, d ->
+                val key = d.year * 12 + d.monthValue
+                if (!firstOfMonth.containsKey(key)) firstOfMonth[key] = i
+            }
+
+            // Strong dashed vertical at each month's FIRST weigh-in — this is
+            // the month boundary, so it must clearly segment the plot. (Only the
+            // start divides months; a last-reading line just added noise.)
+            val monthEdgeColor = Color(0xFF94A3B8).copy(alpha = 0.7f)
+            val dash = PathEffect.dashPathEffect(floatArrayOf(5f, 4f), 0f)
+            for ((_, firstIdx) in firstOfMonth) {
+                drawLine(
+                    color = monthEdgeColor,
+                    start = Offset(xAt(firstIdx), paddingTop),
+                    end = Offset(xAt(firstIdx), footerY),
+                    strokeWidth = 1.5.dp.toPx(),
+                    pathEffect = dash
+                )
+            }
+
+            // Top row — day numbers, greedy left→right; always emit last + selected.
+            val minGapPx = 4.dp.toPx()
+            val dayY = footerY + 4.dp.toPx()
+            val emit = sortedSetOf<Int>()
+            var lastRight = Float.NEGATIVE_INFINITY
+            for (i in 0 until nX) {
+                val layout = textMeasurer.measure(dates[i].dayOfMonth.toString(), dayStyle)
+                val left = xAt(i) - layout.size.width / 2f
+                if (left >= lastRight + minGapPx) {
+                    emit.add(i); lastRight = left + layout.size.width
+                }
+            }
+            emit.add(nX - 1)
+            sel?.let { emit.add(it) }
+            for (i in emit) {
+                val emphasised = sel != null && i == sel
+                val layout = textMeasurer.measure(
+                    dates[i].dayOfMonth.toString(),
+                    if (emphasised) daySelStyle else dayStyle
+                )
+                drawText(
+                    textLayoutResult = layout,
+                    topLeft = Offset(
+                        x = (xAt(i) - layout.size.width / 2f)
+                            .coerceIn(0f, size.width - layout.size.width),
+                        y = dayY
+                    )
+                )
+            }
+
+            // Bottom row — month name left-aligned at each month's first tick.
+            val monthY = dayY + 12.dp.toPx()
+            for ((_, firstIdx) in firstOfMonth) {
+                val d = dates[firstIdx]
+                val name = ptMonths[d.monthValue - 1]
+                val layout = textMeasurer.measure(name, monthStyle)
+                drawText(
+                    textLayoutResult = layout,
+                    topLeft = Offset(
+                        x = xAt(firstIdx).coerceIn(0f, size.width - layout.size.width),
+                        y = monthY
+                    )
+                )
+            }
+        } else {
+            // Index-based fallback: single row of the pre-formatted d/m labels,
+            // greedy anti-overlap. (Used only if a caller passes no epoch-days.)
+            val selLabelStyle = TextStyle(
+                color = Color(0xFF38BDF8), fontSize = 9.sp, fontWeight = FontWeight.Bold
+            )
+            val minGapPx = 4.dp.toPx()
+            val emit = sortedSetOf<Int>()
+            var lastRight = Float.NEGATIVE_INFINITY
+            for (i in 0 until nX) {
+                val layout = textMeasurer.measure(xLabels[i], labelStyle)
+                val left = xAt(i) - layout.size.width / 2f
+                if (left >= lastRight + minGapPx) {
+                    emit.add(i); lastRight = left + layout.size.width
+                }
+            }
+            emit.add(nX - 1)
+            sel?.let { emit.add(it) }
+            for (i in emit) {
+                val emphasised = sel != null && i == sel
+                val layout = textMeasurer.measure(xLabels[i], if (emphasised) selLabelStyle else labelStyle)
+                drawText(
+                    textLayoutResult = layout,
+                    topLeft = Offset(
+                        x = (xAt(i) - layout.size.width / 2f).coerceIn(0f, size.width - layout.size.width),
+                        y = footerY + 4.dp.toPx()
+                    )
+                )
+            }
         }
     }
 }
@@ -999,9 +1257,9 @@ private fun KpiTile(
     }
     val deltaText = kpi?.delta?.let { d ->
         val sign = when {
+            rendersAsZero(d) -> "="
             d > 0 -> "▲"
-            d < 0 -> "▼"
-            else -> "="
+            else -> "▼"
         }
         "$sign ${formatValue(kotlin.math.abs(d))}${if (unit.isNotBlank()) unit else ""}"
     } ?: "—"

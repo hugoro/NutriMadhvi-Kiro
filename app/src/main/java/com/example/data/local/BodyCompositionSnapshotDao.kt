@@ -81,4 +81,26 @@ interface BodyCompositionSnapshotDao {
         )
     """)
     suspend fun existsForSourceTimestamp(sourceTimestampMs: Long): Boolean
+
+    /** The stored snapshot for a given source timestamp, or null. Lets the
+     *  VitaDock sync inspect whether an existing row is a stale weight-only
+     *  row (fat/muscle/water all null) that a later, complete reading should
+     *  replace. */
+    @Query("""
+        SELECT * FROM body_composition_snapshots
+        WHERE sourceTimestampMs = :sourceTimestampMs
+        ORDER BY id DESC
+        LIMIT 1
+    """)
+    suspend fun getForSourceTimestamp(sourceTimestampMs: Long): BodyCompositionSnapshotEntity?
+
+    /** Deletes the row(s) for a single source timestamp. This is the ONE
+     *  mutation exception to the append-only contract, used exclusively by
+     *  the VitaDock sync's upgrade-in-place path: when the portal returns a
+     *  complete reading for a weigh-in we'd previously stored weight-only
+     *  (the old HTML-scrape bug), we delete that impoverished row and insert
+     *  the full one. Scoped to one physical weigh-in — it never touches
+     *  Samsung Health rows for other timestamps. */
+    @Query("DELETE FROM body_composition_snapshots WHERE sourceTimestampMs = :sourceTimestampMs")
+    suspend fun deleteForSourceTimestamp(sourceTimestampMs: Long)
 }

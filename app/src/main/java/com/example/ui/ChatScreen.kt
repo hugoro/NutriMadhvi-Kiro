@@ -58,6 +58,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -107,6 +108,7 @@ import com.example.ui.components.topFreeSugarSourceHint
 import com.example.data.local.FoodEntry
 import com.example.data.local.ActivityEntry
 import com.example.data.health.SamsungHealthRepository
+import com.example.data.health.VitaDockSyncWorker
 import java.time.LocalDate
 import java.time.Instant
 import kotlinx.coroutines.flow.first
@@ -7273,12 +7275,63 @@ fun BodyCompositionCard(
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    text = tr("Body Composition", lang),
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.bodyMedium
-                )
+                val vdContext = LocalContext.current
+                var vdSyncing by remember { mutableStateOf(false) }
+                val vdLastSync = remember(latestBodyComp?.sourceTimestampMs) {
+                    val ms = latestBodyComp?.sourceTimestampMs ?: return@remember null
+                    java.text.SimpleDateFormat("d MMM  HH:mm", java.util.Locale.getDefault())
+                        .format(java.util.Date(ms))
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = tr("Body Composition", lang),
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (vdLastSync != null) {
+                        Text(
+                            text = vdLastSync,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFF64748B),
+                            modifier = Modifier.padding(end = 4.dp)
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            vdSyncing = true
+                            VitaDockSyncWorker.enqueue(vdContext)
+                            android.os.Handler(android.os.Looper.getMainLooper())
+                                .postDelayed({ vdSyncing = false }, 3_000L)
+                        },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        val vdRotation by if (vdSyncing) {
+                            rememberInfiniteTransition(label = "vd_spin")
+                                .animateFloat(
+                                    initialValue = 0f,
+                                    targetValue = 360f,
+                                    animationSpec = infiniteRepeatable(tween(1000, easing = LinearEasing)),
+                                    label = "vd_spin_angle"
+                                )
+                        } else {
+                            remember { androidx.compose.runtime.mutableFloatStateOf(0f) }
+                        }
+                        Icon(
+                            imageVector = Icons.Rounded.Refresh,
+                            contentDescription = tr("Sync body composition", lang),
+                            tint = Color(0xFF818CF8),
+                            modifier = Modifier
+                                .size(18.dp)
+                                .rotate(vdRotation)
+                        )
+                    }
+                }
                 Divider(color = Color(0xFF334155))
                 Row(modifier = Modifier.fillMaxWidth()) {
                     Text(tr("Metric Dimension", lang), color = Color(0xFF94A3B8), fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1.5f))
@@ -7372,43 +7425,62 @@ fun BodyCompositionCard(
                 val lines = remember(history, lang) {
                     val hasWater = history.any { it.totalBodyWaterKg != null }
                     buildList {
-                        add(bodyCompLinePerSnapshot(tr("bodycomp.short.weight", lang), history, { "neutral" }) { it.weightKg.toDouble() })
-                        // Muscle: plot kg, but KPI reports % of weight and its pp
-                        // delta (kg alone flags red on a cut even as muscle % rises).
+                        // Weight: down = good (green), up = bad (red) — both the KPI
+                        // tile delta AND the line trace. (Hugo: "peso desceu 4.9kg é
+                        // positivo, deveria ser verde".) Weight stays in kg — its
+                        // natural unit. The composition lines below are all in % (the
+                        // source unit from VitaDock/Samsung Health): we plot % directly
+                        // so line, KPI and tone never diverge. The kg columns in the DB
+                        // are a derived (weight×%/100) product that reintroduces weight
+                        // as noise — never plotted.
+                        add(bodyCompLinePerSnapshot(
+                            tr("bodycomp.short.weight", lang), history,
+                            tone = { d -> if (d < 0) "good" else "bad" },
+                            segTone = { d -> if (d < 0) "good" else "bad" }
+                        ) { it.weightKg.toDouble() })
+                        // Muscle % of weight (muscle up = good). 0.0 = "not measured"
+                        // sentinel → null (a real 0% is impossible and would anchor the
+                        // line at the floor).
                         add(bodyCompLinePerSnapshot(
                             tr("bodycomp.short.muscle", lang), history,
                             tone = { d -> if (d > 0) "good" else "bad" },
-                            kpiPicker = { s -> s.muscleMassKg?.let { it.toDouble() / s.weightKg * 100.0 } },
                             kpiUnit = "%",
-                            kpiTone = { d -> if (d > 0) "good" else "bad" }
-                        ) { it.muscleMassKg?.toDouble() })
+                            segTone = { d -> if (d > 0) "good" else "bad" }
+                        ) { s -> s.muscleMassKg?.toDouble()?.takeIf { it > 0.0 }?.let { it / s.weightKg * 100.0 } })
+                        // Fat % (fat up = bad). Stored directly as a percentage.
                         add(bodyCompLinePerSnapshot(
                             tr("bodycomp.short.fat", lang), history,
                             tone = { d -> if (d > 0) "bad" else "good" },
-                            kpiPicker = { s -> s.bodyFatPct?.toDouble() },
                             kpiUnit = "%",
-                            kpiTone = { d -> if (d > 0) "bad" else "good" }
-                        ) { s ->
-                            val f = s.bodyFatPct
-                            if (f != null) s.weightKg.toDouble() * f / 100.0 else null
-                        })
+                            segTone = { d -> if (d > 0) "bad" else "good" }
+                        ) { s -> s.bodyFatPct?.toDouble()?.takeIf { it > 0.0 } })
                         if (hasWater) {
+                            // Water % of weight (water up = good).
                             add(bodyCompLinePerSnapshot(
                                 tr("bodycomp.short.water", lang), history,
-                                tone = { "neutral" },
-                                kpiPicker = { s -> s.totalBodyWaterKg?.let { it.toDouble() / s.weightKg * 100.0 } },
+                                tone = { d -> if (d > 0) "good" else "bad" },
                                 kpiUnit = "%",
-                                kpiTone = { "neutral" }
-                            ) { it.totalBodyWaterKg?.toDouble() })
+                                segTone = { d -> if (d > 0) "good" else "bad" }
+                            ) { s -> s.totalBodyWaterKg?.toDouble()?.takeIf { it > 0.0 }?.let { it / s.weightKg * 100.0 } })
                         }
                     }.filter { it.values.any { v -> v != null } }
                 }
                 val xLabels = remember(history) { history.map { snapshotColumnLabel(it, zoneId) } }
+                // Epoch-day per point so the strip can lay out calendar-proportional
+                // (18 elapsed days looks wider than 1). history is already one snapshot
+                // per calendar day, sorted, so these are strictly increasing.
+                val xEpochDays = remember(history) {
+                    history.map {
+                        val ts = it.sourceTimestampMs ?: it.capturedAtMs
+                        java.time.Instant.ofEpochMilli(ts).atZone(zoneId).toLocalDate().toEpochDay()
+                    }
+                }
 
                 if (lines.isNotEmpty()) {
                     com.example.ui.chat.MultilineChartScrollable(
                         lines = lines,
-                        xLabels = xLabels
+                        xLabels = xLabels,
+                        xEpochDays = xEpochDays
                     )
                 }
             }
@@ -7561,6 +7633,10 @@ private fun bodyCompLinePerSnapshot(
     kpiPicker: ((com.example.data.local.BodyCompositionSnapshotEntity) -> Double?)? = null,
     kpiUnit: String? = null,
     kpiTone: ((delta: Double) -> String)? = null,
+    /** Direction lambda for the per-segment LINE tone (green/red/grey). Defaults
+     *  to [kpiTone] ?: [tone]. Split out so a metric can keep a neutral KPI-tile
+     *  accent while still colouring its trace by direction (water). */
+    segTone: ((delta: Double) -> String)? = null,
     picker: (com.example.data.local.BodyCompositionSnapshotEntity) -> Double?
 ): com.example.data.remote.ChartLine {
     val values: List<Double?> = history.map { picker(it) }
@@ -7568,6 +7644,31 @@ private fun bodyCompLinePerSnapshot(
     val kpiValues: List<Double?>? = kpiPicker?.let { p -> history.map { p(it) } }
     val kpiSource = kpiValues ?: values
     val kpiToneFn = kpiTone ?: tone
+    val segToneFn = segTone ?: kpiToneFn
+    // Per-segment LINE tone: index i = tone of the segment arriving at point i,
+    // from the sign of the change since the previous non-null reading. This is
+    // computed over the PLOTTED series ([values]) — so the colour always agrees
+    // with what the line visibly does. A segment is neutral (grey) when the change
+    // rounds to zero AT THE SAME DISPLAY PRECISION as the KPI tile (2 decimals for
+    // these <100 values, i.e. |Δ| < 0.005). This is not an arbitrary dead-zone: it
+    // is exactly "the printed change is 0.0" — the colour must agree with what the
+    // user reads, not with a sub-0.005 delta they can't see. Otherwise water at
+    // "0.0%" showed a coloured (red) segment. Matches ChartCard.rendersAsZero.
+    fun rendersAsZeroPct(d: Double): Boolean =
+        !d.isFinite() || kotlin.math.abs(d) < 0.005
+    val segmentTones: List<String> = buildList {
+        var prev: Double? = null
+        values.forEach { v ->
+            if (v == null) { add("neutral"); return@forEach }
+            val p = prev
+            add(when {
+                p == null -> "neutral"
+                rendersAsZeroPct(v - p) -> "neutral"
+                else -> segToneFn(v - p)
+            })
+            prev = v
+        }
+    }
     val nonNull = kpiSource.filterNotNull()
     val kpi = if (nonNull.isEmpty()) {
         null
@@ -7577,8 +7678,30 @@ private fun bodyCompLinePerSnapshot(
         com.example.data.remote.ChartKpi(
             latest = latest,
             delta = delta,
-            deltaTone = if (delta == 0.0) "neutral" else kpiToneFn(delta)
+            deltaTone = if (rendersAsZeroPct(delta)) "neutral" else kpiToneFn(delta)
         )
+    }
+    // Estimated overlay for a LEADING gap: the earliest weigh-ins have a real
+    // weight but a "not-measured" composition (stored 0 → now null). Rather than
+    // leaving the trace to start abruptly at the first real reading, project a
+    // virtual point back over each missing leading day, using the slope of the
+    // first two REAL readings (linear back-extrapolation). Drawn dashed+hollow by
+    // the plot so it reads as an estimate. Only leading nulls get one — interior
+    // gaps still bridge, and if there are <2 real points we can't infer a slope.
+    val estimatedValues: List<Double?>? = run {
+        val firstReal = values.indexOfFirst { it != null }
+        if (firstReal <= 0) return@run null // no leading gap (or all-null)
+        val secondReal = ((firstReal + 1) until values.size).firstOrNull { values[it] != null }
+        val v0 = values[firstReal]!!
+        // Slope per index-step from the first two real points; flat if only one.
+        val slope = if (secondReal != null) (values[secondReal]!! - v0) / (secondReal - firstReal) else 0.0
+        val est = arrayOfNulls<Double>(values.size).toMutableList<Double?>()
+        for (i in 0 until firstReal) {
+            // Project backward and clamp to a physically sane floor (>0) so a
+            // steep early slope can't estimate a negative mass/%.
+            est[i] = (v0 - slope * (firstReal - i)).coerceAtLeast(0.1)
+        }
+        est
     }
     return com.example.data.remote.ChartLine(
         label = label,
@@ -7586,7 +7709,9 @@ private fun bodyCompLinePerSnapshot(
         values = values,
         kpi = kpi,
         kpiUnit = kpiUnit,
-        kpiValues = kpiValues
+        kpiValues = kpiValues,
+        segmentTones = segmentTones,
+        estimatedValues = estimatedValues
     )
 }
 
@@ -8605,32 +8730,30 @@ fun ReportTab(
                                 .takeLast(200)
                             val hasWater = perDay.any { it.totalBodyWaterKg != null }
                             val srcLines = buildList {
-                                add(bodyCompLinePerSnapshot(tr("bodycomp.short.weight", lang), perDay, { "neutral" }) { it.weightKg.toDouble() })
+                                add(bodyCompLinePerSnapshot(
+                                    tr("bodycomp.short.weight", lang), perDay,
+                                    tone = { d -> if (d < 0) "good" else "bad" },
+                                    segTone = { d -> if (d < 0) "good" else "bad" }
+                                ) { it.weightKg.toDouble() })
                                 add(bodyCompLinePerSnapshot(
                                     tr("bodycomp.short.muscle", lang), perDay,
                                     tone = { d -> if (d > 0) "good" else "bad" },
-                                    kpiPicker = { s -> s.muscleMassKg?.let { it.toDouble() / s.weightKg * 100.0 } },
                                     kpiUnit = "%",
-                                    kpiTone = { d -> if (d > 0) "good" else "bad" }
-                                ) { it.muscleMassKg?.toDouble() })
+                                    segTone = { d -> if (d > 0) "good" else "bad" }
+                                ) { s -> s.muscleMassKg?.toDouble()?.takeIf { it > 0.0 }?.let { it / s.weightKg * 100.0 } })
                                 add(bodyCompLinePerSnapshot(
                                     tr("bodycomp.short.fat", lang), perDay,
                                     tone = { d -> if (d > 0) "bad" else "good" },
-                                    kpiPicker = { s -> s.bodyFatPct?.toDouble() },
                                     kpiUnit = "%",
-                                    kpiTone = { d -> if (d > 0) "bad" else "good" }
-                                ) { s ->
-                                    val f = s.bodyFatPct
-                                    if (f != null) s.weightKg.toDouble() * f / 100.0 else null
-                                })
+                                    segTone = { d -> if (d > 0) "bad" else "good" }
+                                ) { s -> s.bodyFatPct?.toDouble()?.takeIf { it > 0.0 } })
                                 if (hasWater) {
                                     add(bodyCompLinePerSnapshot(
                                         tr("bodycomp.short.water", lang), perDay,
-                                        tone = { "neutral" },
-                                        kpiPicker = { s -> s.totalBodyWaterKg?.let { it.toDouble() / s.weightKg * 100.0 } },
+                                        tone = { d -> if (d > 0) "good" else "bad" },
                                         kpiUnit = "%",
-                                        kpiTone = { "neutral" }
-                                    ) { it.totalBodyWaterKg?.toDouble() })
+                                        segTone = { d -> if (d > 0) "good" else "bad" }
+                                    ) { s -> s.totalBodyWaterKg?.toDouble()?.takeIf { it > 0.0 }?.let { it / s.weightKg * 100.0 } })
                                 }
                             }.filter { it.values.any { v -> v != null } }
                             val bodyCompPalette = listOf("#A78BFA", "#10B981", "#F97316", "#38BDF8")

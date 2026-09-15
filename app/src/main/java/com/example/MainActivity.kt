@@ -29,6 +29,10 @@ import com.example.data.export.GalleryMigrationWorker
 import com.example.data.export.DriveExporter
 import com.example.data.export.OrphanImageCleanupWorker
 import com.example.data.health.DailyActivitySnapshotWorker
+import com.example.data.health.KEY_VITADOCK_EMAIL
+import com.example.data.health.KEY_VITADOCK_PASSWORD
+import com.example.data.health.PREFS_VITADOCK
+import com.example.data.health.VitaDockSyncWorker
 import com.example.data.local.ChatDatabase
 import com.example.data.local.ChatMessage
 import com.example.data.local.ChatSession
@@ -193,6 +197,11 @@ class MainActivity : ComponentActivity() {
         //    for the rationale on the 04:00 choice.
         scheduleDailyActivitySnapshot()
 
+        // 5d. VitaDock body composition delta sync. Fetches new TargetScale
+        //     readings since the last stored snapshot using a fresh login
+        //     each time (no session cookies to expire).
+        syncVitaDock()
+
         // 6. Bloco I: ask for POST_NOTIFICATIONS on API 33+ if we don't have it
         //    yet. The launcher is registered as a class-level property above so
         //    it survives configuration changes. Older APIs grant the permission
@@ -332,6 +341,16 @@ class MainActivity : ComponentActivity() {
      *  aggregate after 02:00, sometimes capturing partial values. 04:07 still falls
      *  inside the typical sleep window and `:07` off the hour avoids the same
      *  fleet-scale clustering problem `:00` and `:30` have. */
+    private fun syncVitaDock() {
+        val prefs = getSharedPreferences(PREFS_VITADOCK, Context.MODE_PRIVATE)
+        if (prefs.getString(KEY_VITADOCK_EMAIL, null).isNullOrBlank()) {
+            prefs.edit().putString(KEY_VITADOCK_EMAIL, "hugo.rodrigues@gmail.com").apply()
+        }
+        // Password is seeded externally (restore-env.sh / setup) and never
+        // hardcoded here. If missing the worker logs a skip and returns success.
+        VitaDockSyncWorker.enqueue(applicationContext)
+    }
+
     private fun scheduleDailyActivitySnapshot() {
         val request = PeriodicWorkRequestBuilder<DailyActivitySnapshotWorker>(
             1, TimeUnit.DAYS

@@ -125,6 +125,7 @@ fun tr(key: String, lang: String): String {
         "Total Activity" to "Total Atividade",
         "Resting (BMR)" to "Metabolismo basal (TMB)",
         "Body Composition" to "Composição Corporal",
+        "Sync body composition" to "Sincronizar composição corporal",
         "Metric Dimension" to "Métrica",
         "Total Sum" to "Soma Total",
         // Balanço card redesign 2026-07-20 — two sections (Energia / Macros)
@@ -704,6 +705,7 @@ fun tr(key: String, lang: String): String {
         "Total Activity" to "કુલ પ્રવૃત્તિ",
         "Resting (BMR)" to "બેઝલ મેટાબોલિક રેટ",
         "Body Composition" to "શરીરની રચના",
+        "Sync body composition" to "શરીરની રચના સિંક કરો",
         "Metric Dimension" to "મેટ્રિક પરિમાણ",
         "Total Sum" to "કુલ રકમ",
         // Balanço card redesign 2026-07-20 — two sections (Energia / Macros)

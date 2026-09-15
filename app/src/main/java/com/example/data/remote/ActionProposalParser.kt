@@ -199,7 +199,22 @@ data class ChartLine(
      *  when the tile reports a different quantity than the plotted line (e.g.
      *  line plots muscle kg, KPI shows muscle % and its pp delta). Same length
      *  and null-alignment as [values]. Null → KPI derives from [values]. */
-    val kpiValues: List<Double?>? = null
+    val kpiValues: List<Double?>? = null,
+    /** Optional per-segment health tone for the scrollable body-composition
+     *  strip. Index i = tone of the segment ARRIVING at point i (so [0] is
+     *  unused / "neutral"). Values: "good" | "bad" | "neutral". When present,
+     *  the strip colours each segment and dot by direction-of-change
+     *  (fat down = good, muscle up = good, …) instead of the flat metric
+     *  palette. Null → palette colouring (AI [CHART_PROPOSAL] charts). */
+    val segmentTones: List<String>? = null,
+    /** Optional per-point ESTIMATED overlay for the body-composition strip.
+     *  Index i non-null = a virtual point to draw at i even though [values][i]
+     *  is null (metric not measured that day). Extrapolated from the trajectory
+     *  of the following real readings, and rendered DASHED + HOLLOW so it reads
+     *  as "estimated, not measured" — it never feeds KPI, delta, or tone (those
+     *  still ignore the null in [values]). Same length as [values]. Null → no
+     *  estimates (AI charts, or series with no leading gap). */
+    val estimatedValues: List<Double?>? = null
 )
 
 /**
