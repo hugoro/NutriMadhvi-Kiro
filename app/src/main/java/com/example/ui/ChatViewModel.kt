@@ -204,6 +204,11 @@ class ChatViewModel(
         repository.observeAllPerformanceSnapshots()
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    /** Live flow of the user's latest performance goal (v37). */
+    val latestPerformanceGoal: StateFlow<com.example.data.local.PerformanceGoalEntity?> =
+        repository.observeLatestPerformanceGoal()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
     /** Saves a mobility assessment snapshot. Ignores duplicates within 60 s. */
     fun savePerformanceSnapshot(entity: com.example.data.local.PerformanceSnapshotEntity) {
         viewModelScope.launch {
@@ -226,15 +231,47 @@ class ChatViewModel(
         viewModelScope.launch { generateCoachReport(entity) }
     }
 
+    /** Saves the user's free-text performance goal and derives ratio targets via LLM. */
+    fun savePerformanceGoal(text: String) {
+        viewModelScope.launch {
+            val entity = com.example.data.local.PerformanceGoalEntity(goalText = text)
+            val id = repository.insertPerformanceGoal(entity)
+            if (id > 0) generateCoachTargets(entity.copy(id = id))
+        }
+    }
+
+    private suspend fun generateCoachTargets(goal: com.example.data.local.PerformanceGoalEntity) {
+        val gender = _userProfile.value.gender.ifBlank { "Male" }
+        val lang = _userProfile.value.language.ifBlank { "pt-PT" }
+        val prompt = com.example.data.chat.PerformanceCoachBuilder.buildTargetsPrompt(
+            goal.goalText, gender, lang)
+        val raw = repository.generateCoachReport(prompt) ?: return
+        // Parse [COACH_TARGETS] {...} [/COACH_TARGETS]
+        val json = Regex("""\[COACH_TARGETS]\s*(\{[^}]+})\s*\[/COACH_TARGETS]""")
+            .find(raw)?.groupValues?.getOrNull(1) ?: return
+        repository.updatePerformanceGoalTargets(goal.id, json, System.currentTimeMillis())
+    }
+
     private suspend fun generateCoachReport(entity: com.example.data.local.PerformanceSnapshotEntity) {
         if (entity.id <= 0L) return
         val bodyComp = repository.recentBodyCompositionSnapshots(10)
         val name = _userProfile.value.name.ifBlank { "Utilizador" }
         val lang = _userProfile.value.language.ifBlank { "pt-PT" }
+        val goal = latestPerformanceGoal.value
         val prompt = com.example.data.chat.PerformanceCoachBuilder.buildPrompt(
-            entity, bodyComp, name, lang)
+            entity, bodyComp, name, lang, goal)
         val report = repository.generateCoachReport(prompt) ?: return
-        repository.updatePerformanceCoachReport(entity.id, report, System.currentTimeMillis())
+        // If the report contains [COACH_TARGETS], extract and persist them too
+        val json = Regex("""\[COACH_TARGETS]\s*(\{[^}]+})\s*\[/COACH_TARGETS]""")
+            .find(report)?.groupValues?.getOrNull(1)
+        if (json != null && goal != null) {
+            repository.updatePerformanceGoalTargets(goal.id, json, System.currentTimeMillis())
+        }
+        // Strip the block from the visible report before saving
+        val cleanReport = report
+            .replace(Regex("""\[COACH_TARGETS][^\[]*\[/COACH_TARGETS]"""), "")
+            .trim()
+        repository.updatePerformanceCoachReport(entity.id, cleanReport, System.currentTimeMillis())
     }
 
     /** Legacy projection: extracts just the weight from [latestBodyComposition]

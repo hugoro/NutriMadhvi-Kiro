@@ -99,6 +99,8 @@ private fun toRatioChartLine(kpi: SilhouetteKpi, snaps: List<PerformanceSnapshot
 @Composable
 fun PerformanceTab(viewModel: ChatViewModel) {
     val snapshots by viewModel.performanceSnapshots.collectAsStateWithLifecycle()
+    val latestGoal by viewModel.latestPerformanceGoal.collectAsStateWithLifecycle()
+    val userProfile by viewModel.userProfile.collectAsStateWithLifecycle()
     var showAssessment by remember { mutableStateOf(false) }
 
     if (showAssessment) {
@@ -163,9 +165,29 @@ fun PerformanceTab(viewModel: ChatViewModel) {
             }
         }
 
+        // ── Goal input card (always visible) ─────────────────────────────────
+        item {
+            PerformanceGoalInputCard(
+                currentGoal = latestGoal,
+                onSave = { viewModel.savePerformanceGoal(it) },
+            )
+        }
+
         // ── Silhouette ratio bars (secondary) ─────────────────────────────────
         if (latest != null && latest.hasSilhouetteData()) {
             item { SilhouetteRatioBars(latest) }
+        }
+
+        // ── Silhouette gap card ───────────────────────────────────────────────
+        if (latest != null && latest.hasSilhouetteData()) {
+            val isMale = !userProfile.gender.equals("Female", ignoreCase = true)
+            item {
+                SilhouetteGoalCard(
+                    snap = latest,
+                    latestGoal = latestGoal,
+                    isMale = isMale,
+                )
+            }
         }
 
         // ── Evolution chart (tertiary) ────────────────────────────────────────

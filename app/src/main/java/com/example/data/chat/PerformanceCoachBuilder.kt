@@ -1,6 +1,7 @@
 package com.example.data.chat
 
 import com.example.data.local.BodyCompositionSnapshotEntity
+import com.example.data.local.PerformanceGoalEntity
 import com.example.data.local.PerformanceSnapshotEntity
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -21,7 +22,8 @@ object PerformanceCoachBuilder {
         snapshot: PerformanceSnapshotEntity,
         bodyCompHistory: List<BodyCompositionSnapshotEntity>,
         userName: String,
-        language: String
+        language: String,
+        goal: PerformanceGoalEntity? = null,
     ): String {
         val langName = when {
             language.startsWith("pt", ignoreCase = true) || language.isBlank() -> "português"
@@ -34,6 +36,13 @@ object PerformanceCoachBuilder {
         sb.appendLine("[AVALIAÇÃO DE PERFORMANCE — $date]")
         sb.appendLine("Utilizador: $userName")
         sb.appendLine()
+
+        // User goal — injected before silhouette data so the LLM frames analysis against it
+        if (goal?.goalText != null) {
+            sb.appendLine("## Objetivo declarado pelo utilizador")
+            sb.appendLine(goal.goalText)
+            sb.appendLine()
+        }
 
         // Silhouette ratios — only emit non-null rows
         val hasFrontal = listOf(
@@ -76,15 +85,40 @@ object PerformanceCoachBuilder {
 
         // Prompt instruction
         sb.appendLine("## Instrução")
+        val goalInstruction = if (goal?.goalText != null) {
+            "\n4. Relaciona a análise com o objetivo declarado pelo utilizador e ajusta as recomendações para o atingir\n5. No final, inclui obrigatoriamente um bloco com os rácios-alvo de silhueta recomendados para este objetivo no formato:\n[COACH_TARGETS] {\"shoulder\":0.00,\"waist\":0.00,\"hip\":0.00,\"thigh\":0.00,\"chest\":0.00,\"belly\":0.00,\"lateralThigh\":0.00} [/COACH_TARGETS]"
+        } else {
+            ""
+        }
         sb.appendLine("""
-Com base nos rácios de silhueta e no histórico de composição corporal acima, escreve um relatório de coach conciso (máximo 180 palavras) em $langName que:
+Com base nos rácios de silhueta e no histórico de composição corporal acima, escreve um relatório de coach conciso (máximo 200 palavras) em $langName que:
 1. Avalia a distribuição corporal atual — onde está a massa/gordura concentrada com base nos rácios
 2. Relaciona com a tendência de composição corporal das últimas semanas (se disponível)
-3. Dá 2–3 recomendações práticas e específicas de treino e nutrição baseadas nos dados
+3. Dá 2–3 recomendações práticas e específicas de treino e nutrição baseadas nos dados$goalInstruction
 
 Usa linguagem directa, sem elogios vazios, sem introdução genérica. Começa imediatamente com a análise.
         """.trimIndent())
 
         return sb.toString()
+    }
+
+    /**
+     * Builds a minimal prompt to derive [COACH_TARGETS] JSON from a free-text
+     * goal without requiring a fresh silhouette snapshot.
+     */
+    fun buildTargetsPrompt(goalText: String, gender: String, language: String): String {
+        val langName = if (language.startsWith("gu", ignoreCase = true)) "gujarati" else "português"
+        val genderLabel = if (gender.equals("Female", ignoreCase = true)) "Feminino" else "Masculino"
+        return """
+Género: $genderLabel
+Objetivo do utilizador: $goalText
+
+Com base neste objetivo e género, calcula os rácios de silhueta-alvo (largura de zona / altura corporal)
+mais adequados para atingi-lo, segundo a literatura desportiva (Lassek & Gaulin 2009, Singh 1993).
+Valores típicos: ombros 0.30–0.42, cintura 0.20–0.29, ancas 0.27–0.36, coxas 0.18–0.24, peito 0.19–0.26, barriga 0.18–0.24, coxa lateral 0.17–0.22.
+
+Responde APENAS com o bloco JSON abaixo, sem nenhum texto adicional:
+[COACH_TARGETS] {"shoulder":0.00,"waist":0.00,"hip":0.00,"thigh":0.00,"chest":0.00,"belly":0.00,"lateralThigh":0.00} [/COACH_TARGETS]
+        """.trimIndent()
     }
 }

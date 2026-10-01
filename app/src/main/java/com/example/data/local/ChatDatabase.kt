@@ -23,9 +23,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         PredictedQaEntity::class,
         IngredientNutritionEntity::class,
         MealCorrectionEntity::class,
-        PerformanceSnapshotEntity::class
+        PerformanceSnapshotEntity::class,
+        PerformanceGoalEntity::class
     ],
-    version = 36,
+    version = 37,
     exportSchema = true
 )
 @androidx.room.TypeConverters(Converters::class)
@@ -43,6 +44,7 @@ abstract class ChatDatabase : RoomDatabase() {
     abstract val ingredientNutritionDao: IngredientNutritionDao
     abstract val mealCorrectionDao: MealCorrectionDao
     abstract val performanceSnapshotDao: PerformanceSnapshotDao
+    abstract val performanceGoalDao: PerformanceGoalDao
 
     companion object {
         @Volatile
@@ -771,6 +773,20 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_36_37 = object : Migration(36, 37) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `performance_goals` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `createdAtMs` INTEGER NOT NULL,
+                        `goalText` TEXT NOT NULL,
+                        `coachTargetJson` TEXT,
+                        `targetsGeneratedAtMs` INTEGER
+                    )
+                """.trimIndent())
+            }
+        }
+
         val MIGRATION_35_36 = object : Migration(35, 36) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // Silhouette photo paths
@@ -856,7 +872,8 @@ abstract class ChatDatabase : RoomDatabase() {
                     MIGRATION_32_33,
                     MIGRATION_33_34,
                     MIGRATION_34_35,
-                    MIGRATION_35_36
+                    MIGRATION_35_36,
+                    MIGRATION_36_37
                 )
                 // Hard guarantee that v9→v10 (and later) NEVER nukes user data:
                 // if a defined migration throws, the app crashes loudly instead of

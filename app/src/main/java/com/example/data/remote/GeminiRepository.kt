@@ -173,6 +173,8 @@ class GeminiRepository(
     /** Performance/mobility snapshots DAO (schema v35). Optional so existing
      *  constructors (tests, legacy code) don't break. */
     private val performanceSnapshotDao: com.example.data.local.PerformanceSnapshotDao? = null,
+    /** Performance goals DAO (schema v37). Optional for same reason. */
+    private val performanceGoalDao: com.example.data.local.PerformanceGoalDao? = null,
 ) {
 
     /** Aggregates the correction-gap history into a directional calibration
@@ -467,6 +469,20 @@ class GeminiRepository(
 
     suspend fun updatePerformanceCoachReport(id: Long, report: String, ts: Long) {
         performanceSnapshotDao?.updateCoachReport(id, report, ts)
+    }
+
+    // ─── Performance goals ────────────────────────────────────────────────────
+
+    fun observeLatestPerformanceGoal() =
+        performanceGoalDao?.observeLatest()
+            ?: kotlinx.coroutines.flow.flowOf(null)
+
+    suspend fun insertPerformanceGoal(
+        goal: com.example.data.local.PerformanceGoalEntity
+    ): Long = performanceGoalDao?.insert(goal) ?: -1L
+
+    suspend fun updatePerformanceGoalTargets(id: Long, json: String, ts: Long) {
+        performanceGoalDao?.updateCoachTargets(id, json, ts)
     }
 
     /** Calls Gemini (text-only, ~180-word output) to produce the silhouette coach report.
