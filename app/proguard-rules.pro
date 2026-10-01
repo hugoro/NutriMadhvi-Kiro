@@ -239,3 +239,22 @@
     public static *** w(...);
     public static *** e(...);
 }
+
+# -------------------------------------------------------------------------
+# ML Kit Pose Detection
+# Firebase component discovery instantiates registrars by reflection via
+# no-arg constructors. R8 strips them because nothing calls them directly.
+# Without this, PoseDetection.getClient() throws LazyInstanceMap NPE.
+# Crash trace (2026-09-30, v394/395):
+#   NoSuchMethodException: PoseRegistrar.<init> []
+#   → NullPointerException: LazyInstanceMap.get() on null
+# -------------------------------------------------------------------------
+-keep class com.google.mlkit.vision.pose.** { *; }
+-keep class com.google.mlkit.vision.common.** { *; }
+-keep class com.google.mlkit.vision.segmentation.** { *; }
+-keep class com.google.mlkit.common.** { *; }
+-keepclassmembers class com.google.mlkit.** {
+    <init>();
+    <init>(...);
+}
+-dontwarn com.google.mlkit.**

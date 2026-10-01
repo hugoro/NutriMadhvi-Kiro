@@ -170,6 +170,9 @@ class GeminiRepository(
      *  existing test constructors keep compiling. Drives
      *  [correctionCalibrator]; null → no capture, empty calibration. */
     private val mealCorrectionDao: com.example.data.local.MealCorrectionDao? = null,
+    /** Performance/mobility snapshots DAO (schema v35). Optional so existing
+     *  constructors (tests, legacy code) don't break. */
+    private val performanceSnapshotDao: com.example.data.local.PerformanceSnapshotDao? = null,
 ) {
 
     /** Aggregates the correction-gap history into a directional calibration
@@ -220,6 +223,7 @@ class GeminiRepository(
             bodyCompositionSnapshotDao = bodyCompositionSnapshotDao,
             userInsightDao = userInsightDao,
             predictedQaDao = predictedQaDao,
+            performanceSnapshotDao = performanceSnapshotDao,
             chartRequester = ::requestChart
         )
 
@@ -443,6 +447,40 @@ class GeminiRepository(
     suspend fun insertBodyCompositionSnapshot(
         snapshot: com.example.data.local.BodyCompositionSnapshotEntity
     ): Long = bodyCompositionSnapshotDao.insert(snapshot)
+
+    // ── Performance / Mobility Snapshots (v35) ───────────────────────────────
+
+    fun observeLatestPerformanceSnapshot() =
+        performanceSnapshotDao?.observeLatest()
+            ?: kotlinx.coroutines.flow.flowOf(null)
+
+    fun observeAllPerformanceSnapshots() =
+        performanceSnapshotDao?.observeAll()
+            ?: kotlinx.coroutines.flow.flowOf(emptyList())
+
+    suspend fun recentPerformanceSnapshots(limit: Int = 20) =
+        performanceSnapshotDao?.recent(limit) ?: emptyList()
+
+    suspend fun insertPerformanceSnapshot(
+        snapshot: com.example.data.local.PerformanceSnapshotEntity
+    ): Long = performanceSnapshotDao?.insert(snapshot) ?: -1L
+
+    suspend fun updatePerformanceCoachReport(id: Long, report: String, ts: Long) {
+        performanceSnapshotDao?.updateCoachReport(id, report, ts)
+    }
+
+    /** Calls Gemini (text-only, ~180-word output) to produce the silhouette coach report.
+     *  Returns null on API key misconfiguration or hard failure. */
+    suspend fun generateCoachReport(prompt: String): String? {
+        val apiKey = BuildConfig.GEMINI_API_KEY
+        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") return null
+        val request = GeminiRequest(
+            contents = listOf(Content(parts = listOf(Part(text = prompt)))),
+            generationConfig = GenerationConfig(temperature = 0.4f),
+        )
+        return generateContentWithFallback(apiKey, "gemini-3.5-flash", request, "pt")
+            .getOrNull()
+    }
 
     // Phase E: persistent user-insight API. The data-card builder reads from
     // topConfirmedInsights() each turn; the chat parser writes pending or

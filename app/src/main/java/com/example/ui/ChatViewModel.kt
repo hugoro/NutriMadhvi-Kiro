@@ -197,6 +197,46 @@ class ChatViewModel(
     ): List<com.example.data.local.BodyCompositionSnapshotEntity> =
         repository.bodyCompositionSnapshotsBetween(startMs, endMs)
 
+    // ── Performance / Mobility (v35) ─────────────────────────────────────────
+
+    /** Live flow of all performance snapshots, ascending. Performance tab subscribes. */
+    val performanceSnapshots: StateFlow<List<com.example.data.local.PerformanceSnapshotEntity>> =
+        repository.observeAllPerformanceSnapshots()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /** Saves a mobility assessment snapshot. Ignores duplicates within 60 s. */
+    fun savePerformanceSnapshot(entity: com.example.data.local.PerformanceSnapshotEntity) {
+        viewModelScope.launch {
+            repository.insertPerformanceSnapshot(entity)
+        }
+    }
+
+    /** Saves a silhouette snapshot then generates the coach report async.
+     *  The entity is persisted immediately (UI can show a spinner); once the
+     *  LLM responds the report is written back via [updateCoachReport]. */
+    fun savePerformanceSnapshotAndRequestReport(entity: com.example.data.local.PerformanceSnapshotEntity) {
+        viewModelScope.launch {
+            val id = repository.insertPerformanceSnapshot(entity)
+            if (id > 0) generateCoachReport(entity.copy(id = id))
+        }
+    }
+
+    /** Triggers async coach report generation for an already-saved snapshot. */
+    fun requestCoachReport(entity: com.example.data.local.PerformanceSnapshotEntity) {
+        viewModelScope.launch { generateCoachReport(entity) }
+    }
+
+    private suspend fun generateCoachReport(entity: com.example.data.local.PerformanceSnapshotEntity) {
+        if (entity.id <= 0L) return
+        val bodyComp = repository.recentBodyCompositionSnapshots(10)
+        val name = _userProfile.value.name.ifBlank { "Utilizador" }
+        val lang = _userProfile.value.language.ifBlank { "pt-PT" }
+        val prompt = com.example.data.chat.PerformanceCoachBuilder.buildPrompt(
+            entity, bodyComp, name, lang)
+        val report = repository.generateCoachReport(prompt) ?: return
+        repository.updatePerformanceCoachReport(entity.id, report, System.currentTimeMillis())
+    }
+
     /** Legacy projection: extracts just the weight from [latestBodyComposition]
      *  for callers that don't need the full snapshot. Kept around so the
      *  Reports tab's existing `shWeightSnap?.kg` call site stays untouched

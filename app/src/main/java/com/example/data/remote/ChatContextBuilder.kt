@@ -4,6 +4,7 @@ import com.example.data.local.ActivityEntry
 import com.example.data.local.BmrSnapshotEntity
 import com.example.data.local.BodyCompositionSnapshotEntity
 import com.example.data.local.FoodEntry
+import com.example.data.local.PerformanceSnapshotEntity
 import com.example.data.local.TargetSnapshot
 import com.example.data.local.UserInsight
 import com.squareup.moshi.Moshi
@@ -72,7 +73,11 @@ internal object ChatContextBuilder {
          *  it can answer questions like "How has my weight changed?" or
          *  reason about lean-mass trends. Empty list omits the section.
          *  Caller decides the depth — a typical value is 5–10 entries. */
-        bodyCompositionHistory: List<BodyCompositionSnapshotEntity> = emptyList()
+        bodyCompositionHistory: List<BodyCompositionSnapshotEntity> = emptyList(),
+        /** Recent performance snapshots (newest first). Surfaces silhouette
+         *  width ratios + coach report excerpt so the assistant can link body
+         *  composition trends to visual assessment. Empty list omits section. */
+        recentPerformanceSnapshots: List<PerformanceSnapshotEntity> = emptyList(),
     ): String {
         val todayStart = today.atStartOfDay(zone).toInstant().toEpochMilli()
         val tomorrowStart = today.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
@@ -351,6 +356,22 @@ internal object ChatContextBuilder {
                 .append(" kcal.\n")
         } else if (targetKcal > 0 && daysRemaining == 0) {
             sb.append("**End-of-month**: today is the last day of ").append(ym).append(".\n")
+        }
+
+        if (recentPerformanceSnapshots.isNotEmpty()) {
+            val latest = recentPerformanceSnapshots.first()
+            val perfDate = DAY_HOUR.format(
+                java.time.LocalDateTime.ofInstant(
+                    java.time.Instant.ofEpochMilli(latest.capturedAtMs), zone))
+            sb.append("\n## Última avaliação de performance ($perfDate)\n")
+            latest.frontalShoulderRatio?.let { sb.append("- Ombros: ${"%.3f".format(it)}\n") }
+            latest.frontalWaistRatio?.let    { sb.append("- Cintura: ${"%.3f".format(it)}\n") }
+            latest.frontalHipRatio?.let      { sb.append("- Ancas: ${"%.3f".format(it)}\n") }
+            latest.frontalThighRatio?.let    { sb.append("- Coxas: ${"%.3f".format(it)}\n") }
+            latest.lateralBellyRatio?.let    { sb.append("- Barriga (lateral): ${"%.3f".format(it)}\n") }
+            latest.coachReport?.let { report ->
+                sb.append("- Resumo do coach: \"${report.take(120)}${if (report.length > 120) "…" else ""}\"\n")
+            }
         }
 
         return sb.toString()

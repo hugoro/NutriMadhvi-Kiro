@@ -22,9 +22,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         UserInsight::class,
         PredictedQaEntity::class,
         IngredientNutritionEntity::class,
-        MealCorrectionEntity::class
+        MealCorrectionEntity::class,
+        PerformanceSnapshotEntity::class
     ],
-    version = 34,
+    version = 36,
     exportSchema = true
 )
 @androidx.room.TypeConverters(Converters::class)
@@ -41,6 +42,7 @@ abstract class ChatDatabase : RoomDatabase() {
     abstract val predictedQaDao: PredictedQaDao
     abstract val ingredientNutritionDao: IngredientNutritionDao
     abstract val mealCorrectionDao: MealCorrectionDao
+    abstract val performanceSnapshotDao: PerformanceSnapshotDao
 
     companion object {
         @Volatile
@@ -769,6 +771,54 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_35_36 = object : Migration(35, 36) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Silhouette photo paths
+                db.execSQL("ALTER TABLE `performance_snapshots` ADD COLUMN `frontalImagePath` TEXT DEFAULT NULL")
+                db.execSQL("ALTER TABLE `performance_snapshots` ADD COLUMN `lateralImagePath` TEXT DEFAULT NULL")
+                // Silhouette width ratios (zone width / image height)
+                db.execSQL("ALTER TABLE `performance_snapshots` ADD COLUMN `frontalShoulderRatio` REAL DEFAULT NULL")
+                db.execSQL("ALTER TABLE `performance_snapshots` ADD COLUMN `frontalWaistRatio` REAL DEFAULT NULL")
+                db.execSQL("ALTER TABLE `performance_snapshots` ADD COLUMN `frontalHipRatio` REAL DEFAULT NULL")
+                db.execSQL("ALTER TABLE `performance_snapshots` ADD COLUMN `frontalThighRatio` REAL DEFAULT NULL")
+                db.execSQL("ALTER TABLE `performance_snapshots` ADD COLUMN `lateralChestRatio` REAL DEFAULT NULL")
+                db.execSQL("ALTER TABLE `performance_snapshots` ADD COLUMN `lateralBellyRatio` REAL DEFAULT NULL")
+                db.execSQL("ALTER TABLE `performance_snapshots` ADD COLUMN `lateralThighRatio` REAL DEFAULT NULL")
+                // LLM coach report (generated async after save)
+                db.execSQL("ALTER TABLE `performance_snapshots` ADD COLUMN `coachReport` TEXT DEFAULT NULL")
+                db.execSQL("ALTER TABLE `performance_snapshots` ADD COLUMN `reportGeneratedAtMs` INTEGER DEFAULT NULL")
+            }
+        }
+
+        val MIGRATION_34_35 = object : Migration(34, 35) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `performance_snapshots` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `capturedAtMs` INTEGER NOT NULL,
+                        `source` TEXT NOT NULL DEFAULT 'manual',
+                        `notes` TEXT,
+                        `leftShoulderSagittalDeg` REAL,
+                        `leftShoulderFrontalDeg` REAL,
+                        `rightShoulderSagittalDeg` REAL,
+                        `rightShoulderFrontalDeg` REAL,
+                        `leftHipSagittalDeg` REAL,
+                        `leftHipFrontalDeg` REAL,
+                        `rightHipSagittalDeg` REAL,
+                        `rightHipFrontalDeg` REAL,
+                        `leftElbowSagittalDeg` REAL,
+                        `rightElbowSagittalDeg` REAL,
+                        `leftKneeSagittalDeg` REAL,
+                        `rightKneeSagittalDeg` REAL
+                    )
+                """.trimIndent())
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_performance_snapshots_capturedAtMs` " +
+                        "ON `performance_snapshots`(`capturedAtMs`)"
+                )
+            }
+        }
+
         fun getInstance(context: Context): ChatDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -804,7 +854,9 @@ abstract class ChatDatabase : RoomDatabase() {
                     MIGRATION_30_31,
                     MIGRATION_31_32,
                     MIGRATION_32_33,
-                    MIGRATION_33_34
+                    MIGRATION_33_34,
+                    MIGRATION_34_35,
+                    MIGRATION_35_36
                 )
                 // Hard guarantee that v9→v10 (and later) NEVER nukes user data:
                 // if a defined migration throws, the app crashes loudly instead of

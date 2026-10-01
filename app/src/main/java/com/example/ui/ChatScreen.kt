@@ -123,7 +123,7 @@ import kotlin.math.roundToInt
 
 // Tabs Enumeration
 enum class AppTab {
-    DASHBOARD, HISTORY, ACTIVITY, CHAT, HABITS, REPORT
+    DASHBOARD, HISTORY, ACTIVITY, CHAT, HABITS, REPORT, PERFORMANCE
 }
 
 /**
@@ -540,10 +540,10 @@ fun ChatScreen(
                         onClick = { selectTab(AppTab.CHAT) }
                     )
                     AppBottomNavItem(
-                        icon = Icons.Rounded.Bookmark,
-                        label = tr("Habits", userProfile.language),
-                        selected = currentTab == AppTab.HABITS,
-                        onClick = { selectTab(AppTab.HABITS) }
+                        icon = Icons.Rounded.FitnessCenter,
+                        label = tr("Performance", userProfile.language),
+                        selected = currentTab == AppTab.PERFORMANCE,
+                        onClick = { selectTab(AppTab.PERFORMANCE) }
                     )
                     AppBottomNavItem(
                         icon = Icons.Rounded.Assessment,
@@ -619,7 +619,7 @@ fun ChatScreen(
                         // `DashboardTab` normal. Mesmo padrão que a History usa
                         // (~linha 511-512).
                         if (originTab == AppTab.DASHBOARD && hasPending) {
-                            ActivityCaptureTab(viewModel = viewModel)
+                            ActivityCaptureTab(viewModel = viewModel, onNavigateToHabits = {})
                         } else {
                         // Pull-to-refresh padrão Material3: dispara o force-sync e
                         // só desliga o spinner quando shLastSyncMs é bumped (= sync
@@ -686,7 +686,10 @@ fun ChatScreen(
                         }
                         }
                     }
-                    AppTab.ACTIVITY -> ActivityCaptureTab(viewModel = viewModel)
+                    AppTab.ACTIVITY -> ActivityCaptureTab(
+                        viewModel = viewModel,
+                        onNavigateToHabits = { selectTab(AppTab.HABITS) }
+                    )
                     AppTab.HISTORY -> {
                         // Quando o utilizador toca num item na History para editar,
                         // setamos `originTab = HISTORY` (sem mexer no pager) e
@@ -697,7 +700,7 @@ fun ChatScreen(
                         // a fazer reset do `originTab` quando o pending limpa,
                         // mas o `animateScrollToPage(HISTORY)` torna-se no-op.
                         if (originTab == AppTab.HISTORY && hasPending) {
-                            ActivityCaptureTab(viewModel = viewModel)
+                            ActivityCaptureTab(viewModel = viewModel, onNavigateToHabits = {})
                         } else {
                             HistoryTab(
                                 foods = foods,
@@ -732,6 +735,7 @@ fun ChatScreen(
                     )
                     AppTab.REPORT -> ReportTab(foods = foods, activities = activities, viewModel = viewModel)
                     AppTab.HABITS -> FoodHabitsScreen(viewModel = viewModel)
+                    AppTab.PERFORMANCE -> PerformanceTab(viewModel = viewModel)
                 }
             }
             // One-shot snackbar host — overlays the entire tab area so the
@@ -11981,7 +11985,7 @@ private fun ActivityCaptureSection(viewModel: ChatViewModel) {
 }
 
 @Composable
-fun ActivityCaptureTab(viewModel: ChatViewModel) {
+fun ActivityCaptureTab(viewModel: ChatViewModel, onNavigateToHabits: () -> Unit = {}) {
     val userProfile by viewModel.userProfile.collectAsState()
     val activeMode by viewModel.activeCaptureMode.collectAsState()
     val pendingFoodEntry by viewModel.pendingFoodEntry.collectAsState()
@@ -12104,6 +12108,34 @@ fun ActivityCaptureTab(viewModel: ChatViewModel) {
             }
         }
         } // end if (pendingFoodEntry == null) — pills hidden in edit mode
+
+        // Habits shortcut — small secondary button, only visible outside edit mode
+        if (pendingFoodEntry == null && pendingActivityEntry == null) {
+            OutlinedButton(
+                onClick = onNavigateToHabits,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                border = androidx.compose.foundation.BorderStroke(
+                    1.dp, Color(0xFF334155)
+                ),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = Color(0xFF94A3B8)
+                ),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+            ) {
+                Icon(
+                    Icons.Rounded.Bookmark,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    tr("Habits", userProfile.language),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+        }
 
         // Spacer between the segment pills and the chosen layout — only
         // meaningful when the pills are visible. In edit mode (pendingFoodEntry

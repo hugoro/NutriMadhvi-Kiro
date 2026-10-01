@@ -10,6 +10,7 @@ fun tr(key: String, lang: String): String {
         "Chat" to "Chat",
         "Report" to "Relatórios",
         "Analytics" to "Análise",
+        "Performance" to "Performance",
         "Nutrition and activity status" to "Estado da nutrição e atividade",
         "Macronutrients" to "Macronutrientes",
         "Activities" to "Atividades",
@@ -1216,10 +1217,20 @@ fun tr(key: String, lang: String): String {
         "macro_breakdown_title_carbs" to "Carbohydrates — detail",
         "macro_breakdown_title_fat" to "Fat — detail",
         "macro_breakdown_title_calories" to "Calories — detail",
-        "macro_breakdown_sh_fallback" to "Samsung Health"
+        "macro_breakdown_sh_fallback" to "Samsung Health",
+        // Notification titles — needed so empty/unknown language falls back to English
+        // rather than returning the raw key (e.g. "notif_title_summary").
+        "notif_title_meals" to "Missing meal",
+        "notif_title_activity_spike" to "Great activity!",
+        "notif_title_macros" to "Macros at risk",
+        "notif_title_summary" to "Daily summary",
+        "notif_session_title_meals" to "Today's meals",
+        "notif_session_title_exercise" to "This week's activity",
+        "notif_session_title_macros" to "Macros at risk",
+        "notif_session_title_summary" to "Daily summary",
     )
     return when (lang) {
-        "pt-PT", "pt" -> pt[key] ?: enExplicit[key] ?: key
+        "pt-PT", "pt", "" -> pt[key] ?: enExplicit[key] ?: key
         "gu" -> gu[key] ?: enExplicit[key] ?: key
         else -> enExplicit[key] ?: key
     }

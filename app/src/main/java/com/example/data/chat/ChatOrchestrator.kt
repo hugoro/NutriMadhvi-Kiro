@@ -89,6 +89,9 @@ class ChatOrchestrator(
      * tests / older wiring paths don't have to plumb it.
      */
     private val predictedQaDao: com.example.data.local.PredictedQaDao? = null,
+    /** Performance snapshot DAO — when present, recent silhouette assessments
+     *  are injected into the canonical chat context. Nullable for backward compat. */
+    private val performanceSnapshotDao: com.example.data.local.PerformanceSnapshotDao? = null,
     private val intentRouter: IntentRouter = IntentRouter,
     private val dataFetcher: DataFetcher = DataFetcher(foodDao, activityDao),
     /**
@@ -2674,6 +2677,7 @@ class ChatOrchestrator(
             val latestBmr: com.example.data.local.BmrSnapshotEntity?,
             val confirmed: List<UserInsight>,
             val bodyComp: List<com.example.data.local.BodyCompositionSnapshotEntity>,
+            val performance: List<com.example.data.local.PerformanceSnapshotEntity>,
         )
         val reads = coroutineScope {
             val foodsDeferred = async {
@@ -2698,6 +2702,9 @@ class ChatOrchestrator(
             val bodyCompDeferred = async {
                 runCatching { bodyCompositionSnapshotDao.recent(10) }.getOrDefault(emptyList())
             }
+            val performanceDeferred = async {
+                runCatching { performanceSnapshotDao?.recent(3) }.getOrDefault(emptyList())
+            }
             SnapshotReads(
                 foods = foodsDeferred.await(),
                 activities = activitiesDeferred.await(),
@@ -2705,6 +2712,7 @@ class ChatOrchestrator(
                 latestBmr = latestBmrDeferred.await(),
                 confirmed = confirmedDeferred.await(),
                 bodyComp = bodyCompDeferred.await(),
+                performance = performanceDeferred.await() ?: emptyList(),
             )
         }
         val readsMs = System.currentTimeMillis() - buildStartedMs
@@ -2719,7 +2727,8 @@ class ChatOrchestrator(
             caloriesBurnedByDate = emptyMap(),
             confirmedInsights = reads.confirmed,
             userName = userName,
-            bodyCompositionHistory = reads.bodyComp
+            bodyCompositionHistory = reads.bodyComp,
+            recentPerformanceSnapshots = reads.performance,
         )
         val buildMs = System.currentTimeMillis() - buildStartedMs
         snapshotCache.value = SnapshotCache(
