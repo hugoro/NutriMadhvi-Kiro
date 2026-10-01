@@ -126,6 +126,21 @@ enum class AppTab {
     DASHBOARD, HISTORY, ACTIVITY, CHAT, HABITS, REPORT, PERFORMANCE
 }
 
+// Navigation order for the pager + bottom bar. Decoupled from the enum's
+// declaration order (whose .ordinal is persisted elsewhere) so the swipe
+// sequence matches the bottom-bar left→right order exactly. HABITS is placed
+// LAST and intentionally has no bottom-bar item — it is a secondary screen
+// reached from the Activity tab (onNavigateToHabits), not part of the main
+// swipe sweep between the six primary tabs.
+private val NAV_ORDER = listOf(
+    AppTab.DASHBOARD, AppTab.HISTORY, AppTab.ACTIVITY, AppTab.CHAT,
+    AppTab.PERFORMANCE, AppTab.REPORT, AppTab.HABITS,
+)
+/** Pager page index for a tab (position in NAV_ORDER). */
+private fun pageOf(tab: AppTab): Int = NAV_ORDER.indexOf(tab).coerceAtLeast(0)
+/** Tab at a pager page index. */
+private fun tabOf(page: Int): AppTab = NAV_ORDER.getOrElse(page) { AppTab.DASHBOARD }
+
 /**
  * Detecta swipe horizontal num filho. Consome o gesto, por isso o HorizontalPager
  * pai não recebe nada — útil para zonas onde o swipe deve mudar estado local
@@ -381,11 +396,11 @@ fun ChatScreen(
     viewModel: ChatViewModel,
     modifier: Modifier = Modifier
 ) {
-    val pagerState = rememberPagerState(initialPage = AppTab.DASHBOARD.ordinal) {
-        AppTab.values().size
+    val pagerState = rememberPagerState(initialPage = pageOf(AppTab.DASHBOARD)) {
+        NAV_ORDER.size
     }
     val coroutineScope = rememberCoroutineScope()
-    val currentTab = AppTab.values()[pagerState.currentPage]
+    val currentTab = tabOf(pagerState.currentPage)
 
     // Bloco I (proactive notifications): when MainActivity.handleNotificationIntent
     // parks an AppTab.CHAT switch on the ViewModel (after a notification tap),
@@ -395,7 +410,7 @@ fun ChatScreen(
     val pendingTab by viewModel.pendingTabSwitch.collectAsState()
     LaunchedEffect(pendingTab) {
         pendingTab?.let {
-            pagerState.animateScrollToPage(it.ordinal)
+            pagerState.animateScrollToPage(pageOf(it))
             viewModel.consumeTabSwitch()
         }
     }
@@ -431,7 +446,7 @@ fun ChatScreen(
         originTab = null
         dashboardBreakdownToRestore = null
         viewModel.clearPendingSession()
-        coroutineScope.launch { pagerState.animateScrollToPage(tab.ordinal) }
+        coroutineScope.launch { pagerState.animateScrollToPage(pageOf(tab)) }
     }
 
     // Cancel / Close & Discard emite `pendingClosed`. Regressamos à tab de
@@ -444,7 +459,7 @@ fun ChatScreen(
     val hasPending = pendingFood != null || pendingActivity != null
     LaunchedEffect(Unit) {
         viewModel.pendingClosed.collect {
-            originTab?.let { pagerState.animateScrollToPage(it.ordinal) }
+            originTab?.let { pagerState.animateScrollToPage(pageOf(it)) }
             originTab = null
         }
     }
@@ -458,7 +473,7 @@ fun ChatScreen(
             // Save never re-opens a dashboard popup — clear the restore token so
             // a prior popup-origin edit that ends in Save lands cleanly on History.
             dashboardBreakdownToRestore = null
-            pagerState.animateScrollToPage(AppTab.HISTORY.ordinal)
+            pagerState.animateScrollToPage(pageOf(AppTab.HISTORY))
         }
     }
     // Activity save path still auto-closes (unchanged behaviour) — this mirrors
@@ -467,7 +482,7 @@ fun ChatScreen(
     LaunchedEffect(pendingActivity != null) {
         val nowPending = pendingActivity != null
         if (hadActivityPending && !nowPending) {
-            originTab?.let { pagerState.animateScrollToPage(it.ordinal) }
+            originTab?.let { pagerState.animateScrollToPage(pageOf(it)) }
             originTab = null
         }
         hadActivityPending = nowPending
@@ -606,7 +621,7 @@ fun ChatScreen(
                 modifier = Modifier.fillMaxSize(),
                 key = { it }
             ) { page ->
-                when (AppTab.values()[page]) {
+                when (tabOf(page)) {
                     AppTab.DASHBOARD -> {
                         // Tab-edit-in-place: quando o utilizador toca no nome
                         // de uma refeição no popup Calorias do Dashboard, marcamos
@@ -709,19 +724,19 @@ fun ChatScreen(
                                 listState = historyListState,
                                 initialFilter = historyFilter,
                                 onFilterChange = { historyFilter = it },
-                                isVisible = pagerState.currentPage == AppTab.HISTORY.ordinal,
+                                isVisible = pagerState.currentPage == pageOf(AppTab.HISTORY),
                                 onNavigateToTab = { tab, mode ->
                                     viewModel.setCaptureMode(mode)
                                     // Marca a History como tab de origem para regressar
                                     // depois de o pending entry ser gravado/rejeitado.
-                                    originTab = AppTab.values()[pagerState.currentPage]
+                                    originTab = tabOf(pagerState.currentPage)
                                     // Se a destinação for Activity e estamos em History,
                                     // não mexemos no pager — o slot da History passa a
                                     // renderizar o ActivityCaptureTab graças ao branch
                                     // acima. Para qualquer outra destinação (ou se
                                     // estivermos noutra tab), animamos normalmente.
-                                    if (!(tab == AppTab.ACTIVITY && pagerState.currentPage == AppTab.HISTORY.ordinal)) {
-                                        coroutineScope.launch { pagerState.animateScrollToPage(tab.ordinal) }
+                                    if (!(tab == AppTab.ACTIVITY && pagerState.currentPage == pageOf(AppTab.HISTORY))) {
+                                        coroutineScope.launch { pagerState.animateScrollToPage(pageOf(tab)) }
                                     }
                                 }
                             )
@@ -729,8 +744,8 @@ fun ChatScreen(
                     }
                     AppTab.CHAT -> ChatTab(
                         viewModel = viewModel,
-                        isVisible = pagerState.currentPage == AppTab.CHAT.ordinal,
-                        isSettledOnChat = pagerState.settledPage == AppTab.CHAT.ordinal &&
+                        isVisible = pagerState.currentPage == pageOf(AppTab.CHAT),
+                        isSettledOnChat = pagerState.settledPage == pageOf(AppTab.CHAT) &&
                             !pagerState.isScrollInProgress
                     )
                     AppTab.REPORT -> ReportTab(foods = foods, activities = activities, viewModel = viewModel)

@@ -90,9 +90,13 @@ fun PerformanceGoalInputCard(
                 shape = RoundedCornerShape(10.dp),
             )
 
+            // Allow re-triggering target generation when a goal exists but the
+            // coach never produced targets (generation failed / returned null).
+            val textChanged = text.trim() != currentGoal?.goalText
+            val canRetry = hasGoal && !hasTargets && text.isNotBlank()
             Button(
                 onClick = { if (text.isNotBlank()) onSave(text.trim()) },
-                enabled = text.isNotBlank() && text.trim() != currentGoal?.goalText,
+                enabled = text.isNotBlank() && (textChanged || canRetry),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = AccentPrimary,
                     disabledContainerColor = Color.White.copy(alpha = 0.08f),
@@ -101,7 +105,11 @@ fun PerformanceGoalInputCard(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(
-                    if (hasGoal) "Atualizar objetivo" else "Guardar objetivo",
+                    when {
+                        canRetry && !textChanged -> "Tentar calcular objetivos"
+                        hasGoal                  -> "Atualizar objetivo"
+                        else                     -> "Guardar objetivo"
+                    },
                     fontSize = 13.sp,
                 )
             }

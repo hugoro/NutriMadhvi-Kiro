@@ -231,9 +231,17 @@ class ChatViewModel(
         viewModelScope.launch { generateCoachReport(entity) }
     }
 
-    /** Saves the user's free-text performance goal and derives ratio targets via LLM. */
+    /** Saves the user's free-text performance goal and derives ratio targets via LLM.
+     *  Idempotent: if the latest goal already has this exact text but no targets yet
+     *  (generation previously failed), re-run generation on it instead of inserting
+     *  a duplicate row. */
     fun savePerformanceGoal(text: String) {
         viewModelScope.launch {
+            val latest = latestPerformanceGoal.value
+            if (latest != null && latest.goalText == text && latest.coachTargetJson == null) {
+                generateCoachTargets(latest)   // retry on the existing row
+                return@launch
+            }
             val entity = com.example.data.local.PerformanceGoalEntity(goalText = text)
             val id = repository.insertPerformanceGoal(entity)
             if (id > 0) generateCoachTargets(entity.copy(id = id))
@@ -243,13 +251,25 @@ class ChatViewModel(
     private suspend fun generateCoachTargets(goal: com.example.data.local.PerformanceGoalEntity) {
         val gender = _userProfile.value.gender.ifBlank { "Male" }
         val lang = _userProfile.value.language.ifBlank { "pt-PT" }
+        val snapshot = repository.recentPerformanceSnapshots(1).firstOrNull()
+        val bodyComp = repository.recentBodyCompositionSnapshots(10)
         val prompt = com.example.data.chat.PerformanceCoachBuilder.buildTargetsPrompt(
-            goal.goalText, gender, lang)
-        val raw = repository.generateCoachReport(prompt) ?: return
-        // Parse [COACH_TARGETS] {...} [/COACH_TARGETS]
-        val json = Regex("""\[COACH_TARGETS]\s*(\{[^}]+})\s*\[/COACH_TARGETS]""")
-            .find(raw)?.groupValues?.getOrNull(1) ?: return
-        repository.updatePerformanceGoalTargets(goal.id, json, System.currentTimeMillis())
+            goal.goalText, gender, lang, snapshot, bodyComp)
+        val raw = repository.generateCoachReport(prompt)
+        if (raw == null) {
+            android.util.Log.w("SHD", "[coach-targets] LLM returned null (key/network) goal=${goal.id}")
+            return
+        }
+        val json = extractCoachTargetsJson(raw)
+        if (json == null) {
+            android.util.Log.w("SHD", "[coach-targets] no [COACH_TARGETS] block in response goal=${goal.id}")
+            return
+        }
+        // Clamp every target into the physiological reference range so a stray or
+        // echoed-noise value from the LLM can never drive the silhouette.
+        val clamped = com.example.data.chat.PerformanceCoachBuilder.clampTargetsJson(json)
+        repository.updatePerformanceGoalTargets(goal.id, clamped, System.currentTimeMillis())
+        android.util.Log.i("SHD", "[coach-targets] persisted goal=${goal.id} raw=$json clamped=$clamped")
     }
 
     private suspend fun generateCoachReport(entity: com.example.data.local.PerformanceSnapshotEntity) {
@@ -261,16 +281,14 @@ class ChatViewModel(
         val prompt = com.example.data.chat.PerformanceCoachBuilder.buildPrompt(
             entity, bodyComp, name, lang, goal)
         val report = repository.generateCoachReport(prompt) ?: return
-        // If the report contains [COACH_TARGETS], extract and persist them too
-        val json = Regex("""\[COACH_TARGETS]\s*(\{[^}]+})\s*\[/COACH_TARGETS]""")
-            .find(report)?.groupValues?.getOrNull(1)
+        // If the report contains [COACH_TARGETS], extract, clamp and persist them too
+        val json = extractCoachTargetsJson(report)
         if (json != null && goal != null) {
-            repository.updatePerformanceGoalTargets(goal.id, json, System.currentTimeMillis())
+            val clamped = com.example.data.chat.PerformanceCoachBuilder.clampTargetsJson(json)
+            repository.updatePerformanceGoalTargets(goal.id, clamped, System.currentTimeMillis())
         }
         // Strip the block from the visible report before saving
-        val cleanReport = report
-            .replace(Regex("""\[COACH_TARGETS][^\[]*\[/COACH_TARGETS]"""), "")
-            .trim()
+        val cleanReport = stripCoachTargetsBlock(report)
         repository.updatePerformanceCoachReport(entity.id, cleanReport, System.currentTimeMillis())
     }
 
@@ -4523,6 +4541,28 @@ class ChatViewModel(
          *  treated as rounding noise, not a correction (see
          *  [maybeRecordCorrection]). 5%. */
         const val MACRO_EPSILON = 0.05
+
+        /** Extract the JSON payload between [COACH_TARGETS] and [/COACH_TARGETS].
+         *  Avoids Android ICU regex edge-cases with [^}] character classes by using
+         *  plain string indexOf instead. */
+        fun extractCoachTargetsJson(text: String): String? {
+            val open = "[COACH_TARGETS]"
+            val close = "[/COACH_TARGETS]"
+            val start = text.indexOf(open).takeIf { it >= 0 } ?: return null
+            val end = text.indexOf(close, start).takeIf { it >= 0 } ?: return null
+            val between = text.substring(start + open.length, end).trim()
+            val jsonStart = between.indexOf('{').takeIf { it >= 0 } ?: return null
+            val jsonEnd = between.lastIndexOf('}').takeIf { it >= 0 } ?: return null
+            return between.substring(jsonStart, jsonEnd + 1)
+        }
+
+        fun stripCoachTargetsBlock(text: String): String {
+            val open = "[COACH_TARGETS]"
+            val close = "[/COACH_TARGETS]"
+            val start = text.indexOf(open).takeIf { it >= 0 } ?: return text.trim()
+            val end = text.indexOf(close, start).takeIf { it >= 0 } ?: return text.trim()
+            return (text.substring(0, start) + text.substring(end + close.length)).trim()
+        }
     }
 }
 
