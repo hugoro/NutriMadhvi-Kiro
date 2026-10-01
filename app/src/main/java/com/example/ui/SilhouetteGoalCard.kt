@@ -3,7 +3,10 @@ package com.example.ui
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Surface
@@ -400,15 +403,33 @@ private fun SilhouettePane(
                 .aspectRatio(0.28f)
                 .clip(RoundedCornerShape(10.dp))
                 .background(Color.White.copy(0.03f))
+                // Pinch-to-zoom WITHOUT stealing vertical scroll from the parent
+                // LazyColumn. A single-finger drag is only consumed once we are
+                // already zoomed (scale > 1) so the user can pan the zoomed image;
+                // at scale == 1 single-finger drags fall through to the list and
+                // the page scrolls normally. Multi-finger (pinch) is always ours.
                 .pointerInput(Unit) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        scale = (scale * zoom).coerceIn(1f, 4f)
-                        val maxX = (size.width  * (scale - 1)) / 2f
-                        val maxY = (size.height * (scale - 1)) / 2f
-                        offset = Offset(
-                            (offset.x + pan.x * scale).coerceIn(-maxX, maxX),
-                            (offset.y + pan.y * scale).coerceIn(-maxY, maxY),
-                        )
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        do {
+                            val event = awaitPointerEvent()
+                            val zoomChange = event.calculateZoom()
+                            val panChange = event.calculatePan()
+                            val multiTouch = event.changes.count { it.pressed } >= 2
+                            // Only act (and consume) for a pinch, or panning while
+                            // already zoomed. Otherwise let the scroll through.
+                            if (multiTouch || scale > 1f) {
+                                scale = (scale * zoomChange).coerceIn(1f, 4f)
+                                val maxX = (size.width * (scale - 1)) / 2f
+                                val maxY = (size.height * (scale - 1)) / 2f
+                                offset = Offset(
+                                    (offset.x + panChange.x * scale).coerceIn(-maxX, maxX),
+                                    (offset.y + panChange.y * scale).coerceIn(-maxY, maxY),
+                                )
+                                if (scale <= 1f) offset = Offset.Zero
+                                event.changes.forEach { it.consume() }
+                            }
+                        } while (event.changes.any { it.pressed })
                     }
                 }
         ) {

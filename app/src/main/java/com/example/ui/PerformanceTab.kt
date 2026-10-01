@@ -1,5 +1,6 @@
 package com.example.ui
 
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -8,9 +9,12 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.rounded.ExpandLess
+import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.FitnessCenter
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -94,6 +98,58 @@ private fun toRatioChartLine(kpi: SilhouetteKpi, snaps: List<PerformanceSnapshot
     return ChartLine(label = kpi.label, unit = "", values = values, kpi = chartKpi)
 }
 
+// ─── Collapsible card wrapper ─────────────────────────────────────────────────
+// A Surface whose titled header toggles a chevron and shows/hides [content].
+// Used for the secondary Performance cards (coach report, evolution, measures,
+// goal) so the silhouette stays at the top and the rest can be folded away.
+
+@Composable
+private fun CollapsibleCard(
+    title: String,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    surfaceColor: Color = Color(0xFF1A1F2E),
+    trailing: @Composable (() -> Unit)? = null,
+    content: @Composable () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = surfaceColor,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .animateContentSize()
+                .padding(14.dp),
+        ) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggle),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(title, color = AccentSoft,
+                    fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    trailing?.invoke()
+                    Icon(
+                        if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                        contentDescription = if (expanded) "Fechar" else "Abrir",
+                        tint = Color.White.copy(alpha = 0.5f),
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+            if (expanded) {
+                Spacer(Modifier.height(10.dp))
+                content()
+            }
+        }
+    }
+}
+
 // ─── Main tab composable ──────────────────────────────────────────────────────
 
 @Composable
@@ -102,6 +158,13 @@ fun PerformanceTab(viewModel: ChatViewModel) {
     val latestGoal by viewModel.latestPerformanceGoal.collectAsStateWithLifecycle()
     val userProfile by viewModel.userProfile.collectAsStateWithLifecycle()
     var showAssessment by remember { mutableStateOf(false) }
+
+    // Collapse state for the secondary cards (silhouette + history stay fixed).
+    // Coach report starts expanded; the rest collapsed to keep the view compact.
+    var coachExpanded     by rememberSaveable { mutableStateOf(true) }
+    var evolutionExpanded by rememberSaveable { mutableStateOf(false) }
+    var measuresExpanded  by rememberSaveable { mutableStateOf(false) }
+    var goalExpanded      by rememberSaveable { mutableStateOf(false) }
 
     if (showAssessment) {
         SilhouetteAssessmentScreen(
@@ -154,31 +217,9 @@ fun PerformanceTab(viewModel: ChatViewModel) {
         }
 
         val latest = snapshots.lastOrNull()
+        val silhouetteSnaps = snapshots.filter { it.hasSilhouetteData() }
 
-        // ── Coach report card (primary) ───────────────────────────────────────
-        if (latest != null) {
-            item {
-                CoachReportCard(
-                    snap = latest,
-                    onGenerateReport = { viewModel.requestCoachReport(latest) }
-                )
-            }
-        }
-
-        // ── Goal input card (always visible) ─────────────────────────────────
-        item {
-            PerformanceGoalInputCard(
-                currentGoal = latestGoal,
-                onSave = { viewModel.savePerformanceGoal(it) },
-            )
-        }
-
-        // ── Silhouette ratio bars (secondary) ─────────────────────────────────
-        if (latest != null && latest.hasSilhouetteData()) {
-            item { SilhouetteRatioBars(latest) }
-        }
-
-        // ── Silhouette gap card ───────────────────────────────────────────────
+        // 1 ── Silhouette gap card (primary, always on top, not collapsible) ────
         if (latest != null && latest.hasSilhouetteData()) {
             val isMale = !userProfile.gender.equals("Female", ignoreCase = true)
             item {
@@ -190,13 +231,83 @@ fun PerformanceTab(viewModel: ChatViewModel) {
             }
         }
 
-        // ── Evolution chart (tertiary) ────────────────────────────────────────
-        val silhouetteSnaps = snapshots.filter { it.hasSilhouetteData() }
+        // 2 ── Coach report (collapsible) ──────────────────────────────────────
+        if (latest != null) {
+            item {
+                CollapsibleCard(
+                    title = "Relatório Coach",
+                    expanded = coachExpanded,
+                    onToggle = { coachExpanded = !coachExpanded },
+                    surfaceColor = Color(0xFF1E293B),
+                    trailing = {
+                        Text(DATE_FMT.format(Date(latest.capturedAtMs)),
+                            color = Color.White.copy(alpha = 0.45f), fontSize = 11.sp,
+                            modifier = Modifier.padding(end = 8.dp))
+                    },
+                ) {
+                    CoachReportContent(
+                        snap = latest,
+                        onGenerateReport = { viewModel.requestCoachReport(latest) },
+                    )
+                }
+            }
+        }
+
+        // 3 ── Silhouette evolution (collapsible) ──────────────────────────────
         if (silhouetteSnaps.size >= 2) {
-            item { SilhouetteEvolutionCard(silhouetteSnaps) }
+            item {
+                CollapsibleCard(
+                    title = "Evolução da silhueta",
+                    expanded = evolutionExpanded,
+                    onToggle = { evolutionExpanded = !evolutionExpanded },
+                ) {
+                    SilhouetteEvolutionContent(silhouetteSnaps)
+                }
+            }
         } else if (snapshots.size >= 2 && latest?.hasAngleData() == true) {
-            // Legacy angle chart for v35-only installs
-            item { LegacyAngleEvolutionCard(snapshots) }
+            item {
+                CollapsibleCard(
+                    title = "Evolução (ângulos articulares)",
+                    expanded = evolutionExpanded,
+                    onToggle = { evolutionExpanded = !evolutionExpanded },
+                ) {
+                    LegacyAngleEvolutionContent(snapshots)
+                }
+            }
+        }
+
+        // 4 ── Silhouette measures (collapsible) ───────────────────────────────
+        if (latest != null && latest.hasSilhouetteData()) {
+            item {
+                CollapsibleCard(
+                    title = "Medidas de silhueta",
+                    expanded = measuresExpanded,
+                    onToggle = { measuresExpanded = !measuresExpanded },
+                ) {
+                    SilhouetteRatioBarsContent(latest)
+                }
+            }
+        }
+
+        // 5 ── Goal input (collapsible) ────────────────────────────────────────
+        item {
+            CollapsibleCard(
+                title = "O teu objetivo",
+                expanded = goalExpanded,
+                onToggle = { goalExpanded = !goalExpanded },
+                surfaceColor = Color(0xFF1A2236),
+                trailing = {
+                    if (latestGoal?.coachTargetJson != null) {
+                        Text("✓", color = Color(0xFF4ADE80), fontSize = 12.sp,
+                            modifier = Modifier.padding(end = 8.dp))
+                    }
+                },
+            ) {
+                PerformanceGoalInputContent(
+                    currentGoal = latestGoal,
+                    onSave = { viewModel.savePerformanceGoal(it) },
+                )
+            }
         }
 
         // ── Backward compat: angle table for v35-only snapshots ───────────────
@@ -204,7 +315,7 @@ fun PerformanceTab(viewModel: ChatViewModel) {
             item { LatestSnapshotCard(latest) }
         }
 
-        // ── History ───────────────────────────────────────────────────────────
+        // 6 ── History ─────────────────────────────────────────────────────────
         if (snapshots.size > 1) {
             item {
                 Text("Avaliações anteriores",
@@ -219,103 +330,81 @@ fun PerformanceTab(viewModel: ChatViewModel) {
     }
 }
 
-// ─── Coach report card ────────────────────────────────────────────────────────
+// ─── Coach report content (inside CollapsibleCard) ────────────────────────────
 
 @Composable
-private fun CoachReportCard(
+private fun CoachReportContent(
     snap: PerformanceSnapshotEntity,
     onGenerateReport: () -> Unit,
 ) {
-    Surface(
-        shape = RoundedCornerShape(16.dp),
-        color = Color(0xFF1E293B),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Relatório Coach", color = AccentSoft,
-                    fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                Text(DATE_FMT.format(Date(snap.capturedAtMs)),
-                    color = Color.White.copy(alpha = 0.45f), fontSize = 11.sp)
-            }
-            when {
-                snap.coachReport != null -> {
-                    CompositionLocalProvider(LocalContentColor provides Color.White) {
-                        RichText(
-                            modifier = Modifier.fillMaxWidth(),
-                            style = com.halilibo.richtext.ui.RichTextStyle(
-                                stringStyle = com.halilibo.richtext.ui.string.RichTextStringStyle(
-                                    boldStyle = androidx.compose.ui.text.SpanStyle(
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White
-                                    ),
-                                    italicStyle = androidx.compose.ui.text.SpanStyle(
-                                        fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
-                                        color = Color.White
-                                    ),
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        when {
+            snap.coachReport != null -> {
+                CompositionLocalProvider(LocalContentColor provides Color.White) {
+                    RichText(
+                        modifier = Modifier.fillMaxWidth(),
+                        style = com.halilibo.richtext.ui.RichTextStyle(
+                            stringStyle = com.halilibo.richtext.ui.string.RichTextStringStyle(
+                                boldStyle = androidx.compose.ui.text.SpanStyle(
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
                                 ),
-                            )
-                        ) {
-                            Markdown(content = snap.coachReport)
-                        }
-                    }
-                }
-                snap.hasSilhouetteData() -> {
-                    Text("A gerar relatório...",
-                        color = Color.White.copy(alpha = 0.55f), fontSize = 13.sp)
-                    LinearProgressIndicator(
-                        color = AccentSoft,
-                        modifier = Modifier.fillMaxWidth().height(2.dp),
-                    )
-                }
-                else -> {
-                    Text(
-                        "Faz uma avaliação com fotos frontal e lateral para gerar o relatório de coach.",
-                        color = Color.White.copy(alpha = 0.55f), fontSize = 13.sp,
-                    )
-                    OutlinedButton(
-                        onClick = onGenerateReport,
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentSoft),
+                                italicStyle = androidx.compose.ui.text.SpanStyle(
+                                    fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                                    color = Color.White
+                                ),
+                            ),
+                        )
                     ) {
-                        Text("Gerar relatório", fontSize = 12.sp)
+                        Markdown(content = snap.coachReport)
                     }
+                }
+            }
+            snap.hasSilhouetteData() -> {
+                Text("A gerar relatório...",
+                    color = Color.White.copy(alpha = 0.55f), fontSize = 13.sp)
+                LinearProgressIndicator(
+                    color = AccentSoft,
+                    modifier = Modifier.fillMaxWidth().height(2.dp),
+                )
+            }
+            else -> {
+                Text(
+                    "Faz uma avaliação com fotos frontal e lateral para gerar o relatório de coach.",
+                    color = Color.White.copy(alpha = 0.55f), fontSize = 13.sp,
+                )
+                OutlinedButton(
+                    onClick = onGenerateReport,
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentSoft),
+                ) {
+                    Text("Gerar relatório", fontSize = 12.sp)
                 }
             }
         }
     }
 }
 
-// ─── Silhouette ratio bars ────────────────────────────────────────────────────
+// ─── Silhouette ratio bars content (inside CollapsibleCard) ───────────────────
 
 @Composable
-private fun SilhouetteRatioBars(snap: PerformanceSnapshotEntity) {
-    Surface(
-        shape = RoundedCornerShape(16.dp),
-        color = Color(0xFF1A1F2E),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Medidas de silhueta", color = AccentSoft,
-                fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-            Spacer(Modifier.height(2.dp))
+private fun SilhouetteRatioBarsContent(snap: PerformanceSnapshotEntity) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        val frontalRows = listOfNotNull(
+            snap.frontalShoulderRatio?.let { "Ombros (frontal)" to it },
+            snap.frontalWaistRatio?.let    { "Cintura (frontal)" to it },
+            snap.frontalHipRatio?.let      { "Ancas (frontal)" to it },
+            snap.frontalThighRatio?.let    { "Coxas (frontal)" to it },
+        )
+        val lateralRows = listOfNotNull(
+            snap.lateralChestRatio?.let   { "Peito (lateral)" to it },
+            snap.lateralBellyRatio?.let   { "Barriga (lateral)" to it },
+            snap.lateralThighRatio?.let   { "Coxa (lateral)" to it },
+        )
+        val allRows = frontalRows + lateralRows
+        val maxVal = allRows.maxOfOrNull { it.second } ?: 1f
 
-            val frontalRows = listOfNotNull(
-                snap.frontalShoulderRatio?.let { "Ombros (frontal)" to it },
-                snap.frontalWaistRatio?.let    { "Cintura (frontal)" to it },
-                snap.frontalHipRatio?.let      { "Ancas (frontal)" to it },
-                snap.frontalThighRatio?.let    { "Coxas (frontal)" to it },
-            )
-            val lateralRows = listOfNotNull(
-                snap.lateralChestRatio?.let   { "Peito (lateral)" to it },
-                snap.lateralBellyRatio?.let   { "Barriga (lateral)" to it },
-                snap.lateralThighRatio?.let   { "Coxa (lateral)" to it },
-            )
-            val allRows = frontalRows + lateralRows
-            val maxVal = allRows.maxOfOrNull { it.second } ?: 1f
-
-            allRows.forEach { (label, value) ->
-                RatioBar(label = label, value = value, maxValue = maxVal)
-            }
+        allRows.forEach { (label, value) ->
+            RatioBar(label = label, value = value, maxValue = maxVal)
         }
     }
 }
@@ -339,99 +428,81 @@ private fun RatioBar(label: String, value: Float, maxValue: Float) {
     }
 }
 
-// ─── Silhouette evolution chart ───────────────────────────────────────────────
+// ─── Silhouette evolution content (inside CollapsibleCard) ────────────────────
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SilhouetteEvolutionCard(snaps: List<PerformanceSnapshotEntity>) {
+private fun SilhouetteEvolutionContent(snaps: List<PerformanceSnapshotEntity>) {
     var selectedKpis by remember {
         mutableStateOf(setOf(SilhouetteKpi.FRONTAL_WAIST, SilhouetteKpi.FRONTAL_HIP))
     }
-    Surface(
-        shape = RoundedCornerShape(16.dp),
-        color = Color(0xFF1A1F2E),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(Modifier.padding(14.dp)) {
-            Text("Evolução da silhueta", color = AccentSoft,
-                fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-            Spacer(Modifier.height(8.dp))
-            // KPI chips — FlowRow so chips wrap instead of overflowing
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                SilhouetteKpi.entries.forEach { kpi ->
-                    val on = kpi in selectedKpis
-                    Surface(
-                        shape = RoundedCornerShape(8.dp),
-                        color = if (on) AccentPrimary else Color.White.copy(alpha = 0.08f),
-                        modifier = Modifier.clickable {
-                            selectedKpis = if (on) {
-                                if (selectedKpis.size > 1) selectedKpis - kpi else selectedKpis
-                            } else {
-                                if (selectedKpis.size < 4) selectedKpis + kpi else selectedKpis
-                            }
-                        },
-                    ) {
-                        Text(
-                            kpi.label,
-                            color = if (on) Color.White else Color.White.copy(alpha = 0.6f),
-                            fontSize = 10.sp,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                        )
-                    }
+    Column {
+        // KPI chips — FlowRow so chips wrap instead of overflowing
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            SilhouetteKpi.entries.forEach { kpi ->
+                val on = kpi in selectedKpis
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (on) AccentPrimary else Color.White.copy(alpha = 0.08f),
+                    modifier = Modifier.clickable {
+                        selectedKpis = if (on) {
+                            if (selectedKpis.size > 1) selectedKpis - kpi else selectedKpis
+                        } else {
+                            if (selectedKpis.size < 4) selectedKpis + kpi else selectedKpis
+                        }
+                    },
+                ) {
+                    Text(
+                        kpi.label,
+                        color = if (on) Color.White else Color.White.copy(alpha = 0.6f),
+                        fontSize = 10.sp,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    )
                 }
             }
-            Spacer(Modifier.height(10.dp))
-            val xLabels = snaps.map { DATE_FMT.format(Date(it.capturedAtMs)) }
-            val lines = selectedKpis.map { toRatioChartLine(it, snaps) }
-            if (lines.isNotEmpty()) {
-                MultilineChart(lines = lines, xLabels = xLabels, showLatestValue = true)
-            }
+        }
+        Spacer(Modifier.height(10.dp))
+        val xLabels = snaps.map { DATE_FMT.format(Date(it.capturedAtMs)) }
+        val lines = selectedKpis.map { toRatioChartLine(it, snaps) }
+        if (lines.isNotEmpty()) {
+            MultilineChart(lines = lines, xLabels = xLabels, showLatestValue = true)
         }
     }
 }
 
-// ─── Legacy angle chart (v35 backward compat) ────────────────────────────────
+// ─── Legacy angle chart content (v35 backward compat) ────────────────────────
 
 @Composable
-private fun LegacyAngleEvolutionCard(snaps: List<PerformanceSnapshotEntity>) {
+private fun LegacyAngleEvolutionContent(snaps: List<PerformanceSnapshotEntity>) {
     var selected by remember {
         mutableStateOf(setOf(MobilityKpi.LEFT_HIP_SAG, MobilityKpi.RIGHT_HIP_SAG))
     }
-    Surface(
-        shape = RoundedCornerShape(16.dp),
-        color = Color(0xFF1A1F2E),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(Modifier.padding(14.dp)) {
-            Text("Evolução (ângulos articulares)", color = AccentSoft,
-                fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-            Spacer(Modifier.height(8.dp))
-            KpiSelector(selected = selected, onToggle = { kpi ->
-                selected = if (kpi in selected) {
-                    if (selected.size > 1) selected - kpi else selected
-                } else {
-                    if (selected.size < 4) selected + kpi else selected
-                }
-            })
-            Spacer(Modifier.height(10.dp))
-            val xLabels = snaps.map { DATE_FMT.format(Date(it.capturedAtMs)) }
-            val lines = selected.map { kpi ->
-                val values = snaps.map { kpi.pick(it)?.toDouble() }
-                val nonNull = values.filterNotNull()
-                val chartKpi = if (nonNull.size >= 2) {
-                    val delta = nonNull.last() - nonNull.first()
-                    ChartKpi(latest = nonNull.last(), delta = delta,
-                        deltaTone = if (delta > 0.5) "positive" else if (delta < -0.5) "negative" else "neutral")
-                } else null
-                ChartLine(label = kpi.label, unit = kpi.unit, values = values, kpi = chartKpi)
+    Column {
+        KpiSelector(selected = selected, onToggle = { kpi ->
+            selected = if (kpi in selected) {
+                if (selected.size > 1) selected - kpi else selected
+            } else {
+                if (selected.size < 4) selected + kpi else selected
             }
-            if (lines.isNotEmpty()) {
-                MultilineChart(lines = lines, xLabels = xLabels, showLatestValue = true)
-            }
+        })
+        Spacer(Modifier.height(10.dp))
+        val xLabels = snaps.map { DATE_FMT.format(Date(it.capturedAtMs)) }
+        val lines = selected.map { kpi ->
+            val values = snaps.map { kpi.pick(it)?.toDouble() }
+            val nonNull = values.filterNotNull()
+            val chartKpi = if (nonNull.size >= 2) {
+                val delta = nonNull.last() - nonNull.first()
+                ChartKpi(latest = nonNull.last(), delta = delta,
+                    deltaTone = if (delta > 0.5) "positive" else if (delta < -0.5) "negative" else "neutral")
+            } else null
+            ChartLine(label = kpi.label, unit = kpi.unit, values = values, kpi = chartKpi)
+        }
+        if (lines.isNotEmpty()) {
+            MultilineChart(lines = lines, xLabels = xLabels, showLatestValue = true)
         }
     }
 }

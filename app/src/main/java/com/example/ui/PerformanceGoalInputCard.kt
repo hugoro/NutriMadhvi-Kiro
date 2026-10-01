@@ -23,7 +23,7 @@ import com.example.ui.theme.AccentSoft
  * and embeds them in the next coach report.
  */
 @Composable
-fun PerformanceGoalInputCard(
+fun PerformanceGoalInputContent(
     currentGoal: PerformanceGoalEntity?,
     onSave: (String) -> Unit,
 ) {
@@ -33,86 +33,64 @@ fun PerformanceGoalInputCard(
     val hasGoal = currentGoal != null
     val hasTargets = currentGoal?.coachTargetJson != null
 
-    Surface(
-        shape = RoundedCornerShape(16.dp),
-        color = Color(0xFF1A2236),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        if (hasTargets) {
+            Text("✓ objetivos calculados", color = Color(0xFF4ADE80), fontSize = 10.sp)
+        } else if (hasGoal) {
+            Text("a calcular...", color = Color.White.copy(alpha = 0.4f), fontSize = 10.sp)
+        }
+
+        OutlinedTextField(
+            value = text,
+            onValueChange = { text = it },
+            placeholder = {
                 Text(
-                    "O teu objetivo",
-                    color = AccentSoft,
-                    fontWeight = FontWeight.SemiBold,
+                    "Descreve o teu objetivo de performance...",
+                    color = Color.White.copy(alpha = 0.35f),
                     fontSize = 13.sp,
                 )
-                if (hasTargets) {
-                    Text(
-                        "✓ objetivos calculados",
-                        color = Color(0xFF4ADE80),
-                        fontSize = 10.sp,
-                    )
-                } else if (hasGoal) {
-                    Text(
-                        "a calcular...",
-                        color = Color.White.copy(alpha = 0.4f),
-                        fontSize = 10.sp,
-                    )
-                }
-            }
+            },
+            modifier = Modifier.fillMaxWidth(),
+            minLines = 2,
+            maxLines = 4,
+            keyboardOptions = KeyboardOptions(
+                capitalization = KeyboardCapitalization.Sentences,
+                imeAction = ImeAction.Default,
+            ),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = Color.White,
+                unfocusedTextColor = Color.White,
+                focusedBorderColor = AccentPrimary.copy(alpha = 0.6f),
+                unfocusedBorderColor = Color.White.copy(alpha = 0.12f),
+                cursorColor = AccentSoft,
+                focusedContainerColor = Color.White.copy(alpha = 0.04f),
+                unfocusedContainerColor = Color.White.copy(alpha = 0.04f),
+            ),
+            shape = RoundedCornerShape(10.dp),
+        )
 
-            OutlinedTextField(
-                value = text,
-                onValueChange = { text = it },
-                placeholder = {
-                    Text(
-                        "Descreve o teu objetivo de performance...",
-                        color = Color.White.copy(alpha = 0.35f),
-                        fontSize = 13.sp,
-                    )
+        // Allow re-triggering target generation when a goal exists but the
+        // coach never produced targets (generation failed / returned null).
+        val textChanged = text.trim() != currentGoal?.goalText
+        val canRetry = hasGoal && !hasTargets && text.isNotBlank()
+        Button(
+            onClick = { if (text.isNotBlank()) onSave(text.trim()) },
+            enabled = text.isNotBlank() && (textChanged || canRetry),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = AccentPrimary,
+                disabledContainerColor = Color.White.copy(alpha = 0.08f),
+            ),
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                when {
+                    canRetry && !textChanged -> "Tentar calcular objetivos"
+                    hasGoal                  -> "Atualizar objetivo"
+                    else                     -> "Guardar objetivo"
                 },
-                modifier = Modifier.fillMaxWidth(),
-                minLines = 2,
-                maxLines = 4,
-                keyboardOptions = KeyboardOptions(
-                    capitalization = KeyboardCapitalization.Sentences,
-                    imeAction = ImeAction.Default,
-                ),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = Color.White,
-                    unfocusedTextColor = Color.White,
-                    focusedBorderColor = AccentPrimary.copy(alpha = 0.6f),
-                    unfocusedBorderColor = Color.White.copy(alpha = 0.12f),
-                    cursorColor = AccentSoft,
-                    focusedContainerColor = Color.White.copy(alpha = 0.04f),
-                    unfocusedContainerColor = Color.White.copy(alpha = 0.04f),
-                ),
-                shape = RoundedCornerShape(10.dp),
+                fontSize = 13.sp,
             )
-
-            // Allow re-triggering target generation when a goal exists but the
-            // coach never produced targets (generation failed / returned null).
-            val textChanged = text.trim() != currentGoal?.goalText
-            val canRetry = hasGoal && !hasTargets && text.isNotBlank()
-            Button(
-                onClick = { if (text.isNotBlank()) onSave(text.trim()) },
-                enabled = text.isNotBlank() && (textChanged || canRetry),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = AccentPrimary,
-                    disabledContainerColor = Color.White.copy(alpha = 0.08f),
-                ),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(
-                    when {
-                        canRetry && !textChanged -> "Tentar calcular objetivos"
-                        hasGoal                  -> "Atualizar objetivo"
-                        else                     -> "Guardar objetivo"
-                    },
-                    fontSize = 13.sp,
-                )
-            }
         }
     }
 }
