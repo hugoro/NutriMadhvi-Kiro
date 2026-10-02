@@ -130,18 +130,26 @@ private data class ZoneBand(
 
 // Y bands calibrated to human proportions mapped onto the PNG figure
 // (body spans PNG-norm 0.087→0.898; landmarks from the 7.5-head canon).
-private fun frontalBands(snap: PerformanceSnapshotEntity, t: SilhouetteTargets) = listOf(
-    ZoneBand("Ombros", 0.22f, 0.29f, validMeasure("shoulder", snap.frontalShoulderRatio), t.shoulder),
-    ZoneBand("Cintura", 0.38f, 0.44f, validMeasure("waist", snap.frontalWaistRatio), t.waist),   // navel / abdomen
-    ZoneBand("Ancas",  0.46f, 0.53f, validMeasure("hip", snap.frontalHipRatio), t.hip),          // pelvis, before legs split
-    ZoneBand("Coxas",  0.56f, 0.70f, validMeasure("thigh", snap.frontalThighRatio), t.thigh),    // upper→mid thigh
-)
+// The female figure's waist sits a touch higher and is more marked, so female
+// bands shift up slightly (dY) vs the male canon.
+private fun frontalBands(snap: PerformanceSnapshotEntity, t: SilhouetteTargets, isMale: Boolean): List<ZoneBand> {
+    val dY = if (isMale) 0f else -0.03f   // raise female markers ~3%
+    return listOf(
+        ZoneBand("Ombros", 0.22f + dY, 0.29f + dY, validMeasure("shoulder", snap.frontalShoulderRatio), t.shoulder),
+        ZoneBand("Cintura", 0.38f + dY, 0.44f + dY, validMeasure("waist", snap.frontalWaistRatio), t.waist),
+        ZoneBand("Ancas",  0.46f + dY, 0.53f + dY, validMeasure("hip", snap.frontalHipRatio), t.hip),
+        ZoneBand("Coxas",  0.56f + dY, 0.70f + dY, validMeasure("thigh", snap.frontalThighRatio), t.thigh),
+    )
+}
 
-private fun lateralBands(snap: PerformanceSnapshotEntity, t: SilhouetteTargets) = listOf(
-    ZoneBand("Peito",   0.27f, 0.36f, validMeasure("chest", snap.lateralChestRatio), t.chest),   // chest, deepest
-    ZoneBand("Barriga", 0.43f, 0.51f, validMeasure("belly", snap.lateralBellyRatio), t.belly),   // belly bulge
-    ZoneBand("Coxas",   0.58f, 0.72f, validMeasure("ltrhigh", snap.lateralThighRatio), t.lateralThigh),
-)
+private fun lateralBands(snap: PerformanceSnapshotEntity, t: SilhouetteTargets, isMale: Boolean): List<ZoneBand> {
+    val dY = if (isMale) 0f else -0.03f
+    return listOf(
+        ZoneBand("Peito",   0.27f + dY, 0.36f + dY, validMeasure("chest", snap.lateralChestRatio), t.chest),
+        ZoneBand("Barriga", 0.43f + dY, 0.51f + dY, validMeasure("belly", snap.lateralBellyRatio), t.belly),
+        ZoneBand("Coxas",   0.58f + dY, 0.72f + dY, validMeasure("ltrhigh", snap.lateralThighRatio), t.lateralThigh),
+    )
+}
 
 // ─── Verdict colours & copy ─────────────────────────────────────────────────────
 
@@ -345,14 +353,14 @@ fun SilhouetteGoalCard(
                 SilhouettePane(
                     modifier  = Modifier.weight(1f),
                     label     = "Frontal",
-                    bands     = frontalBands(snap, targets),
+                    bands     = frontalBands(snap, targets, isMale),
                     isMale    = isMale,
                     isFrontal = true,
                 )
                 SilhouettePane(
                     modifier  = Modifier.weight(1f),
                     label     = "Lateral",
-                    bands     = lateralBands(snap, targets),
+                    bands     = lateralBands(snap, targets, isMale),
                     isMale    = isMale,
                     isFrontal = false,
                 )
