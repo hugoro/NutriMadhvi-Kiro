@@ -4177,6 +4177,31 @@ class ChatViewModel(
                 // `orchestrator.handle` was invoked.
                 val freshInstruction = createDefaultSystemInstruction(activeType) + _localContextBlock.value
                 val liveName = _userProfile.value.name
+                // 2026-10-05 (chat TTS mode) — one-shot prompt repair: sessions
+                // created before the TTS-mode persona carry the OLD prompt in
+                // `systemInstruction` (and often a server-side cachedContent
+                // with the old prompt baked in). Refresh the row and drop the
+                // stale cache so this turn's cache re-creation uses the new
+                // prompt. No-op on already-refreshed sessions.
+                // NB: persist only the STABLE base (no _localContextBlock —
+                // that ephemeral weather/GPS block is appended per send and
+                // must not be baked into the stored prompt).
+                activeSession.value?.let { ses ->
+                    val staleCache = repository.refreshStaleSystemInstruction(
+                        ses,
+                        createDefaultSystemInstruction(activeType)
+                    )
+                    if (staleCache != null) {
+                        viewModelScope.launch {
+                            runCatching {
+                                com.example.data.remote.GeminiCacheClient
+                                    .deleteCache(staleCache, BuildConfig.GEMINI_API_KEY)
+                            }.onFailure { t ->
+                                android.util.Log.w("CHAT_PROMPT_REFRESH", "deleteCache failed (cache expires on its own): ${t.message?.take(120)}")
+                            }
+                        }
+                    }
+                }
                 orchestrator.handle(
                     sessionId = targetSessionId,
                     text = textToSend,

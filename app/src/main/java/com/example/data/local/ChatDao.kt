@@ -11,6 +11,14 @@ interface ChatDao {
     @Update
     suspend fun updateSession(session: ChatSession)
 
+    /** 2026-10-05 — one-shot prompt refresh: clear (or re-point) the
+     *  server-side cachedContent reference for a session whose stored
+     *  systemInstruction is about to be rewritten, so the next turn
+     *  re-creates the cache with the new prompt instead of keeping the
+     *  stale baked-in one. */
+    @Query("UPDATE chat_sessions SET cachedContentName = :cacheName WHERE id = :id")
+    suspend fun updateCachedContentName(id: Long, cacheName: String?)
+
     @Delete
     suspend fun deleteSession(session: ChatSession)
 

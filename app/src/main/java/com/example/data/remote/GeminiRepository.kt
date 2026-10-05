@@ -1771,6 +1771,40 @@ If you used any of the patterns above, return their numeric ids in an "appliedHa
         return chatDao.insertSession(session)
     }
 
+    /**
+     * 2026-10-05 (chat TTS mode) — one-shot repair for sessions whose stored
+     *  systemInstruction predates the TTS-mode persona (no [TTS_SUMMARY]
+     *  spoken-script rules). Rewrites the prompt column to [freshInstruction]
+     *  and clears the server-side cachedContent reference so the next turn
+     *  re-creates the cache with the NEW prompt.
+     *
+     *  Data-safety: touches ONLY `chat_sessions.systemInstruction` and
+     *  `chat_sessions.cachedContentName` for a single row — no messages,
+     *  no schema, no destructive path. No-op when the stored prompt already
+     *  contains the marker (refresh fires exactly once per session).
+     *
+     *  @return the stale cache name that was dropped (caller may delete it
+     *          server-side best-effort), or null when no refresh was needed.
+     */
+    suspend fun refreshStaleSystemInstruction(
+        session: com.example.data.local.ChatSession,
+        freshInstruction: String
+    ): String? {
+        val stored = session.systemInstruction
+        if (stored.contains(com.example.data.chat.TtsPromptConstants.TTS_SUMMARY_MARKER)) return null
+        android.util.Log.i(
+            "CHAT_PROMPT_REFRESH",
+            "stale prompt detected (no TTS marker; stored=${stored.length}chars) — " +
+                "refreshing session=${session.id} fresh=${freshInstruction.length}chars"
+        )
+        chatDao.updateSession(session.copy(systemInstruction = freshInstruction))
+        val staleCache = session.cachedContentName
+        if (!staleCache.isNullOrBlank()) {
+            chatDao.updateCachedContentName(session.id, null)
+        }
+        return staleCache
+    }
+
     suspend fun updateSession(session: ChatSession) {
         chatDao.updateSession(session)
     }

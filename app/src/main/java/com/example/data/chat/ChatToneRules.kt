@@ -31,6 +31,20 @@ package com.example.data.chat
  * now imports [PERSONA_CRITICAL_FRIEND_NAMED] and [clean] from here instead
  * of duplicating the rules.
  */
+
+/**
+ * 2026-10-05 — prompt-version marker for the TTS-mode persona. [personaFor]
+ * contains the spoken-script rules keyed off [TTS_SUMMARY_MARKER];
+ * [com.example.ui.ChatViewModel] uses the same marker to detect sessions
+ * whose STORED systemInstruction predates the TTS mode (prompt baked at
+ * creation time) so it can refresh them once, together with dropping the
+ * stale server-side cachedContent (which would otherwise keep serving the
+ * old prompt even when the interactive path passes a fresh override).
+ */
+internal object TtsPromptConstants {
+    const val TTS_SUMMARY_MARKER: String = "SPOKEN SCRIPT — [TTS_SUMMARY]:"
+}
+
 internal object ChatToneRules {
 
     /**
