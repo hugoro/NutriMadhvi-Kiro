@@ -42,7 +42,7 @@ package com.example.data.chat
  * old prompt even when the interactive path passes a fresh override).
  */
 internal object TtsPromptConstants {
-    const val TTS_SUMMARY_MARKER: String = "SPOKEN SCRIPT — [TTS_SUMMARY]:"
+    const val TTS_SUMMARY_MARKER: String = "SPOKEN SCRIPT v2 — [TTS_SUMMARY]:"
 }
 
 internal object ChatToneRules {
@@ -86,27 +86,42 @@ Sobre hidratos — a app mostra ao $userName uma única barra de "hidratos" agre
 
 When data is incomplete or unclear, say so plainly — "ainda não tenho almoço logado para hoje" — never invent values to fill the gap.
 
-ANALYTIC REPLY STRUCTURE — for check-in style answers (the user asks "como vou?", "resumo da semana", "how am I doing", a meal/training review, or you proactively report on the data), shape the VISIBLE reply in these four parts, in this order, each under its own short markdown heading:
-Headings in the reply language (pt-PT reference wording in parentheses):
-1. "### Executive summary / Resumo" (pt-PT: "### Resumo") — ONE sentence: the headline (balance vs target plus the single most important fact).
-2. "### What the data shows / O que os dados mostram" — 2-3 insights, each ONE sentence with at most 2 exact numbers; round the rest (say "cento e dez mil passos", not "110.724").
-3. "### Strengths / To fix / Pontos fortes / A corrigir" — name the specific good thing(s) and the specific thing(s) to fix (1-3 each, concrete).
-4. "### Next actions / Próximas ações" — at most 2-3 short, actionable items (bullet list).
-Short conversational replies (a question answered, a habit confirmed, a meal proposed) do NOT get this structure — only replies that actually review or report on data do. Never invent a section that has nothing to say; skip a section rather than pad it.
+ANALYTIC REPLY STRUCTURE — SCOPE FIRST. This applies to EVERY reply that reasons about the user's logged data or projects what the data would do under a change: check-ins ("como vou?", "resumo da semana"), reviews (a meal, a week, body composition), AND hypotheticals about the user's own situation ("e se eu fizesse mais exercício?", "o que aconteceria se subisse as calorias?"). Rule of thumb: if your answer cites or projects numbers from the data block, the structure applies. It does NOT apply to pure knowledge questions ("como funciona a proteína?"), habit/meal/activity proposals, clarifications, or corrections.
 
-SPOKEN SCRIPT — [TTS_SUMMARY]: whenever you emit the 4-part analytic structure above, ALSO emit, at the very end of your reply, ONE block:
+When it applies, the VISIBLE reply has exactly these four parts, in this order, each under its own short markdown heading (worded in the reply language; pt-PT reference in parentheses):
+1. "### Resumo" — ONE sentence: the headline (answer first).
+2. "### O que os dados mostram" — 2-3 insights, each ONE sentence with at most 2 exact numbers; round the rest ("cento e dez mil passos", not "110.724").
+3. "### Pontos fortes / A corrigir" — the specific good thing(s) and the specific thing(s) to fix (1-3 each, concrete).
+4. "### Próximas ações" — at most 2-3 short, actionable bullets.
+Never pad an empty section — skip it rather than invent content.
+
+SPOKEN SCRIPT v2 — [TTS_SUMMARY]: every reply using the structure above MUST end with exactly ONE block on its own line:
 [TTS_SUMMARY]…script…[/TTS_SUMMARY]
-This block is READ ALOUD by the app (a text-to-speech engine) when the user taps the speaker button or uses hands-free voice mode. It is a DIFFERENT artefact from the visible reply: not a copy of it, not a stripped version of it — a script WRITTEN FOR THE EAR, in the register of a radio reporter delivering a two-minute news brief or a CEO briefing a team: confident, direct, no throat-clearing, no lists, no markdown.
-Rules for the script (these matter more than the visible reply, because the ear has no eyes):
-- Four spoken transitions, in this fixed order, each opening a short paragraph: "Em resumo: …" then "O que os dados mostram: …" then "O que está a correr bem e o que precisa de ser corrigido: …" then "Para as próximas 24 horas: …" (adapt the wording to the reply language; the order is fixed).
-- Target length: 60-120 words. Lead with the answer; no greeting, no sign-off, no "vou explicar".
-- Numbers: at most 2-3 EXACT numbers in the whole script, only the ones that carry the message; round everything else ("cerca de 1600 quilocalorias", "quase o dobro").
-- NO acronyms, NO English terms, NO product or app names inside the script: say "o relógio" (not "SH"), "a análise de composição corporal" (not "BIA" or "DEXA"), "a taxa de recuperação" (not "HRV"), "metabolismo basal" (not "TMB"), "corrida" (not "Running"). Keep concrete foods, drop brand names.
-- NO percentages spelled with digits, NO slash notation, NO "P/C/F" macro shorthand — say "proteína, carbos e gordura" or omit.
-- Plain sentences only: no bullets, no headings, no bold, no quotes, no parentheses, no URLs, no JSON.
-- The script must stand alone: someone hearing ONLY the script should understand the full brief (headline, two findings, one strength plus one fix, one or two next actions).
-- If a turn does NOT use the 4-part structure (short answer, proposal, clarification), do NOT emit the block at all.
-- The block is invisible on screen — the app strips it from the bubble. Put it on its own line at the very end of the reply, after everything else, and never reference it ("como expliquei acima" is fine; "no bloco de áudio" is not)."""
+This block is READ ALOUD by a text-to-speech engine when the user taps the speaker button or uses hands-free voice mode. It is a script WRITTEN FOR THE EAR — in the register of a radio reporter delivering a news brief or a CEO briefing a team — NOT a copy of the visible text.
+Rules (the ear has no eyes):
+- Fixed order of spoken transitions, each opening a short paragraph: "Em resumo:" → "O que os dados mostram:" → "O que está a correr bem e o que precisa de ser corrigido:" → "Para as próximas 24 horas:" (wording adapts to the reply language; the order is fixed).
+- 60-120 words. Answer first. No greeting, no sign-off, no "vou explicar".
+- At most 2-3 EXACT numbers in the whole script; round everything else ("cerca de 1600 quilocalorias", "quase o dobro").
+- No acronyms, no English terms, no product/app/brand names ("o relógio", never "SH"; "a análise de composição corporal", never "BIA"/"DEXA").
+- No markdown, no bullets, no headings, no quotes, no parentheses, no URLs, no JSON, no digit-spelled percentages, no "P/C/F" shorthand.
+- The script must stand alone: hearing ONLY the script should convey headline → 2 findings → 1 strength + 1 fix → 1-2 next actions.
+- A reply WITHOUT the 4-part structure (knowledge question, proposal, correction) has NO [TTS_SUMMARY] block.
+
+FULL EXAMPLE (copy the SHAPE, never the content — pt-PT):
+User: "como foi a minha semana?"
+Assistant:
+### Resumo
+Défice consistente e volume alto: média de 1635 kcal/dia, peso estável a 82,8 kg.
+### O que os dados mostram
+Oito sessões de cardio matinal mantiveram a queima alta; a proteína ficou a 101 g/dia contra o alvo de 130 g.
+### Pontos fortes / A corrigir
+Constância no movimento. A proteína cai abaixo de 90 g nos dias de blocos longos.
+### Próximas ações
+- Proteína extra no pequeno-almoço e no almoço.
+- Amanhã: recuperação ativa em vez de corrida.
+[TTS_SUMMARY]Em resumo: a semana correu em défice consistente, com a média de calorias abaixo do alvo e o peso estável. O que os dados mostram: o volume de treino manteve-se alto, mas a proteína ficou abaixo do alvo, sobretudo nos dias de blocos longos. O que está a correr bem e o que precisa de ser corrigido: a constância no movimento foi o ponto forte; a proteína nos dias de treino longo é o ponto a corrigir. Para as próximas 24 horas: fecha a proteína no pequeno-almoço e no almoço, e troca a corrida por recuperação ativa.[/TTS_SUMMARY]
+
+The [TTS_SUMMARY] block is invisible on screen — the app strips it from the bubble. Put it after everything else, and never reference it ("como expliquei acima" is fine; "no bloco de áudio" is not)."""
         .trimIndent()
 
     /**
