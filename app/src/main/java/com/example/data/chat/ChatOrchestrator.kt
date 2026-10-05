@@ -1492,7 +1492,9 @@ class ChatOrchestrator(
                 sender = "gemini",
                 // Persist the RAW final text so the existing
                 // ingestAssistantMessage flow in the ViewModel can re-derive
-                // proposals on the next collect — same shape as today.
+                // proposals on the next collect — same shape as today. The
+                // [TTS_SUMMARY] script rides along inside this raw text and is
+                // re-extracted by the parser on ingest (it is NOT shown).
                 text = finalReplyText,
                 // Whichever model in the fleet actually answered (may differ
                 // from modelToUse if the primary quota'd out and a fallback
@@ -1515,7 +1517,11 @@ class ChatOrchestrator(
         // small (<500ms) the parallel pipeline is doing its job; if it's
         // 3-6s the parallel start point may be too late (kick earlier).
         val doneEmittedAtMs = System.currentTimeMillis()
-        emit(HandleEvent.Done(sievedClean, insertedMessageId = insertedMessageId))
+        emit(HandleEvent.Done(
+            sievedClean,
+            insertedMessageId = insertedMessageId,
+            ttsSummary = finalParse.ttsSummary
+        ))
 
         // 2026-07-06 (Frente D) — background digest refresh. The trim
         // boundary shifted this turn (or the session had no digest at
@@ -3277,6 +3283,11 @@ sealed class HandleEvent {
     data class Done(
         val cleanedText: String,
         val insertedMessageId: Long? = null,
+        /** TTS mode (2026-10-05): the spoken script extracted from the raw
+         *  reply, when the model emitted one. Null for turns without a
+         *  `[TTS_SUMMARY]` block (and for fast-fallback / cached turns). The
+         *  ViewModel prefers this over [cleanedText] for TTS playback. */
+        val ttsSummary: String? = null,
     ) : HandleEvent()
 
     data class Error(val cause: Throwable) : HandleEvent()

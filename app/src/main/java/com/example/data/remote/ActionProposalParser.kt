@@ -242,7 +242,16 @@ data class ParsedActionMessage(
     /** Phase G: at most one report-generation proposal per turn. */
     val reportProposals: List<GenerateReportProposal>,
     /** Phase 3 (2026-06-28): at most one inline chart per turn. */
-    val chartProposals: List<ChartProposal>
+    val chartProposals: List<ChartProposal>,
+    /** TTS mode (2026-10-05): the spoken script the model emits for analytic
+     *  replies, wrapped in `[TTS_SUMMARY]…[/TTS_SUMMARY]`. Written for the EAR
+     *  (radio-briefing register, spoken transitions, rounded numbers, no
+     *  acronyms) — deliberately NOT a markdown-stripped copy of the visible
+     *  reply. When non-null the TTS path prefers it over [cleanedText]; when
+     *  null the TTS falls back to the visible text (pre-existing behaviour,
+     *  so older persisted messages keep working). Stripped from [cleanedText]
+     *  so it never leaks to the screen. */
+    val ttsSummary: String? = null
 )
 
 @JsonClass(generateAdapter = true)
@@ -321,7 +330,7 @@ private object QueryDataSalvage {
      *  failed (e.g. closing tag missing). Cleans visible text only — does not
      *  re-inject anything into the proposal lists, that's already done. */
     val OTHER_MARKERS_SWEEP = Regex(
-        """\[(?:LOG_MEAL_PROPOSAL|LOG_ACTIVITY_PROPOSAL|INSIGHT_PROPOSAL|GENERATE_REPORT_PROPOSAL|CHART_PROPOSAL)\][^\[]*"""
+        """\[(?:LOG_MEAL_PROPOSAL|LOG_ACTIVITY_PROPOSAL|INSIGHT_PROPOSAL|GENERATE_REPORT_PROPOSAL|CHART_PROPOSAL|TTS_SUMMARY)\][^\[]*"""
     )
 
     /** Defensive: closing tags that survived after their opening was eaten by
@@ -329,9 +338,10 @@ private object QueryDataSalvage {
      *  reference-style link anchor and may strip it from the visible string).
      *  Without this the closing tag itself leaks to the bubble. Runs AFTER
      *  the CHART salvage pass so we never strip a closing tag we still need
-     *  to match against. */
+     *  to match against. `\??` tolerates the `[/?NAME]` variant the model
+     *  occasionally emits. */
     val ORPHAN_CLOSE_SWEEP = Regex(
-        """\[/(?:LOG_MEAL_PROPOSAL|LOG_ACTIVITY_PROPOSAL|INSIGHT_PROPOSAL|GENERATE_REPORT_PROPOSAL|CHART_PROPOSAL|QUERY_DATA|HABIT_PROPOSAL)\]"""
+        """\[/\??(?:LOG_MEAL_PROPOSAL|LOG_ACTIVITY_PROPOSAL|INSIGHT_PROPOSAL|GENERATE_REPORT_PROPOSAL|CHART_PROPOSAL|QUERY_DATA|HABIT_PROPOSAL|TTS_SUMMARY)\]"""
     )
 
     /** Two-or-more ISO dates anywhere in the orphan payload. */
@@ -449,6 +459,12 @@ object ActionProposalParser {
     )
     private val CHART_REGEX = Regex(
         """\[CHART_PROPOSAL\](.*?)\[/CHART_PROPOSAL\]""",
+        setOf(RegexOption.DOT_MATCHES_ALL)
+    )
+    /** TTS mode (2026-10-05): plain-text spoken script — NOT JSON. The model
+     *  emits it ONCE per analytic reply, wrapped like the other proposals. */
+    private val TTS_SUMMARY_REGEX = Regex(
+        """\[TTS_SUMMARY\](.*?)\[/TTS_SUMMARY\]""",
         setOf(RegexOption.DOT_MATCHES_ALL)
     )
     /** Salvage path A — opener survived but the closer never arrived (LLM
@@ -722,6 +738,25 @@ object ActionProposalParser {
             }
         }
 
+        // TTS mode (2026-10-05): the spoken script. Plain text — no JSON,
+        // no Moshi. At most ONE block per turn (the prompt enforces it; we
+        // take the first). Extracted BEFORE the deferred sweeps below so a
+        // stray `[/TTS_SUMMARY]` further along still gets cleaned up. The
+        // visible reply keeps the rest of the text; the script is only ever
+        // consumed by the TTS path (ChatViewModel → TtsController).
+        var ttsSummary: String? = null
+        TTS_SUMMARY_REGEX.find(working)?.let { m ->
+            val body = m.groupValues[1].trim()
+            if (body.isNotBlank()) {
+                ttsSummary = body
+                android.util.Log.i(
+                    "CHAT_PROTOCOL",
+                    "parsed TTS_SUMMARY chars=${body.length}"
+                )
+            }
+        }
+        working = TTS_SUMMARY_REGEX.replace(working, "")
+
         // Deferred sweep — runs AFTER all typed parsers (including CHART
         // salvage paths above) so they got their shot at the markers first.
         // Anything still wearing a marker shape after this point is debris.
@@ -771,7 +806,8 @@ object ActionProposalParser {
             insightProposals = insights,
             queryDataRequest = queryRequest,
             reportProposals = reports,
-            chartProposals = charts
+            chartProposals = charts,
+            ttsSummary = ttsSummary
         )
     }
 

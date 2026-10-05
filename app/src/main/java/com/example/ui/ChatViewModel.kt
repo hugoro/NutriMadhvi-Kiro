@@ -1139,6 +1139,17 @@ class ChatViewModel(
     private val _cleanedMessageText = MutableStateFlow<Map<Long, String>>(emptyMap())
     val cleanedMessageText: StateFlow<Map<Long, String>> = _cleanedMessageText.asStateFlow()
 
+    /** TTS mode (2026-10-05): per-message spoken script extracted from
+     *  `[TTS_SUMMARY]` blocks, keyed by ChatMessage.id. Populated by
+     *  [ingestAssistantMessage] (covers both the live collect and the
+     *  session-history load path, since both re-run the parser over the
+     *  persisted RAW text — the script survives app restarts). TTS playback
+     *  prefers this over [cleanedMessageText]; a missing entry simply falls
+     *  back to the pre-existing behaviour. Cleared with the rest of the
+     *  per-message maps on session delete (see the purge site below). */
+    private val _ttsSummaryText = MutableStateFlow<Map<Long, String>>(emptyMap())
+    val ttsSummaryText: StateFlow<Map<Long, String>> = _ttsSummaryText.asStateFlow()
+
     /** Phase 2 of chat-redesign 2026-06-12 (#1b — hallucination warning).
      *  Set to `true` for assistant message ids whose text reads like the model
      *  claimed it persisted a habit but **no** [HABIT_PROPOSAL] block was
@@ -1243,6 +1254,14 @@ class ChatViewModel(
         }
         // Always populate so speakMessage() never falls back to raw msg.text
         _cleanedMessageText.update { it + (messageId to parsed.cleanedText) }
+        // TTS mode: the spoken script (when the model emitted one) is keyed
+        // alongside the cleaned text. Because this runs over the persisted
+        // RAW text on BOTH the live collect and the history-load path, the
+        // script survives app restarts — the 🔊 button and Voice Mode pick it
+        // up from the map, never from the visible (stripped) text.
+        if (!parsed.ttsSummary.isNullOrBlank()) {
+            _ttsSummaryText.update { it + (messageId to parsed.ttsSummary) }
+        }
     }
 
     fun confirmHabitProposal(messageId: Long, proposal: HabitProposal) {
@@ -3823,10 +3842,15 @@ class ChatViewModel(
      *  bubble stops (see TtsController.speak semantics). */
     fun speakMessage(msg: ChatMessage) {
         val tts = ttsController ?: return
-        // Prefer the cleaned text (proposal markers, [CHART], etc. already
-        // stripped) so the TTS engine doesn't spell them out. Falls back to
-        // the raw message text if no cleaned copy exists yet.
-        val readable = _cleanedMessageText.value[msg.id] ?: msg.text
+        // TTS mode (2026-10-05): prefer the spoken script when the model
+        // emitted one — it's written for the ear (radio-briefing register),
+        // not a markdown-stripped copy of the visible reply. Falls back to
+        // the cleaned text (proposal markers, [CHART], etc. already
+        // stripped) so the TTS engine doesn't spell them out, then to the
+        // raw message text if no cleaned copy exists yet.
+        val readable = _ttsSummaryText.value[msg.id]
+            ?: _cleanedMessageText.value[msg.id]
+            ?: msg.text
         tts.speak(readable, _userProfile.value.language, msg.id)
     }
 
@@ -3954,14 +3978,19 @@ class ChatViewModel(
         val id = event.insertedMessageId
         val tts = ttsController
         if (id != null && tts != null && _voiceMode.value == VoiceMode.Thinking) {
-            val readable = _cleanedMessageText.value[id] ?: event.cleanedText
+            // TTS mode: the script extracted at Done (if any) beats the
+            // visible text — Voice Mode is exactly the "hands-free briefing"
+            // path, so it should hear the ear-written version.
+            val readable = event.ttsSummary
+                ?: _cleanedMessageText.value[id]
+                ?: event.cleanedText
             if (readable.isNotBlank()) {
                 lastSpokenAssistantId = id
                 _voiceMode.value = VoiceMode.Speaking
                 tts.speak(readable, _userProfile.value.language, id)
                 android.util.Log.d(
                     "CHAT_VOICE",
-                    "auto-speak id=$id text=${readable.take(40)}"
+                    "auto-speak id=$id chars=${readable.length} script=${event.ttsSummary != null} text=${readable.take(40)}"
                 )
             }
         }
@@ -4565,6 +4594,7 @@ class ChatViewModel(
         _pendingHabitWarnings.update { it - s }
         _proposalReceipts.update { it - s }
         _cleanedMessageText.update { it - s }
+        _ttsSummaryText.update { it - s }
     }
 
     private companion object {
