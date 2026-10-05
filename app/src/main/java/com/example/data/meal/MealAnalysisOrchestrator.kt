@@ -16,6 +16,7 @@ import com.example.data.meal.ensemble.createQwenGroqProvider
 import com.example.data.remote.ActivityAnalysisResult
 import com.example.data.remote.Content
 import com.example.data.remote.FoodAnalysisResult
+import com.example.data.remote.FullSummaryRepair
 import com.example.data.remote.GeminiRepository
 import com.example.data.remote.GeminiRequest
 import com.example.data.remote.sanitizeAiNewlines
@@ -834,10 +835,17 @@ class MealAnalysisOrchestrator(
     fun mergeReanalysis(
         currentEntry: FoodEntry,
         result: FoodAnalysisResult,
-        newSummary: String
+        newSummary: String,
+        language: String = "pt-PT"
     ): FoodEntry {
         val mergedCarbs = result.carbs ?: currentEntry.carbs
         val mergedFat = result.fat ?: currentEntry.fat
+        // Ingredients merged first (fresh breakdown wins; keep prior JSON
+        // otherwise) so the gram-weight repair below sees the FINAL
+        // ingredient list, not just what the model returned this call.
+        val mergedIngredientsJson = result.ingredients
+            ?.let { encodeIngredients(it) }
+            ?: currentEntry.ingredientsJson
         return currentEntry.copy(
             name = result.name ?: currentEntry.name,
             calories = result.calories ?: currentEntry.calories,
@@ -849,12 +857,18 @@ class MealAnalysisOrchestrator(
             // keeps the stale model and the edit log shows "Manual" with no
             // engine even though the AI just re-ran.
             analysisModel = result.analysisModel ?: currentEntry.analysisModel,
-            fullSummary = (result.fullSummary ?: newSummary).sanitizeAiNewlines(),
+            // Same gram-weight repair as the capture paths: a re-analysis
+            // that resolves to gemini-3.5-flash can again return a one-line
+            // summary without (~Xg) weights — rebuild from the merged
+            // ingredients so the saved description is always weighted.
+            fullSummary = FullSummaryRepair.repair(
+                result.fullSummary ?: newSummary,
+                mergedIngredientsJson,
+                language
+            ) ?: (result.fullSummary ?: newSummary).sanitizeAiNewlines(),
             mealCategory = MealCategory.parse(result.mealCategory),
             appliedHabitIds = result.appliedHabitIds,
-            ingredientsJson = result.ingredients
-                ?.let { encodeIngredients(it) }
-                ?: currentEntry.ingredientsJson,
+            ingredientsJson = mergedIngredientsJson,
             // Free sugars: prefer the fresh estimate, fall back to the stored
             // value, then clamp to [0, mergedCarbs] so we never render a
             // segment wider than the total. Symmetric with

@@ -2896,7 +2896,21 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
         val confidenceForEntry = analysisForEntry?.confidence
 
         var editName by remember(entry.id, entry.timestamp, entry.name) { mutableStateOf(entry.name) }
-        var editSummary by remember(entry.id, entry.timestamp, entry.lastAiAnalyzedSummary) { mutableStateOf(entry.fullSummary.sanitizeAiNewlines()) }
+        // Heal-on-read (same pattern as sanitizeAiNewlines): entries persisted
+        // by a non-compliant model (gemini-3.5-flash one-liners, no (~Xg)) are
+        // repaired from their ingredientsJson the moment the edit screen opens.
+        // Not routed through onValueChange, so markSummaryEdited() does NOT
+        // fire — saving the healed text persists it WITHOUT triggering a
+        // re-analysis.
+        var editSummary by remember(entry.id, entry.timestamp, entry.lastAiAnalyzedSummary) {
+            mutableStateOf(
+                com.example.data.remote.FullSummaryRepair.repair(
+                    entry.fullSummary,
+                    entry.ingredientsJson,
+                    userProfile.language
+                ) ?: entry.fullSummary.sanitizeAiNewlines()
+            )
+        }
         var editCalories by remember(entry.id, entry.timestamp, entry.calories) { mutableStateOf(entry.calories.toString()) }
         var editProtein by remember(entry.id, entry.timestamp) { mutableStateOf(roundedGramsValue(entry.protein)) }
         var editCarbs by remember(entry.id, entry.timestamp) { mutableStateOf(roundedGramsValue(entry.carbs)) }
@@ -2927,8 +2941,20 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
         // Snapshot of the entry the user landed on (existing meal from History, or
         // a fresh AI analysis of a just-captured photo). Compared against the live
         // edit fields so we only prompt the user when something actually changed —
-        // back without edits exits silently.
-        val initialEntry by remember(entry.id, entry.timestamp) { mutableStateOf(entry) }
+        // back without edits exits silently. The summary snapshot uses the SAME
+        // heal-on-read as editSummary, so repairing a legacy one-liner is not a
+        // "change" (only the user's own keystrokes are).
+        val initialEntry by remember(entry.id, entry.timestamp) {
+            mutableStateOf(
+                entry.copy(
+                    fullSummary = com.example.data.remote.FullSummaryRepair.repair(
+                        entry.fullSummary,
+                        entry.ingredientsJson,
+                        userProfile.language
+                    ) ?: entry.fullSummary.sanitizeAiNewlines()
+                )
+            )
+        }
         val isDirty = initialEntry.name != editName ||
             initialEntry.fullSummary != editSummary ||
             initialEntry.calories != parsedCals ||

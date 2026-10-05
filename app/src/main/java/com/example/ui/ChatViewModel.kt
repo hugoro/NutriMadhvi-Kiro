@@ -658,7 +658,14 @@ class ChatViewModel(
         onSuccess: () -> Unit
     ) {
         _lastAnalyzedResult.value = result
-        val summaryText = result.fullSummary ?: result.analysisSummary ?: ""
+        val rawSummary = result.fullSummary ?: result.analysisSummary ?: ""
+        // Encode once; reused for storage and for the gram-weight repair.
+        val ingredientsJson = com.example.data.remote.encodeIngredients(result.ingredients)
+        // Deterministic gram-weight repair: gemini-3.5-flash often returns a
+        // one-line fullSummary without the per-ingredient (~Xg) weights the
+        // prompt requires; rebuild it from ingredientsJson (weightGrams is
+        // reliably emitted). No-op when the model already complied.
+        val summaryText = com.example.data.remote.FullSummaryRepair.repair(rawSummary, ingredientsJson, _userProfile.value.language) ?: rawSummary
         val timestamp = System.currentTimeMillis()
         // 2026-06-18 — meal category from clock, not from the LLM. The LLM's
         // call was effectively random; Hugo's mental model is the hour of
@@ -679,7 +686,7 @@ class ChatViewModel(
             lastAiAnalyzedSummary = summaryText,
             mealCategory = resolvedCategory,
             appliedHabitIds = result.appliedHabitIds,
-            ingredientsJson = com.example.data.remote.encodeIngredients(result.ingredients),
+            ingredientsJson = ingredientsJson,
             freeSugarsG = result.freeSugarsG
                 ?.coerceAtMost(result.carbs ?: 0.0)
                 ?.coerceAtLeast(0.0),
@@ -816,7 +823,12 @@ class ChatViewModel(
                 for ((photo, res) in results) {
                     res.onSuccess { result ->
                         _lastAnalyzedResult.value = result
-                        val summaryText = result.fullSummary ?: result.analysisSummary ?: ""
+                        val rawSummary = result.fullSummary ?: result.analysisSummary ?: ""
+                        // Same gram-weight repair as [applyFoodAnalysisResult]
+                        // — the batch path must not persist one-line
+                        // summaries without per-ingredient weights.
+                        val ingredientsJson = com.example.data.remote.encodeIngredients(result.ingredients)
+                        val summaryText = com.example.data.remote.FullSummaryRepair.repair(rawSummary, ingredientsJson, _userProfile.value.language) ?: rawSummary
                         // Clock-based category override (see [[MealCategoryFromTime]]).
                         val timestamp = System.currentTimeMillis()
                         val llmCategory = com.example.data.local.MealCategory.parse(result.mealCategory)
@@ -835,7 +847,7 @@ class ChatViewModel(
                             lastAiAnalyzedSummary = summaryText,
                             mealCategory = resolvedCategory,
                             appliedHabitIds = result.appliedHabitIds,
-                            ingredientsJson = com.example.data.remote.encodeIngredients(result.ingredients),
+                            ingredientsJson = ingredientsJson,
                             freeSugarsG = result.freeSugarsG
                                 ?.coerceAtMost(result.carbs ?: 0.0)
                                 ?.coerceAtLeast(0.0),
@@ -1325,10 +1337,17 @@ class ChatViewModel(
             // Legacy stub kept ONLY when the LLM did not produce a real
             // description — pre-2026-06-22 protocol or a card the model
             // emitted without enough context to summarise.
-            val fullSummaryFinal = description ?: "Logged from chat session #$sid"
             val ingredientsJson = item.proposal.ingredients
                 ?.takeIf { it.isNotEmpty() }
                 ?.let { com.example.data.remote.encodeIngredients(it) }
+            // Gram-weight repair: a chat-proposal description is freeform
+            // model prose that frequently lacks the (~Xg) weights; rebuild
+            // the weighted line from the proposal's ingredients when present.
+            val fullSummaryFinal = com.example.data.remote.FullSummaryRepair.repair(
+                description,
+                ingredientsJson,
+                _userProfile.value.language
+            ) ?: (description ?: "Logged from chat session #$sid")
             repository.insertFood(
                 FoodEntry(
                     name = item.proposal.name,
@@ -1825,20 +1844,27 @@ class ChatViewModel(
                             _oneShotSnack.tryEmit("snack_reanalysis_failed_saved_anyway")
                             withGroup
                         } else {
-                            mealOrchestrator
-                                .mergeReanalysis(withGroup, result, withGroup.fullSummary)
-                                .copy(
-                                    // Manual mealCategory always wins — the user's pick from the edit
-                                    // dialog must never be overwritten by Gemini's classification of the
-                                    // summary text. ([[user-choice-wins-after-llm-reanalysis]])
-                                    mealCategory = withGroup.mealCategory,
-                                    // Preserve the groupId that the UI already settled on.
-                                    groupId = withGroup.groupId,
-                                    // Use the *actually-analysed* summary as the next baseline so the
-                                    // re-analysis branch only fires when the user truly edits the
-                                    // summary again.
-                                    lastAiAnalyzedSummary = result.fullSummary ?: withGroup.fullSummary
+                            val merged = mealOrchestrator
+                                .mergeReanalysis(
+                                    withGroup,
+                                    result,
+                                    withGroup.fullSummary,
+                                    _userProfile.value.language
                                 )
+                            merged.copy(
+                                // Manual mealCategory always wins — the user's pick from the edit
+                                // dialog must never be overwritten by Gemini's classification of the
+                                // summary text. ([[user-choice-wins-after-llm-reanalysis]])
+                                mealCategory = withGroup.mealCategory,
+                                // Preserve the groupId that the UI already settled on.
+                                groupId = withGroup.groupId,
+                                // Use the *actually-analysed* summary (post
+                                // gram-repair — mergeReanalysis already
+                                // applied it) as the next baseline so the
+                                // re-analysis branch only fires when the
+                                // user truly edits the summary again.
+                                lastAiAnalyzedSummary = merged.fullSummary
+                            )
                         }
                     } else {
                         withGroup
@@ -2146,7 +2172,12 @@ class ChatViewModel(
                         android.util.Log.w("FOOD_RETRY", "analysis produced no result for entry ${entry.id}, skipping")
                         continue
                     }
-                    val summaryText = result.fullSummary ?: result.analysisSummary ?: ""
+                    val rawSummary = result.fullSummary ?: result.analysisSummary ?: ""
+                    // Gram-weight repair — same as the capture paths: an
+                    // auto re-analysis resolving to gemini-3.5-flash can
+                    // return a one-line summary without (~Xg) weights.
+                    val retryIngredientsJson = com.example.data.remote.encodeIngredients(result.ingredients)
+                    val summaryText = com.example.data.remote.FullSummaryRepair.repair(rawSummary, retryIngredientsJson, _userProfile.value.language) ?: rawSummary
                     val ts = entry.timestamp
                     val resolved = com.example.data.local.MealCategoryFromTime
                         .classify(ts, com.example.data.local.MealCategory.parse(result.mealCategory))
@@ -2160,7 +2191,7 @@ class ChatViewModel(
                         fullSummary = summaryText,
                         lastAiAnalyzedSummary = summaryText,
                         mealCategory = resolved,
-                        ingredientsJson = com.example.data.remote.encodeIngredients(result.ingredients),
+                        ingredientsJson = retryIngredientsJson,
                         freeSugarsG = result.freeSugarsG?.coerceAtMost(result.carbs ?: 0.0)?.coerceAtLeast(0.0),
                         saturatedFatG = result.saturatedFatG?.coerceAtMost(result.fat ?: 0.0)?.coerceAtLeast(0.0),
                         // Record the engine behind this auto-analysis so the meal-details

@@ -61,8 +61,8 @@ internal object FullSummaryRepair {
         if (summary.isNullOrBlank()) return fullSummary
         if (hasGrams(summary)) return summary
 
-        val ingredients = decode(ingredientsJson).orEmpty()
-        val weighted = ingredients.filter { !it.name.isNullOrBlank() && it.weightGrams > 0.0 }
+        val weighted = decode(ingredientsJson).orEmpty()
+            .filter { !it.name.isNullOrBlank() && it.weightGrams > 0.0 }
         if (weighted.isEmpty()) return summary
 
         val lines = summary.split('\n').map { it.trim() }.filter { it.isNotEmpty() }

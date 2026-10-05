@@ -1625,22 +1625,32 @@ If you used any of the patterns above, return their numeric ids in an "appliedHa
             val offeredIds = habits.map { it.id }.toSet()
             val safeApplied = result.appliedHabitIds?.filter { it in offeredIds }?.distinct()
             markHabitsApplied(safeApplied)
+            // Ingredients merged first (fresh breakdown wins; keep prior JSON
+            // otherwise) so the gram-weight repair sees the FINAL list.
+            val mergedIngredientsJson = result.ingredients
+                ?.let { encodeIngredients(it) }
+                ?: currentEntry.ingredientsJson
             currentEntry.copy(
                 name = result.name ?: currentEntry.name,
                 calories = result.calories ?: currentEntry.calories,
                 protein = result.protein ?: currentEntry.protein,
                 carbs = result.carbs ?: currentEntry.carbs,
                 fat = result.fat ?: currentEntry.fat,
-                fullSummary = (result.fullSummary ?: newSummary).sanitizeAiNewlines(),
+                // Gram-weight repair — same as mergeReanalysis/streaming
+                // paths: rebuild from the merged ingredients when the model
+                // returned a one-line summary without (~Xg) weights.
+                fullSummary = FullSummaryRepair.repair(
+                    result.fullSummary ?: newSummary,
+                    mergedIngredientsJson,
+                    language
+                ) ?: (result.fullSummary ?: newSummary).sanitizeAiNewlines(),
                 mealCategory = MealCategory.parse(result.mealCategory),
                 appliedHabitIds = safeApplied,
                 // Re-analysis can shift the ingredient list (user added eggs,
                 // dropped milk, etc.). Always overwrite with the fresh
                 // breakdown when the model returns one; preserve the previous
                 // JSON only if the model omitted ingredients entirely.
-                ingredientsJson = result.ingredients
-                    ?.let { encodeIngredients(it) }
-                    ?: currentEntry.ingredientsJson,
+                ingredientsJson = mergedIngredientsJson,
                 // Free sugars is authoritative from the fresh estimate; only
                 // fall back to the previously-stored value if the model
                 // omitted it (older prompt / parse dropout). Clamp against
