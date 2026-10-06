@@ -478,6 +478,7 @@ fun tr(key: String, lang: String): String {
         "warning_slow" to "O servidor está lento. Podes cancelar com ✕.",
         // 2026-10-06 (Frente Thinking) — live reasoning card
         "reasoning" to "Raciocínio",
+        "query_followup_failed" to "Não consegui terminar a consulta aos teus registos. Volta a pedir, por favor.",
         "reasoning_done" to "Raciocínio concluído",
         "analyzing_your_data" to "A analisar os teus dados…",
         "querying_records" to "A consultar registos…",
@@ -1172,6 +1173,7 @@ fun tr(key: String, lang: String): String {
         "phase_uploading_image" to "Uploading image…",
         // 2026-10-06 (Frente Thinking) — live reasoning card
         "reasoning" to "Reasoning",
+        "query_followup_failed" to "I could not finish looking up your records. Please ask again.",
         "reasoning_done" to "Reasoning complete",
         "phase_analyzing_meal" to "Analysing meal…",
         "phase_identifying_dish" to "Identifying dish…",

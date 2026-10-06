@@ -1475,23 +1475,47 @@ class ChatOrchestrator(
             val followupContents = contents +
                 Content(role = "model", parts = listOf(Part(text = replyText))) +
                 Content(role = "user", parts = listOf(Part(text = "[QUERY_DATA_RESULT]\n$resultBlock")))
+            // 2026-10-06 — the follow-up is a plain blocking call: disable
+            // thinking here (thinkingBudget=0) instead of reusing
+            // chatGenerationConfig, which now carries includeThoughts=true
+            // for the streaming card. A thinking pass costs ~9s and ~1.1k
+            // tokens before the follow-up's first byte (live repro:
+            // 12s with thoughts vs 3.3s without) — and the thinking is
+            // invisible on this non-streaming path anyway, so it was pure
+            // quota burn that pushed this call closer to 429/timeout.
             val followupRequest = GeminiRequest(
                 contents = followupContents,
                 systemInstruction = systemInstruction,
-                generationConfig = chatGenerationConfig,
+                generationConfig = GenerationConfig(thinkingConfig = ThinkingConfig(thinkingBudget = 0)),
                 cachedContent = cacheName
             )
             // 2026-07-07 (Fix #2) — cap the QUERY_DATA follow-up. This
             // runs AFTER the stream already returned, so it's additive
             // to whatever the first round took. Without a cap a slow
             // 503-cascade here could keep the user waiting 20-30s past
-            // the first answer with nothing on screen. On timeout we
-            // fall back to the pre-QUERY_DATA replyText — the raw tag
-            // just leaks through, but the user sees something.
+            // the first answer with nothing on screen.
+            //
+            // 2026-10-06 — no more SILENT fallback. Pre-fix, `followup ?:
+            // replyText` persisted "Vou aceder aos dados…" and stopped:
+            // the user saw a dead-end with zero feedback (session 175,
+            // 2026-10-06 02:46 — the follow-up failed fast on-device and
+            // the turn simply ended). Now a failed follow-up surfaces a
+            // visible note so the user knows to ask again, and the
+            // failure is logged with the window for diagnosis.
             val followup = kotlinx.coroutines.withTimeoutOrNull(30_000L) {
                 blockingReply(modelToUse, apiKey, followupRequest, language, onModelResolved = { resolvedModel = it })
             }
-            followup ?: replyText
+            if (followup != null) followup
+            else {
+                android.util.Log.e(
+                    "CHAT_QUERY",
+                    "follow-up FAILED (timeout/null) type=${qdr.type} " +
+                        "from=${qdr.fromDate} to=${qdr.toDate} dataRows=${resultBlock.length} — " +
+                        "falling back to first part + visible note"
+                )
+                firstParse.cleanedText.trimEnd() + "\n\n⚠️ " +
+                    com.example.ui.tr("query_followup_failed", language)
+            }
         } ?: replyText
 
         // --- 8. Parse, persist cleaned, emit Done ---
