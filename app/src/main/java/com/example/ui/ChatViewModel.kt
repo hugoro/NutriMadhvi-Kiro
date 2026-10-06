@@ -2445,6 +2445,14 @@ class ChatViewModel(
     private val _streamingText = MutableStateFlow<String?>(null)
     val streamingText: StateFlow<String?> = _streamingText.asStateFlow()
 
+    /** 2026-10-06 (Frente Thinking) — cumulative extended-thinking text for
+     *  the in-flight turn (Gemini `thought` parts / Qwen reasoning). Rendered
+     *  in the live "Raciocínio" card above the streaming bubble; cleared in
+     *  [clearSendUiIfCurrent] when the turn ends, so the completed message
+     *  shows ONLY the answer. Never persisted. */
+    private val _thinkingText = MutableStateFlow<String?>(null)
+    val thinkingText: StateFlow<String?> = _thinkingText.asStateFlow()
+
     /** 2026-07-06 (Frente B) — pre-computed `[CONTEXTO LOCAL]` block (GPS
      *  fix + IPMA weather). Populated by [prefetchLocalContext], read at
      *  send time in place of the previous inline `buildLocalContextBlock()`
@@ -2490,6 +2498,7 @@ class ChatViewModel(
             _isTyping.value = false
             _typingPhase.value = null
             _streamingText.value = null
+            _thinkingText.value = null
         }
     }
 
@@ -4127,6 +4136,7 @@ class ChatViewModel(
                 _isTyping.value = true
                 _typingPhase.value = tr("thinking", _userProfile.value.language)
                 _streamingText.value = null
+                _thinkingText.value = null
             }
             finishSendLaunch(sendGeneration)
 
@@ -4137,10 +4147,21 @@ class ChatViewModel(
                 val lang = _userProfile.value.language
                 val started = System.currentTimeMillis()
                 var lastTier = 0
+                var lastThinkingLen = 0
                 while (true) {
                     delay(1_000)
                     if (!isCurrentSend(sendGeneration)) break
                     val elapsedSec = ((System.currentTimeMillis() - started) / 1000).toInt()
+                    // 2026-10-06 (Frente Thinking) — reasoning tokens still
+                    // landing is VISIBLE progress (the user is watching the
+                    // model think), so it resets the escalation tiers: we no
+                    // longer show "O servidor está lento" while the thinking
+                    // card is actively growing.
+                    val thinkingLen = _thinkingText.value?.length ?: 0
+                    if (thinkingLen > lastThinkingLen) {
+                        lastThinkingLen = thinkingLen
+                        if (lastTier > 0) lastTier = 0
+                    }
                     val tier = when {
                         elapsedSec >= 30 -> 3
                         elapsedSec >= 15 -> 2
@@ -4236,6 +4257,12 @@ class ChatViewModel(
                         is com.example.data.chat.HandleEvent.Partial -> {
                             _streamingText.value = event.accumulatedText
                         }
+                        is com.example.data.chat.HandleEvent.Thinking -> {
+                            // 2026-10-06 (Frente Thinking) — cumulative
+                            // reasoning; feeds the live card. Side-channel:
+                            // never touches _streamingText (the answer).
+                            _thinkingText.value = event.text
+                        }
                         is com.example.data.chat.HandleEvent.Reset -> {
                             // 2026-09-08 (Phase 6, §13) — router failed over
                             // mid-stream. Discard the abandoned partial so the
@@ -4246,6 +4273,9 @@ class ChatViewModel(
                                 "VM Reset: ${event.from} -> ${event.to} (clearing partial)"
                             )
                             _streamingText.value = ""
+                            // The dying provider's reasoning is abandoned with
+                            // its partial — the fallback re-thinks from scratch.
+                            _thinkingText.value = ""
                         }
                         is com.example.data.chat.HandleEvent.Done -> {
                             // 2026-07-07 (Fix #1) — clear typing indicator the
@@ -4454,6 +4484,7 @@ class ChatViewModel(
                 _isTyping.value = true
                 _typingPhase.value = tr("thinking", _userProfile.value.language)
                 _streamingText.value = null
+                _thinkingText.value = null
             }
             finishSendLaunch(sendGeneration)
 
@@ -4522,6 +4553,11 @@ class ChatViewModel(
                         is com.example.data.chat.HandleEvent.Partial -> {
                             _streamingText.value = event.accumulatedText
                         }
+                        is com.example.data.chat.HandleEvent.Thinking -> {
+                            // 2026-10-06 (Frente Thinking) — edit-resubmits
+                            // share the primary path's live reasoning card.
+                            _thinkingText.value = event.text
+                        }
                         is com.example.data.chat.HandleEvent.Reset -> {
                             // 2026-09-08 (Phase 6, §13) — same as the primary
                             // send path: discard the abandoned partial on a
@@ -4532,6 +4568,8 @@ class ChatViewModel(
                                 "VM Reset (edit): ${event.from} -> ${event.to} (clearing partial)"
                             )
                             _streamingText.value = ""
+                            // Abandon the dying provider's reasoning too.
+                            _thinkingText.value = ""
                         }
                         is com.example.data.chat.HandleEvent.Done -> {
                             // 2026-07-07 (Fix #1) — same reasoning as the

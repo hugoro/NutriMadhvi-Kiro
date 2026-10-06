@@ -172,4 +172,43 @@ class RunInfraChatProviderTest {
         assertEquals("json_object", captured?.responseFormat?.type)
         assertEquals(512, captured?.maxTokens)
     }
+
+    // --- 2026-10-06 (Frente Thinking) --------------------------------------
+
+    @Test
+    fun reasoning_content_chunks_map_to_thinking_never_delta() = runTest {
+        val p = provider { _, _ ->
+            flow {
+                emit(RunInfraStreamChunk.Reasoning("A ", "A "))
+                emit(RunInfraStreamChunk.Reasoning("analisar", "A analisar"))
+                emit(RunInfraStreamChunk.Partial("Tens 82,5 kg", "Tens 82,5 kg"))
+                emit(RunInfraStreamChunk.Done("Tens 82,5 kg", "stop"))
+            }
+        }
+        val events = p.stream(textRequest()).toList()
+
+        assertEquals(4, events.size)
+        assertEquals(ChatEvent.Thinking("A ", "A "), events[0])
+        assertEquals(ChatEvent.Thinking("analisar", "A analisar"), events[1])
+        assertEquals(ChatEvent.Delta("Tens 82,5 kg", "Tens 82,5 kg"), events[2])
+        val completed = events[3] as ChatEvent.Completed
+        assertEquals("Tens 82,5 kg", completed.fullText)
+    }
+
+    @Test
+    fun reasoning_effort_is_low_for_chat_none_for_structured() = runTest {
+        var captured: RunInfraStreamRequest? = null
+        val p = provider { _, req ->
+            captured = req
+            flowOf(RunInfraStreamChunk.Done("ok", "stop"))
+        }
+        p.stream(textRequest()).toList()
+        assertEquals("low", captured?.reasoningEffort)
+
+        captured = null
+        val req = textRequest().copy(generation = ChatGeneration(structured = true, maxOutputTokens = 512))
+        p.stream(req).toList()
+        assertEquals("none", captured?.reasoningEffort)
+    }
+
 }

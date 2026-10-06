@@ -1009,7 +1009,14 @@ class ChatOrchestrator(
         // send `thinking_level = "low"` only. If a model rejects the
         // field with a different HTTP 400 (Fix 7c below), we re-issue
         // the same model without the field.
-        val chatThinking = ThinkingConfig(thinkingLevel = "low")
+        // 2026-10-06 (Frente Thinking): includeThoughts=true makes the
+        // stream emit the model's extended-thinking parts (flagged
+        // `thought: true`) BEFORE the answer, so the UI can show live
+        // reasoning while the model thinks. Verified live on
+        // gemini-3.5-flash: ~1.1k thought tokens stream first, then the
+        // answer. The thought parts never enter the persisted answer text
+        // (GeminiStreamingClient routes them to StreamChunk.Thought).
+        val chatThinking = ThinkingConfig(thinkingLevel = "low", includeThoughts = true)
         val chatGenerationConfig = GenerationConfig(thinkingConfig = chatThinking)
         val request = GeminiRequest(
             contents = contents,
@@ -1186,6 +1193,7 @@ class ChatOrchestrator(
                         modelToUse, apiKey, request, language,
                         onModelResolved = { cb.onModelResolved(it); resolvedModel = it },
                         onPartial = { partial -> cb.onPartial(partial) },
+                        onThinking = { thought -> cb.onThinking(thought) },
                         onPhase = { phase -> emit(HandleEvent.Phase(phase)) },
                         onFirstToken = { cb.onFirstToken() },
                         fullSystemInstructionForCacheFallback = fullSystemInstructionFallback,
@@ -1203,14 +1211,25 @@ class ChatOrchestrator(
                     )
                 },
             )
+            // 2026-10-06 (TTS-mode + thinking) — chain reordered: Gemini is
+            // FIRST. The TTS-mode prompt (4-part analytic structure +
+            // [TTS_SUMMARY] spoken script) was calibrated for
+            // gemini-3.5-flash and only it follows it reliably — the Qwen
+            // links answer correctly but ignore the conditional structure
+            // rules in a 45k-char system prompt (verified on session 175,
+            // build 426: prompt refreshed, no structure, no [TTS_SUMMARY]).
+            // Groq/RunInfra stay in the chain as fast failover: the circuit
+            // breaker (§12) opens `gemini:*` after repeated failures, so a
+            // dead/quota-exhausted Gemini degrades to Qwen within a couple
+            // of turns instead of making every turn wait on the cascade.
             val chain: List<com.example.data.ai.provider.ChatProvider> = listOf(
+                geminiCascadeProvider,
                 com.example.data.ai.provider.groq.GroqChatProvider(
                     apiKeyProvider = { com.example.BuildConfig.GROQ_API_KEY },
                 ),
                 com.example.data.ai.provider.runinfra.RunInfraChatProvider(
                     apiKeyProvider = { com.example.BuildConfig.RUNINFRA_API_KEY },
                 ),
-                geminiCascadeProvider,
             )
             val router = com.example.data.ai.provider.ChatProviderRouter(
                 chain = chain,
@@ -1295,6 +1314,7 @@ class ChatOrchestrator(
                 streamReply(
                     modelToUse, apiKey, request, language,
                     onModelResolved = { resolvedModel = it },
+                    onThinking = { thought -> emit(HandleEvent.Thinking(thought)) },
                     onPartial = { partial ->
                         if (!fastReplyEmitted) {
                             fastReplyEmitted = true
@@ -1888,6 +1908,10 @@ class ChatOrchestrator(
         request: GeminiRequest,
         onPartial: suspend (String) -> Unit,
         onFirstToken: suspend () -> Unit,
+        /** 2026-10-06 (Frente Thinking) — cumulative extended-thinking text
+         *  (Gemini `thought: true` parts). Side-channel: never feeds the
+         *  answer buffer. Default no-op for non-chat callers. */
+        onThinking: suspend (String) -> Unit = {},
         logLabel: String = modelName,
     ): StreamAttemptResult {
         val ttftTimeoutMs = streamTtftTimeoutMs(request.hasInlineData())
@@ -1917,6 +1941,9 @@ class ChatOrchestrator(
             onFirstToken = onFirstToken,
             onPartial = { accumulated, _ ->
                 onPartial(accumulated)
+            },
+            onThought = { accumulated, _ ->
+                onThinking(accumulated)
             },
             onDone = { accumulated, _, chunk ->
                 val u = chunk.usage
@@ -2037,6 +2064,10 @@ class ChatOrchestrator(
         language: String,
         onPartial: suspend (String) -> Unit,
         onPhase: suspend (String) -> Unit,
+        /** 2026-10-06 (Frente Thinking) — cumulative extended-thinking text
+         *  (Gemini `thought: true` parts). Side-channel for the live
+         *  reasoning card; never part of the returned/persisted answer. */
+        onThinking: suspend (String) -> Unit = {},
         /** 2026-07-06 (Frente H v2) — fired exactly once, on the FIRST
          *  `StreamChunk.Partial` seen (across all fleet-loop retries).
          *  The caller uses it to complete the `firstDeepPartialLatch`
@@ -2127,6 +2158,7 @@ class ChatOrchestrator(
                 request = effectiveRequest,
                 onPartial = onPartial,
                 onFirstToken = { signalFirstTokenOnce() },
+                onThinking = onThinking,
                 logLabel = modelName,
             )
             accumulated = attempt.accumulated
@@ -2172,6 +2204,7 @@ class ChatOrchestrator(
                         request = effectiveRequest,
                         onPartial = onPartial,
                         onFirstToken = { signalFirstTokenOnce() },
+                        onThinking = onThinking,
                         logLabel = "$modelName (post-cache)",
                     )
                     accumulatedC = retry.accumulated
@@ -2219,6 +2252,7 @@ class ChatOrchestrator(
                     request = effectiveRequest,
                     onPartial = onPartial,
                     onFirstToken = { signalFirstTokenOnce() },
+                    onThinking = onThinking,
                     logLabel = "$modelName (post-thinking)",
                 )
                 accumulated2 = retry.accumulated
@@ -2438,7 +2472,16 @@ class ChatOrchestrator(
                         android.util.Log.w("CHAT_ORCH", "$modelName: error code=$code, falling through")
                         break
                     }
-                    val text = resp.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                    // 2026-10-06 (Frente Thinking): this request carries
+                    // includeThoughts=true (stream path's ThinkingConfig), so
+                    // the response may lead with `thought:true` parts. The
+                    // blocking path shows no live reasoning card — skip
+                    // thought parts and take the FIRST real answer part, or
+                    // the model's reasoning would be persisted as the reply.
+                    val parts = resp.candidates?.firstOrNull()?.content?.parts.orEmpty()
+                    val text = parts.filter { it.thought != true }
+                        .mapNotNull { it.text }
+                        .firstOrNull { !it.isNullOrBlank() }
                     if (!text.isNullOrBlank()) {
                         android.util.Log.d("CHAT_ORCH", "blocking reply via $modelName (attempt $attempt)")
                         onModelResolved(modelName)
@@ -3116,6 +3159,12 @@ class ChatOrchestrator(
                             accumulated = event.accumulated
                             emit(HandleEvent.Partial(accumulated))
                         }
+                        // 2026-10-06 (Frente Thinking) — side-channel
+                        // reasoning: map through, never touch `accumulated`
+                        // (the §13 answer buffer stays clean).
+                        is com.example.data.ai.provider.ChatEvent.Thinking -> {
+                            emit(HandleEvent.Thinking(event.accumulated))
+                        }
                         is com.example.data.ai.provider.ChatEvent.Reset -> {
                             // §13 mid-stream failover boundary: discard the transient
                             // buffer the UI is showing; the fallback re-streams from
@@ -3269,6 +3318,20 @@ class ChatOrchestrator(
 sealed class HandleEvent {
     /** Human-readable phase label for the typing bubble. */
     data class Phase(val text: String) : HandleEvent()
+
+    /** 2026-10-06 (Frente Thinking) — extended-thinking fragment: the
+     *  model's reasoning, streamed (usually) before the answer text.
+     *  [text] is the cumulative thinking so far for the current turn.
+     *
+     *  Side-channel UI feedback: never persisted, never part of the
+     *  bubble text. The ViewModel accumulates it in `_thinkingText`; the
+     *  UI renders it in a collapsed "Raciocínio" card above the streaming
+     *  bubble while the turn is in flight. Cleared on Done/Reset/Error —
+     *  the completed message shows only the answer.
+     *
+     *  Sources: Gemini `thought: true` stream parts (includeThoughts),
+     *  Groq `delta.reasoning`, RunInfra `delta.reasoning_content`. */
+    data class Thinking(val text: String) : HandleEvent()
 
     /** Streaming partial — the cumulative text so far. */
     data class Partial(val accumulatedText: String) : HandleEvent()

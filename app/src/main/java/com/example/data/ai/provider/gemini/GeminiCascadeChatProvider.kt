@@ -77,6 +77,10 @@ class GeminiCascadeChatProvider(
     interface Callbacks {
         /** Cumulative text so far (matches `streamReply.onPartial`). */
         suspend fun onPartial(accumulated: String)
+        /** 2026-10-06 (Frente Thinking) — cumulative extended-thinking text
+         *  so far (matches `streamReply.onThinking`). Side-channel only:
+         *  never commits output, never part of the persisted answer. */
+        suspend fun onThinking(accumulated: String)
         /** Fired once, on the first token (matches `streamReply.onFirstToken`). */
         suspend fun onFirstToken()
         /** The concrete model that produced the answer, for the badge/log
@@ -109,6 +113,12 @@ class GeminiCascadeChatProvider(
             override suspend fun onPartial(accumulated: String) {
                 if (!sawFirstToken) sawFirstToken = true
                 emit(ChatEvent.Delta(text = accumulated, accumulated = accumulated))
+            }
+
+            override suspend fun onThinking(accumulated: String) {
+                // Side-channel reasoning — forward, do NOT flip sawFirstToken
+                // (thinking is not answer output for the §13 duplicate rule).
+                emit(ChatEvent.Thinking(text = accumulated, accumulated = accumulated))
             }
 
             override suspend fun onFirstToken() {

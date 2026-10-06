@@ -29,7 +29,11 @@ data class Content(
 @JsonClass(generateAdapter = true)
 data class Part(
     @Json(name = "text") val text: String? = null,
-    @Json(name = "inlineData") val inlineData: InlineData? = null
+    @Json(name = "inlineData") val inlineData: InlineData? = null,
+    /** 2026-10-06 (Frente Thinking) — `true` when this part is extended
+     *  thinking output (emitted while `includeThoughts` is on) instead of
+     *  final answer text. Null on parts that carry no flag. */
+    @Json(name = "thought") val thought: Boolean? = null
 )
 
 @JsonClass(generateAdapter = true)
@@ -70,7 +74,14 @@ data class GenerationConfig(
 @JsonClass(generateAdapter = true)
 data class ThinkingConfig(
     @Json(name = "thinking_level") val thinkingLevel: String? = null,
-    @Json(name = "thinkingBudget") val thinkingBudget: Int? = null
+    @Json(name = "thinkingBudget") val thinkingBudget: Int? = null,
+    /** 2026-10-06 (Frente Thinking) — when true, the stream interleaves the
+     *  model's extended-thinking parts (flagged `thought: true`) BEFORE the
+     *  answer text, so the UI can render live reasoning. Verified live on
+     *  gemini-3.5-flash 2026-10-06 (SSE `includeThoughts=true`): thought
+     *  parts stream first (~1.1k thought tokens), then the answer.
+     *  Omitted when null — older call sites are unaffected. */
+    @Json(name = "includeThoughts") val includeThoughts: Boolean? = null
 )
 
 @JsonClass(generateAdapter = true)

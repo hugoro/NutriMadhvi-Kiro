@@ -61,6 +61,13 @@ internal object GeminiStreamWatchdogCollector {
         onTimeoutLog: (String) -> String,
         onFirstToken: suspend () -> Unit = {},
         onPartial: suspend (String, Int) -> Unit = { _, _ -> },
+        /** 2026-10-06 (Frente Thinking) — extended-thinking fragment
+         *  (cumulative thinking text so far, chunk count). Counts as stream
+         *  activity for the watchdog (a thinking stream is NOT idle) and
+         *  signals the first-token gate, but never feeds [onPartial] — the
+         *  answer buffer stays clean. Default no-op: call sites that don't
+         *  render reasoning are untouched. */
+        onThought: suspend (String, Int) -> Unit = { _, _ -> },
         onDone: suspend (String, Int, StreamChunk.Done) -> Unit = { _, _, _ -> },
         onError: suspend (StreamChunk.Error, Int, String) -> Unit = { _, _, _ -> },
     ): Result {
@@ -102,6 +109,17 @@ internal object GeminiStreamWatchdogCollector {
                                 lastPartialAtMs.set(System.currentTimeMillis())
                                 onFirstToken()
                                 onPartial(fullText, chunkCount)
+                            }
+                            is StreamChunk.Thought -> {
+                                // Extended-thinking fragment: counts as stream
+                                // activity (watchdog) and opens the first-token
+                                // gate, but NEVER touches fullText — the answer
+                                // buffer stays clean and persisted text is
+                                // identical with or without includeThoughts.
+                                chunkCount += 1
+                                lastPartialAtMs.set(System.currentTimeMillis())
+                                onFirstToken()
+                                onThought(chunk.accumulatedSoFar, chunkCount)
                             }
                             is StreamChunk.Done -> {
                                 fullText = chunk.fullText

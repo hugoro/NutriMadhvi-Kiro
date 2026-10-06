@@ -584,13 +584,54 @@ object ActionProposalParser {
             val payload = m.groupValues[1].trim()
             queryHandled = true
             val normalised = QueryDataSalvage.normaliseJson(payload)
-            val dto = runCatching { queryAdapter.fromJson(normalised) }.getOrNull() ?: return@forEach
-            val type = dto.type?.trim()?.lowercase().orEmpty()
-            val from = dto.fromDate?.trim().orEmpty()
-            val to = dto.toDate?.trim().orEmpty()
-            if (type !in setOf("meals", "activity")) return@forEach
-            if (from.isBlank() || to.isBlank()) return@forEach
+            val dto = runCatching { queryAdapter.fromJson(normalised) }.getOrNull()
+            if (dto != null) {
+                val type = dto.type?.trim()?.lowercase().orEmpty()
+                val from = dto.fromDate?.trim().orEmpty()
+                val to = dto.toDate?.trim().orEmpty()
+                if (type in setOf("meals", "activity") && from.isNotBlank() && to.isNotBlank()) {
+                    queryRequest = QueryDataRequest(type, from, to)
+                    return@forEach
+                }
+            }
+            // 2026-10-06 (empty-bubble fix) — the canonical tag MATCHED but
+            // the payload is not a parseable/complete request: the model
+            // invented keys (`"window": "2026-09-28 → 2026-10-04"` instead
+            // of fromDate/toDate, or dropped the JSON entirely). Before the
+            // fix this `return@forEach` silently dropped the turn: the tag
+            // was stripped from the visible text AND the follow-up never ran
+            // → the user saw a completely empty bubble. Salvage from the
+            // raw payload instead: alias-key normalisation first, then the
+            // ISO-date sniff (handles the `window: "X → Y"` shape because
+            // both dates appear verbatim in the string).
+            val asJson = if (payload.startsWith("{")) {
+                runCatching { queryAdapter.fromJson(normalised) }.getOrNull()
+            } else null
+            val from: String?
+            val to: String?
+            val type: String?
+            if (asJson != null && !asJson.fromDate.isNullOrBlank() && !asJson.toDate.isNullOrBlank()) {
+                from = asJson.fromDate.trim()
+                to = asJson.toDate.trim()
+                type = asJson.type?.trim()?.lowercase()?.takeIf { it in setOf("meals", "activity") }
+                    ?: QueryDataSalvage.inferType(raw)
+            } else {
+                val dates = QueryDataSalvage.ISO_DATE_REGEX.findAll(payload)
+                    .map { it.value }.toList()
+                if (dates.size < 2) return@forEach
+                from = dates[0]
+                to = dates[1]
+                // A declared-but-malformed `"type"` is still the model's
+                // intent — trust it over keyword inference when valid.
+                type = asJson?.type?.trim()?.lowercase()?.takeIf { it in setOf("meals", "activity") }
+                    ?: QueryDataSalvage.inferType(raw)
+            }
+            if (from.isNullOrBlank() || to.isNullOrBlank() || type.isNullOrBlank()) return@forEach
             queryRequest = QueryDataRequest(type, from, to)
+            android.util.Log.w(
+                "CHAT_PROTOCOL",
+                "salvaged malformed canonical QUERY_DATA: type=$type from=$from to=$to (rawLen=${payload.length})"
+            )
         }
         working = QUERY_DATA_REGEX.replace(working, "")
 

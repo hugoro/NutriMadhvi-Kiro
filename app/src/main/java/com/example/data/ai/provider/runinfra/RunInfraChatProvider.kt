@@ -74,6 +74,9 @@ class RunInfraChatProvider(
                 is RunInfraStreamChunk.Partial ->
                     emit(ChatEvent.Delta(chunk.deltaText, chunk.accumulatedSoFar))
 
+                is RunInfraStreamChunk.Reasoning ->
+                    emit(ChatEvent.Thinking(chunk.deltaText, chunk.accumulatedSoFar))
+
                 is RunInfraStreamChunk.Done ->
                     emit(
                         ChatEvent.Completed(
@@ -106,6 +109,9 @@ class RunInfraChatProvider(
             temperature = request.generation.temperature?.toDouble(),
             topP = request.generation.topP?.toDouble(),
             maxTokens = request.generation.maxOutputTokens,
+            // 2026-10-06 (Frente Thinking) — verified live: the endpoint
+            // honours reasoning_effort; structured turns keep it off.
+            reasoningEffort = if (request.generation.structured) "none" else "low",
             responseFormat = if (request.generation.structured) {
                 RunInfraResponseFormatRef("json_object")
             } else null,

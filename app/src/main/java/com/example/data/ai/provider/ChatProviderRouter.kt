@@ -99,6 +99,13 @@ class ChatProviderRouter(
                             sawDelta = true
                             emit(event)
                         }
+                        // Side-channel reasoning — forward transparently.
+                        // Never sets sawDelta (thinking is not answer output:
+                        // a turn that died after thinking but BEFORE any
+                        // answer delta is still a pre-token failure to §13).
+                        is ChatEvent.Thinking -> {
+                            emit(event)
+                        }
                         is ChatEvent.Completed -> {
                             terminal = event
                             emit(event)

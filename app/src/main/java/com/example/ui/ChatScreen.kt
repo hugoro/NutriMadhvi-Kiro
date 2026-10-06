@@ -4503,6 +4503,10 @@ fun ChatTab(
     // them in an in-list bubble pinned at index 0 with the top-anchor
     // pattern below.
     val streamingText by viewModel.streamingText.collectAsState()
+    // 2026-10-06 (Frente Thinking) — live model reasoning for the in-flight
+    // turn; rendered in the collapsible ThinkingCard above the streaming
+    // bubble, gone when the answer lands.
+    val thinkingText by viewModel.thinkingText.collectAsState()
     val attachedChatImageBase64 by viewModel.attachedChatImageBase64.collectAsState()
     val attachedChatImagePaths by viewModel.attachedChatImagePaths.collectAsState()
     // Phase 3 (#4): observed in [ChatTab] so the input bar at both call
@@ -5496,6 +5500,24 @@ fun ChatTab(
                                     // pins the view to the start of the
                                     // assistant's reply when it begins.
                                     if (isTyping) {
+                                        // 2026-10-06 (Frente Thinking) — live
+                                        // reasoning card. Expanded while the
+                                        // model is still thinking (no answer
+                                        // bytes yet); auto-minimises to one
+                                        // line the moment the answer starts
+                                        // streaming; gone when the turn
+                                        // completes (thinkingText is cleared
+                                        // in clearSendUiIfCurrent).
+                                        val thinking = thinkingText
+                                        if (!thinking.isNullOrBlank()) {
+                                            item(key = "thinking_card") {
+                                                ThinkingCard(
+                                                    text = thinking,
+                                                    language = userProfile.language,
+                                                    active = streamingText.isNullOrBlank(),
+                                                )
+                                            }
+                                        }
                                         val live = streamingText
                                         if (!live.isNullOrBlank()) {
                                             item(key = "streaming_bubble") {
@@ -10780,6 +10802,115 @@ fun TypingIndicatorBubble(
                             contentDescription = "Cancel",
                             tint = Color(0xFF94A3B8),
                             modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ThinkingCard(
+    text: String,
+    language: String,
+    /** true while the model is still thinking (no answer bytes yet).
+     *  Flips to false the moment the answer starts streaming → the card
+     *  auto-minimises to a one-line "reasoning complete" row. */
+    active: Boolean,
+) {
+    // 2026-10-06 (Frente Thinking) — the live reasoning card.
+    //
+    // UX contract (Hugo, 2026-10-06): while the reply is being elaborated
+    // the user must SEE the reasoning being thought (streaming, tail-pinned);
+    // when the message completes, the thinking MINIMISES and only the
+    // answer bubble remains. Implementation: expanded while [active];
+    // a LaunchedEffect on [active] auto-collapses on false and
+    // re-expands when the NEXT turn starts thinking (active flips back
+    // to true) — so the same list item key works across turns without
+    // stale state. Tapping the header toggles manually at any time.
+    var userExpanded by rememberSaveable { mutableStateOf(true) }
+    LaunchedEffect(active) {
+        userExpanded = active
+    }
+    val expanded = userExpanded
+    val scrollState = rememberScrollState()
+    // Tail-pin: as new reasoning fragments land, keep the newest visible.
+    LaunchedEffect(text.length) {
+        if (expanded) {
+            scrollState.scrollTo(scrollState.maxValue)
+        }
+    }
+    val title = tr("reasoning", language)
+    val doneLabel = tr("reasoning_done", language)
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.Start
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth(0.85f)
+                .padding(vertical = 4.dp)
+                .animateContentSize(),
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF16202F)),
+            border = BorderStroke(1.dp, Color(0xFF2B3A50))
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { userExpanded = !userExpanded }
+                ) {
+                    Icon(
+                        imageVector = if (active) Icons.Rounded.Edit else Icons.Rounded.Done,
+                        contentDescription = null,
+                        tint = if (active) Color(0xFF7DD3FC) else Color(0xFF64748B),
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = if (active) title else doneLabel,
+                        color = if (active) Color(0xFF93C5FD) else Color(0xFF64748B),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    if (active) {
+                        // pulsing-dot hint: the model is actively thinking
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "…",
+                            color = Color(0xFF7DD3FC),
+                            fontSize = 13.sp
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Icon(
+                        imageVector = if (expanded) Icons.Rounded.KeyboardArrowUp
+                        else Icons.Rounded.KeyboardArrowDown,
+                        contentDescription = "Toggle",
+                        tint = Color(0xFF64748B),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+                if (expanded) {
+                    Spacer(Modifier.height(8.dp))
+                    // Plain Text (not Markdown): raw model reasoning is
+                    // intentionally unpolished — markdown-parsing half-finished
+                    // thinking would flicker broken syntax.
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 140.dp)
+                            .verticalScroll(scrollState)
+                    ) {
+                        Text(
+                            text = text,
+                            color = Color(0xFF94A3B8),
+                            fontSize = 12.sp,
+                            lineHeight = 16.sp
                         )
                     }
                 }

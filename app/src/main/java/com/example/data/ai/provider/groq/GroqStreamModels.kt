@@ -25,10 +25,15 @@ data class GroqStreamRequest(
     @Json(name = "temperature") val temperature: Double? = null,
     @Json(name = "top_p") val topP: Double? = null,
     @Json(name = "max_tokens") val maxTokens: Int? = null,
-    /** `none` disables Qwen's reasoning pass — required for low latency per the
-     *  benchmark (§2, and the groq-api-key-failover memory: reasoning_effort
-     *  "none" is mandatory). */
-    @Json(name = "reasoning_effort") val reasoningEffort: String? = "none",
+    /** 2026-10-06 (Frente Thinking) — `low` instead of `none`: Qwen3.8-27B
+     *  on Groq streams its reasoning in a SEPARATE `delta.reasoning` field
+     *  (verified live 2026-10-06), so the thinking is rendered in the live
+     *  reasoning card while `delta.content` stays the clean answer. The old
+     *  `none` default killed the reasoning pass for low latency; with a
+     *  separate stream channel the latency cost no longer lands in the
+     *  answer text the user reads. Structured-output turns (response_format
+     *  set) still force `none` below. */
+    @Json(name = "reasoning_effort") val reasoningEffort: String? = "low",
     /** Ask Groq to emit a final usage chunk in the stream so token accounting
      *  is available without a second call (§20). */
     @Json(name = "stream_options") val streamOptions: GroqStreamOptions? =
@@ -70,6 +75,10 @@ data class GroqStreamChoice(
 @JsonClass(generateAdapter = true)
 data class GroqStreamDelta(
     @Json(name = "content") val content: String? = null,
+    /** 2026-10-06 (Frente Thinking) — Qwen's extended reasoning, streamed
+     *  in its own field when `reasoning_effort` != "none". Kept separate
+     *  from [content]: reasoning is live UI feedback, never answer text. */
+    @Json(name = "reasoning") val reasoning: String? = null,
 )
 
 @JsonClass(generateAdapter = true)

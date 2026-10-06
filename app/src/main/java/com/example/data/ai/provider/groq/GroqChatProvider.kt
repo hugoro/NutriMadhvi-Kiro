@@ -82,6 +82,9 @@ class GroqChatProvider(
                 is GroqStreamChunk.Partial ->
                     emit(ChatEvent.Delta(chunk.deltaText, chunk.accumulatedSoFar))
 
+                is GroqStreamChunk.Reasoning ->
+                    emit(ChatEvent.Thinking(chunk.deltaText, chunk.accumulatedSoFar))
+
                 is GroqStreamChunk.Done ->
                     emit(
                         ChatEvent.Completed(
@@ -122,6 +125,10 @@ class GroqChatProvider(
             temperature = request.generation.temperature?.toDouble(),
             topP = request.generation.topP?.toDouble(),
             maxTokens = request.generation.maxOutputTokens,
+            // Explicit: the server-side default for Qwen's reasoning effort is
+            // not "none" and not documented — pin it. Structured turns keep
+            // the reasoning pass off (JSON output, no thinking budget).
+            reasoningEffort = if (request.generation.structured) "none" else "low",
             responseFormat = if (request.generation.structured) {
                 GroqResponseFormatRef("json_object")
             } else null,

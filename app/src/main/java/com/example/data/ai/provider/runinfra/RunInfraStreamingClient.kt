@@ -42,6 +42,12 @@ import java.util.concurrent.TimeUnit
  */
 sealed class RunInfraStreamChunk {
     data class Partial(val deltaText: String, val accumulatedSoFar: String) : RunInfraStreamChunk()
+
+    /** 2026-10-06 (Frente Thinking) — a `delta.reasoning_content` fragment
+     *  (Qwen's reasoning on RunInfra; the OpenAI field name, vs Groq's
+     *  `reasoning`). Never merged into [Partial] text. */
+    data class Reasoning(val deltaText: String, val accumulatedSoFar: String) : RunInfraStreamChunk()
+
     data class Done(
         val fullText: String,
         val finishReason: String,
@@ -91,6 +97,7 @@ class RunInfraStreamingClient(
 
         val call = httpClient.newCall(httpReq)
         val fullText = StringBuilder()
+        val reasoningText = StringBuilder()
 
         try {
             call.execute().use { response ->
@@ -133,6 +140,14 @@ class RunInfraStreamingClient(
                     }
                     val choice = chunk.choices?.firstOrNull()
                     choice?.finishReason?.let { finishReason = it }
+                    val reasoningDelta = choice?.delta?.reasoningContent
+                    if (!reasoningDelta.isNullOrEmpty()) {
+                        // Extended-thinking fragment — its own channel, kept
+                        // OUT of the answer text (persisted text is identical
+                        // with or without reasoning enabled).
+                        reasoningText.append(reasoningDelta)
+                        trySend(RunInfraStreamChunk.Reasoning(reasoningDelta, reasoningText.toString()))
+                    }
                     val delta = choice?.delta?.content
                     if (!delta.isNullOrEmpty()) {
                         fullText.append(delta)

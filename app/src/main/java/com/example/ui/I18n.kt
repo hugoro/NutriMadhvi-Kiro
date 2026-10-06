@@ -476,6 +476,9 @@ fun tr(key: String, lang: String): String {
         "still_thinking" to "Ainda a processar…",
         "still_thinking_long" to "Ainda a processar (%ds)…",
         "warning_slow" to "O servidor está lento. Podes cancelar com ✕.",
+        // 2026-10-06 (Frente Thinking) — live reasoning card
+        "reasoning" to "Raciocínio",
+        "reasoning_done" to "Raciocínio concluído",
         "analyzing_your_data" to "A analisar os teus dados…",
         "querying_records" to "A consultar registos…",
         "auto_last_7_days_label" to "últimos 7 dias",
@@ -1167,6 +1170,9 @@ fun tr(key: String, lang: String): String {
     // adding entries here for normal English keys would mask typos.
     val enExplicit = mapOf(
         "phase_uploading_image" to "Uploading image…",
+        // 2026-10-06 (Frente Thinking) — live reasoning card
+        "reasoning" to "Reasoning",
+        "reasoning_done" to "Reasoning complete",
         "phase_analyzing_meal" to "Analysing meal…",
         "phase_identifying_dish" to "Identifying dish…",
         "phase_extracting_ingredients" to "Extracting ingredients…",
