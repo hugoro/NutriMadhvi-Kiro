@@ -1502,8 +1502,27 @@ class ChatOrchestrator(
             // the turn simply ended). Now a failed follow-up surfaces a
             // visible note so the user knows to ask again, and the
             // failure is logged with the window for diagnosis.
-            val followup = kotlinx.coroutines.withTimeoutOrNull(30_000L) {
+            // 2026-10-06 — one retry of the WHOLE fleet pass on failure.
+            // blockingReply already retries 429 once per model and cascades
+            // 3.5-flash → 3.6-flash → 3.7-flash → lite, but a burst-quota
+            // window can exhaust ALL of those at once (observed 03:18:
+            // follow-up died in ~4s while the identical request 8 min later
+            // succeeded on the first attempt). One 1.5s-spaced retry
+            // absorbs the transient; if the whole fleet is down the user
+            // gets the visible note instead of another 30s of waiting.
+            var followup = kotlinx.coroutines.withTimeoutOrNull(30_000L) {
                 blockingReply(modelToUse, apiKey, followupRequest, language, onModelResolved = { resolvedModel = it })
+            }
+            if (followup == null) {
+                android.util.Log.w(
+                    "CHAT_QUERY",
+                    "follow-up attempt 1 failed — single retry in 1.5s " +
+                        "(type=${qdr.type} from=${qdr.fromDate} to=${qdr.toDate})"
+                )
+                kotlinx.coroutines.delay(1_500L)
+                followup = kotlinx.coroutines.withTimeoutOrNull(30_000L) {
+                    blockingReply(modelToUse, apiKey, followupRequest, language, onModelResolved = { resolvedModel = it })
+                }
             }
             if (followup != null) followup
             else {

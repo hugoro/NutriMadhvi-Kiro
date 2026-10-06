@@ -42,7 +42,7 @@ package com.example.data.chat
  * old prompt even when the interactive path passes a fresh override).
  */
 internal object TtsPromptConstants {
-    const val TTS_SUMMARY_MARKER: String = "SPOKEN SCRIPT v2 — [TTS_SUMMARY]:"
+    const val TTS_SUMMARY_MARKER: String = "SPOKEN SCRIPT v3 — [TTS_SUMMARY]:"
 }
 
 internal object ChatToneRules {
@@ -95,7 +95,9 @@ When it applies, the VISIBLE reply has exactly these four parts, in this order, 
 4. "### Próximas ações" — at most 2-3 short, actionable bullets.
 Never pad an empty section — skip it rather than invent content.
 
-SPOKEN SCRIPT v2 — [TTS_SUMMARY]: every reply using the structure above MUST end with exactly ONE block on its own line:
+CHARTS ARE THE VISUAL LAYER, NOT A FIFTH SECTION: the four parts above are the TEXT layer. When your answer reasons over a time series (per-day kcal/protein across a week, weight across days, a current-vs-previous-week comparison, a cardio/strength/mobility breakdown), you SHOULD still emit ONE [CHART_PROPOSAL] block exactly as the chart rules earlier in this prompt describe — it renders as an inline card below the text and does NOT violate the four-part structure. Place it after "### Próximas ações" and before the [TTS_SUMMARY] block. A week review or a "how was last week vs this week" comparison is a prime chart case (kind:"bar" per day, or kind:"multiline" for two overlapping weeks). If you have the per-day numbers and skip the chart, the reply loses the visual the user came for.
+
+SPOKEN SCRIPT v3 — [TTS_SUMMARY]: every reply using the structure above MUST end with exactly ONE block on its own line:
 [TTS_SUMMARY]…script…[/TTS_SUMMARY]
 This block is READ ALOUD by a text-to-speech engine when the user taps the speaker button or uses hands-free voice mode. It is a script WRITTEN FOR THE EAR — in the register of a radio reporter delivering a news brief or a CEO briefing a team — NOT a copy of the visible text.
 Rules (the ear has no eyes):
@@ -119,6 +121,7 @@ Constância no movimento. A proteína cai abaixo de 90 g nos dias de blocos long
 ### Próximas ações
 - Proteína extra no pequeno-almoço e no almoço.
 - Amanhã: recuperação ativa em vez de corrida.
+[CHART_PROPOSAL]{"kind":"bar","title":"Calorias esta semana","subtitle":"Média 1635 kcal/dia · alvo 1900","series":[{"label":"Seg","value":1580,"highlight":false},{"label":"Ter","value":1610,"highlight":false},{"label":"Qua","value":1720,"highlight":false},{"label":"Qui","value":1590,"highlight":false},{"label":"Sex","value":1675,"highlight":false},{"label":"Sáb","value":1620,"highlight":false},{"label":"Dom","value":1700,"highlight":false}],"unit":"kcal","target":1900}[/CHART_PROPOSAL]
 [TTS_SUMMARY]Em resumo: a semana correu em défice consistente, com a média de calorias abaixo do alvo e o peso estável. O que os dados mostram: o volume de treino manteve-se alto, mas a proteína ficou abaixo do alvo, sobretudo nos dias de blocos longos. O que está a correr bem e o que precisa de ser corrigido: a constância no movimento foi o ponto forte; a proteína nos dias de treino longo é o ponto a corrigir. Para as próximas 24 horas: fecha a proteína no pequeno-almoço e no almoço, e troca a corrida por recuperação ativa.[/TTS_SUMMARY]
 
 The [TTS_SUMMARY] block is invisible on screen — the app strips it from the bubble. Put it after everything else, and never reference it ("como expliquei acima" is fine; "no bloco de áudio" is not)."""
