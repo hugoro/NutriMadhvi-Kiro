@@ -548,6 +548,214 @@ class ChatViewModel(
         )
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // LEFTOVERS ANALYSIS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private val _isAnalyzingLeftovers = MutableStateFlow(false)
+    val isAnalyzingLeftovers: StateFlow<Boolean> = _isAnalyzingLeftovers.asStateFlow()
+
+    data class LeftoverValidationState(
+        val original: FoodEntry,
+        val leftovers: com.example.data.remote.FoodAnalysisResult,
+        val consumedPreview: FoodEntry,
+        val validation: com.example.data.meal.MealAnalysisOrchestrator.LeftoversValidation,
+        val imagePath: String
+    )
+
+    private val _leftoverValidationPending = MutableStateFlow<LeftoverValidationState?>(null)
+    val leftoverValidationPending: StateFlow<LeftoverValidationState?> =
+        _leftoverValidationPending.asStateFlow()
+
+    /**
+     * Analyze leftovers photo and merge result into the original FoodEntry.
+     * Flow: analyze leftovers → validate → (if plausible) merge → updateFood.
+     * If implausible, emits validation state for UI dialog confirmation.
+     *
+     * @param currentEntry Original FoodEntry (must be persisted, id != 0)
+     * @param base64Image Photo of leftovers (required)
+     * @param imagePath Path where leftover photo was staged (not persisted)
+     * @param mimeType Image mime type
+     * @param onSuccess Called after successful update
+     * @param onFailure Called on error
+     */
+    fun analyzeLeftovers(
+        currentEntry: FoodEntry,
+        base64Image: String,
+        imagePath: String,
+        mimeType: String = "image/jpeg",
+        onSuccess: () -> Unit = {},
+        onFailure: (String) -> Unit = {}
+    ) {
+        if (currentEntry.id == 0L) {
+            viewModelScope.launch {
+                _oneShotSnack.emit("error_original_no_data")
+            }
+            onFailure("Entry not persisted")
+            return
+        }
+
+        viewModelScope.launch {
+            _isAnalyzingLeftovers.value = true
+            _foodAnalysisPhase.value = com.example.data.meal.MealAnalysisOrchestrator.PHASE_ANALYZING_LEFTOVERS
+
+            try {
+                var streamedResult: com.example.data.remote.FoodAnalysisResult? = null
+                var errorKey: String? = null
+
+                // Collect stream from orchestrator
+                mealOrchestrator.analyzeLeftoversStreaming(
+                    currentEntry = currentEntry,
+                    base64Image = base64Image,
+                    language = _userProfile.value.language,
+                    mimeType = mimeType
+                ).collect { event ->
+                    when (event) {
+                        is com.example.data.meal.MealAnalysisEvent.Phase ->
+                            _foodAnalysisPhase.value = event.key
+                        is com.example.data.meal.MealAnalysisEvent.Done ->
+                            streamedResult = event.result
+                        is com.example.data.meal.MealAnalysisEvent.Error -> {
+                            streamedResult = event.salvage
+                            errorKey = event.messageKey
+                        }
+                        else -> { /* Ignore Partial events */ }
+                    }
+                }
+
+                // Check if we got a result
+                val result = streamedResult
+                if (result == null) {
+                    android.util.Log.e("FOOD_DIAG", "analyzeLeftovers: no result from stream")
+                    _oneShotSnack.emit(tr("error_leftovers_analysis_failed", _userProfile.value.language))
+                    onFailure("No result from analysis")
+                    return@launch
+                }
+
+                android.util.Log.i("FOOD_DIAG", "analyzeLeftovers: got result, ${result.calories ?: 0} kcal leftovers")
+
+                // Validate plausibility
+                val validation = mealOrchestrator.validateLeftovers(currentEntry, result)
+                android.util.Log.i("FOOD_DIAG", "analyzeLeftovers: validation isPlausible=${validation.isPlausible}, percent=${validation.leftoverPercent}%, warningKey=${validation.warningKey}")
+
+                // Calculate preview of consumed (for UI display)
+                val consumedPreview = mealOrchestrator.mergeLeftovers(
+                    original = currentEntry,
+                    leftoversResult = result,
+                    language = _userProfile.value.language
+                )
+
+                // ALWAYS show result card for user confirmation (gives clear feedback
+                // of what was detected and what will be saved). Card shows warning
+                // badge if implausible, but user can confirm either way.
+                _leftoverValidationPending.value = LeftoverValidationState(
+                    original = currentEntry,
+                    leftovers = result,
+                    consumedPreview = consumedPreview,
+                    validation = validation,
+                    imagePath = imagePath
+                )
+                android.util.Log.i("FOOD_DIAG", "analyzeLeftovers: showing result card to user (plausible=${validation.isPlausible})")
+
+            } catch (e: Exception) {
+                android.util.Log.e("FOOD_DIAG", "analyzeLeftovers failed", e)
+                _oneShotSnack.emit("error_leftovers_network_failed")
+                onFailure(e.message ?: "Unknown error")
+            } finally {
+                _isAnalyzingLeftovers.value = false
+                _foodAnalysisPhase.value = null
+            }
+        }
+    }
+
+    /**
+     * Confirm leftovers anyway (user clicked "Confirm Adjustment" on result card).
+     * Proceeds with merge despite plausibility warning.
+     */
+    fun confirmLeftoversAnyway() {
+        val pending = _leftoverValidationPending.value ?: return
+        viewModelScope.launch {
+            try {
+                // Use the pre-calculated consumedPreview instead of re-merging
+                val withLog = pending.consumedPreview.appendEditLog(
+                    type = com.example.data.local.FoodEditType.LEFTOVER,
+                    model = pending.leftovers.analysisModel
+                )
+
+                // Update in DB
+                repository.updateFood(withLog)
+                android.util.Log.i("FOOD_DIAG", "confirmLeftoversAnyway: DB updated, entry id=${withLog.id}")
+
+                // Update session state
+                _pendingFoodSession.value = _pendingFoodSession.value.map { entry ->
+                    if (entry.id == pending.original.id) withLog else entry
+                }
+                android.util.Log.i("FOOD_DIAG", "confirmLeftoversAnyway: session updated")
+
+                // Feedback to user
+                val kcalDiff = (pending.original.calories ?: 0) - (pending.consumedPreview.calories ?: 0)
+                val message = tr("snack_leftovers_adjusted", _userProfile.value.language)
+                    .replace("{kcal}", kcalDiff.toString())
+                _oneShotSnack.emit(message)
+                android.util.Log.i("FOOD_DIAG", "confirmLeftoversAnyway: snackbar shown, diff=$kcalDiff kcal")
+            } finally {
+                _leftoverValidationPending.value = null
+            }
+        }
+    }
+
+    /**
+     * Cancel leftovers confirmation dialog.
+     */
+    fun cancelLeftovers() {
+        _leftoverValidationPending.value = null
+    }
+
+    /**
+     * Shared merge + update logic for leftovers.
+     */
+    private suspend fun performLeftoverMergeAndUpdate(
+        original: FoodEntry,
+        leftoversResult: com.example.data.remote.FoodAnalysisResult,
+        onSuccess: () -> Unit
+    ) {
+        android.util.Log.i("FOOD_DIAG", "performLeftoverMergeAndUpdate: original=${original.calories} kcal, leftovers=${leftoversResult.calories} kcal")
+
+        // Merge leftovers
+        val consumed = mealOrchestrator.mergeLeftovers(
+            original = original,
+            leftoversResult = leftoversResult,
+            language = _userProfile.value.language
+        )
+
+        android.util.Log.i("FOOD_DIAG", "performLeftoverMergeAndUpdate: consumed=${consumed.calories} kcal after merge")
+
+        // Append edit log
+        val withLog = consumed.appendEditLog(
+            type = com.example.data.local.FoodEditType.LEFTOVER,
+            model = leftoversResult.analysisModel
+        )
+
+        // Update in DB
+        repository.updateFood(withLog)
+        android.util.Log.i("FOOD_DIAG", "performLeftoverMergeAndUpdate: DB updated, entry id=${withLog.id}")
+
+        // Update session state so UI reflects changes immediately
+        _pendingFoodSession.value = _pendingFoodSession.value.map { entry ->
+            if (entry.id == original.id) withLog else entry
+        }
+        android.util.Log.i("FOOD_DIAG", "performLeftoverMergeAndUpdate: session updated")
+
+        // Feedback to user
+        val kcalDiff = (original.calories ?: 0) - (consumed.calories ?: 0)
+        val message = tr("snack_leftovers_adjusted", _userProfile.value.language)
+            .replace("{kcal}", kcalDiff.toString())
+        _oneShotSnack.emit(message)
+        android.util.Log.i("FOOD_DIAG", "performLeftoverMergeAndUpdate: snackbar shown, diff=$kcalDiff kcal")
+
+        onSuccess()
+    }
+
     /**
      * Cancel any in-flight food analysis stream. Called from the
      * "Cancelar análise" button on the capture card and from the typing

@@ -3,7 +3,12 @@ package com.example.data.local
 import org.json.JSONArray
 import org.json.JSONObject
 
-enum class FoodEditType { ADDED, AUTO, MANUAL }
+enum class FoodEditType {
+    ADDED,      // Initial AI analysis
+    AUTO,       // Re-analyzed via "Substituir foto"
+    MANUAL,     // User edited manually
+    LEFTOVER    // Adjusted via "Registar sobras"
+}
 
 /**
  * One row of a meal's activity history.

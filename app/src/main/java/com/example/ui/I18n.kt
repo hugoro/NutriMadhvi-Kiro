@@ -586,7 +586,25 @@ fun tr(key: String, lang: String): String {
         "Read aloud" to "Ler em voz alta",
         "Voice mode" to "Modo voz",
         "Listening…" to "A ouvir…",
-        "Grant microphone access" to "Conceder acesso ao microfone"
+        "Grant microphone access" to "Conceder acesso ao microfone",
+        // Leftovers feature (2026-10-09)
+        "button_log_leftovers" to "Registar Sobras",
+        "prompt_photo_leftovers" to "Fotografa as sobras que ficaram no prato",
+        "phase_analyzing_leftovers" to "A analisar as sobras...",
+        "dialog_leftovers_warning_title" to "Sobras Implausíveis",
+        "leftover_analysis_result" to "Resultado da Análise de Sobras",
+        "leftovers_detected" to "SOBRAS IDENTIFICADAS",
+        "consumed_calculated" to "CONSUMIDO (ORIGINAL − SOBRAS)",
+        "button_confirm_adjustment" to "Confirmar Ajuste",
+        "more" to "mais",
+        "warning_leftovers_exceed_original" to "As sobras parecem ter mais calorias que a refeição original. Verifica se a foto está correta.",
+        "warning_leftovers_too_large" to "As sobras parecem ser {percent}% da refeição original. Comeste muito pouco?",
+        "warning_leftovers_too_small" to "As sobras parecem muito pequenas ({percent}% do original). Confirma que é correto?",
+        "button_confirm_anyway" to "Confirmar Assim Mesmo",
+        "snack_leftovers_adjusted" to "✓ Refeição ajustada: −{kcal} kcal",
+        "error_leftovers_analysis_failed" to "Não foi possível analisar as sobras. Tenta de novo.",
+        "error_leftovers_network_failed" to "Erro de rede ao analisar sobras. Verifica a ligação.",
+        "error_original_no_data" to "A refeição original não tem dados suficientes."
     )
     val gu = mapOf(
         "Dashboard" to "ડેશબોર્ડ",
@@ -1161,7 +1179,25 @@ fun tr(key: String, lang: String): String {
         "Read aloud" to "મોટેથી વાંચો",
         "Voice mode" to "વૉઇસ મોડ",
         "Listening…" to "સાંભળી રહ્યું છે…",
-        "Grant microphone access" to "માઇક્રોફોન ઍક્સેસ આપો"
+        "Grant microphone access" to "માઇક્રોફોન ઍક્સેસ આપો",
+        // Leftovers feature (2026-10-09)
+        "button_log_leftovers" to "બાકીનું નોંધો",
+        "prompt_photo_leftovers" to "પ્લેટમાં રહેલ બાકીનું ફોટો લો",
+        "phase_analyzing_leftovers" to "બાકીનું વિશ્લેષણ કરી રહ્યું છે...",
+        "dialog_leftovers_warning_title" to "અવિશ્વસનીય બાકી",
+        "leftover_analysis_result" to "બાકીનું વિશ્લેષણ પરિણામ",
+        "leftovers_detected" to "ઓળખાયેલ બાકીનું",
+        "consumed_calculated" to "ખાધેલું (મૂળ − બાકી)",
+        "button_confirm_adjustment" to "ગોઠવણ પુષ્ટિ કરો",
+        "more" to "વધુ",
+        "warning_leftovers_exceed_original" to "બાકીનામાં મૂળ ભોજન કરતાં વધુ કેલરી હોવાનું લાગે છે. ફોટો સાચો છે કે તપાસો.",
+        "warning_leftovers_too_large" to "બાકીનું મૂળ ભોજનનું {percent}% લાગે છે. તમે બહુ ઓછું ખાધું?",
+        "warning_leftovers_too_small" to "બાકીનું બહુ ઓછું લાગે છે (મૂળનું {percent}%). તે સાચું છે કે તપાસો?",
+        "button_confirm_anyway" to "તો પણ પુષ્ટિ કરો",
+        "snack_leftovers_adjusted" to "✓ ભોજન ગોઠવાયું: −{kcal} kcal",
+        "error_leftovers_analysis_failed" to "બાકીનું વિશ્લેષણ કરી શકાયું નહીં. ફરી પ્રયાસ કરો.",
+        "error_leftovers_network_failed" to "બાકીનું વિશ્લેષણ કરતી વખતે નેટવર્ક ભૂલ. કનેક્શન તપાસો.",
+        "error_original_no_data" to "મૂળ ભોજનમાં પૂરતો ડેટા નથી."
     )
     // Small English map for keys whose identifier is opaque (e.g. `phase_*`
     // technical tokens used by the meal-analysis orchestrator). For all
@@ -1236,6 +1272,24 @@ fun tr(key: String, lang: String): String {
         "notif_session_title_exercise" to "This week's activity",
         "notif_session_title_macros" to "Macros at risk",
         "notif_session_title_summary" to "Daily summary",
+        // Leftovers feature (2026-10-09)
+        "button_log_leftovers" to "Log Leftovers",
+        "prompt_photo_leftovers" to "Take a photo of the leftovers on the plate",
+        "phase_analyzing_leftovers" to "Analyzing leftovers…",
+        "dialog_leftovers_warning_title" to "Implausible Leftovers",
+        "leftover_analysis_result" to "Leftover Analysis Result",
+        "leftovers_detected" to "LEFTOVERS DETECTED",
+        "consumed_calculated" to "CONSUMED (ORIGINAL − LEFTOVERS)",
+        "button_confirm_adjustment" to "Confirm Adjustment",
+        "more" to "more",
+        "warning_leftovers_exceed_original" to "The leftovers appear to have more calories than the original meal. Check if the photo is correct.",
+        "warning_leftovers_too_large" to "The leftovers appear to be {percent}% of the original meal. Did you eat very little?",
+        "warning_leftovers_too_small" to "The leftovers appear very small ({percent}% of original). Confirm this is correct?",
+        "button_confirm_anyway" to "Confirm Anyway",
+        "snack_leftovers_adjusted" to "✓ Meal adjusted: −{kcal} kcal",
+        "error_leftovers_analysis_failed" to "Could not analyze leftovers. Try again.",
+        "error_leftovers_network_failed" to "Network error analyzing leftovers. Check connection.",
+        "error_original_no_data" to "Original meal does not have enough data."
     )
     return when (lang) {
         "pt-PT", "pt", "" -> pt[key] ?: enExplicit[key] ?: key

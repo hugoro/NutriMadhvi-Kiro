@@ -761,6 +761,7 @@ fun ChatScreen(
                 oneShotSnack = viewModel.oneShotSnack,
                 resolveMessage = { key -> tr(key, userProfile.language) }
             )
+
         }
     }
 }
@@ -2780,13 +2781,16 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
     // subsequent tap starts clean. See plan
     // see-last-snap-looks-wobbly-quasar.md (2026-07-01).
     var replaceModeRequested by remember { mutableStateOf(false) }
+    var leftoverModeRequested by remember { mutableStateOf(false) }
     val addMoreGalleryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
         // Snapshot the flag on the main thread before hopping to IO so a
         // parallel tap can't race the branch.
         val wasReplace = replaceModeRequested
+        val wasLeftover = leftoverModeRequested
         replaceModeRequested = false
+        leftoverModeRequested = false
         if (uri != null) {
             // Phase 5: lossless byte-copy + verbatim Gemini upload.
             coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
@@ -2796,20 +2800,36 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                     if (pair != null) {
                         val (b64, mime) = pair
                         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                            if (wasReplace) {
-                                viewModel.analyzeAndReplaceFoodImage(
-                                    base64Image = b64,
-                                    imagePath = persistedPath,
-                                    promptHint = "User-uploaded gallery image (replace head item)",
-                                    mimeType = mime
-                                )
-                            } else {
-                                viewModel.analyzeAndAppendFoodImage(
-                                    base64Image = b64,
-                                    imagePath = persistedPath,
-                                    promptHint = "User-uploaded gallery image (extra item in session)",
-                                    mimeType = mime
-                                )
+                            when {
+                                wasLeftover -> {
+                                    val entry = viewModel.pendingFoodSession.value.firstOrNull()
+                                    if (entry != null && entry.id != 0L) {
+                                        viewModel.analyzeLeftovers(
+                                            currentEntry = entry,
+                                            base64Image = b64,
+                                            imagePath = persistedPath,
+                                            mimeType = mime,
+                                            onSuccess = { /* Success handled by ViewModel snackbar */ },
+                                            onFailure = { /* Error handled by ViewModel snackbar */ }
+                                        )
+                                    }
+                                }
+                                wasReplace -> {
+                                    viewModel.analyzeAndReplaceFoodImage(
+                                        base64Image = b64,
+                                        imagePath = persistedPath,
+                                        promptHint = "User-uploaded gallery image (replace head item)",
+                                        mimeType = mime
+                                    )
+                                }
+                                else -> {
+                                    viewModel.analyzeAndAppendFoodImage(
+                                        base64Image = b64,
+                                        imagePath = persistedPath,
+                                        promptHint = "User-uploaded gallery image (extra item in session)",
+                                        mimeType = mime
+                                    )
+                                }
                             }
                         }
                     }
@@ -2830,7 +2850,9 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
         pendingAddMoreCameraFile = null
         pendingAddMoreCameraUri = null
         val wasReplace = replaceModeRequested
+        val wasLeftover = leftoverModeRequested
         replaceModeRequested = false
+        leftoverModeRequested = false
         if (success && file != null && uri != null) {
             val finalUriString = uri.toString()
             coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
@@ -2839,20 +2861,36 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                 if (pair != null) {
                     val (b64, mime) = pair
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                        if (wasReplace) {
-                            viewModel.analyzeAndReplaceFoodImage(
-                                base64Image = b64,
-                                imagePath = finalUriString,
-                                promptHint = "User-captured camera image (replace head item)",
-                                mimeType = mime
-                            )
-                        } else {
-                            viewModel.analyzeAndAppendFoodImage(
-                                base64Image = b64,
-                                imagePath = finalUriString,
-                                promptHint = "User-captured camera image (extra item in session)",
-                                mimeType = mime
-                            )
+                        when {
+                            wasLeftover -> {
+                                val entry = viewModel.pendingFoodSession.value.firstOrNull()
+                                if (entry != null && entry.id != 0L) {
+                                    viewModel.analyzeLeftovers(
+                                        currentEntry = entry,
+                                        base64Image = b64,
+                                        imagePath = finalUriString,
+                                        mimeType = mime,
+                                        onSuccess = { /* Success handled by ViewModel snackbar */ },
+                                        onFailure = { /* Error handled by ViewModel snackbar */ }
+                                    )
+                                }
+                            }
+                            wasReplace -> {
+                                viewModel.analyzeAndReplaceFoodImage(
+                                    base64Image = b64,
+                                    imagePath = finalUriString,
+                                    promptHint = "User-captured camera image (replace head item)",
+                                    mimeType = mime
+                                )
+                            }
+                            else -> {
+                                viewModel.analyzeAndAppendFoodImage(
+                                    base64Image = b64,
+                                    imagePath = finalUriString,
+                                    promptHint = "User-captured camera image (extra item in session)",
+                                    mimeType = mime
+                                )
+                            }
                         }
                     }
                 }
@@ -2874,6 +2912,7 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
             // round, so the read-and-reset there won't fire; do it here so
             // the next gallery tap doesn't inherit stale replace mode.
             replaceModeRequested = false
+            leftoverModeRequested = false
         }
     }
 
@@ -3610,6 +3649,69 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                     }
                 }
 
+                // 2026-10-09 — "Registar Sobras" button. Only shown when:
+                // - Single persisted entry (id != 0)
+                // - Entry has a photo (imagePath != null)
+                // - Not currently saving/analyzing
+                val currentEntry = sessionItems.firstOrNull()
+                val canLogLeftovers = currentEntry != null
+                    && currentEntry.id != 0L
+                    && currentEntry.imagePath != null
+                    && !isSaving
+                    && !isAnalyzing
+
+                if (canLogLeftovers) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = {
+                            leftoverModeRequested = true
+                            addMoreGalleryLauncher.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth().height(50.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = AccentPrimary
+                        ),
+                        border = BorderStroke(1.5.dp, AccentPrimary)
+                    ) {
+                        Icon(Icons.Rounded.RemoveCircle, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            tr("button_log_leftovers", userProfile.language),
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 15.sp
+                        )
+                    }
+                }
+
+                // 2026-10-10 — Leftovers result card. Shown after analysis completes,
+                // displaying detected leftovers breakdown and consumed calculation.
+                val leftoverValidation by viewModel.leftoverValidationPending.collectAsState()
+                leftoverValidation?.let { state ->
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    val warningText = state.validation.warningKey?.let { key ->
+                        tr(key, userProfile.language).replace(
+                            "{percent}",
+                            state.validation.leftoverPercent.toInt().toString()
+                        )
+                    }
+
+                    com.example.ui.components.LeftoverResultCard(
+                        original = state.original,
+                        leftovers = state.leftovers,
+                        consumedPreview = state.consumedPreview,
+                        hasWarning = !state.validation.isPlausible,
+                        warningText = warningText,
+                        onConfirm = { viewModel.confirmLeftoversAnyway() },
+                        onCancel = { viewModel.cancelLeftovers() },
+                        tr = { key, lang -> tr(key, lang) },
+                        language = userProfile.language
+                    )
+                }
+
                 // 2026-06-18 — re-analysis feedback bubble. Visible when the
                 // user edited fullSummary and tapped Save: the orchestrator
                 // streams phase events so the bubble shows "A reanalisar a
@@ -3621,9 +3723,11 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                 // the user thought "nada aconteceu". The bubble now covers
                 // both the save-reanalysis and the photo-replace windows,
                 // including the seconds spent retrying a 429.
+                // 2026-10-10 — ALSO covers leftovers analysis (isAnalyzingLeftovers).
                 run {
                     val phaseKey by viewModel.foodAnalysisPhase.collectAsState()
-                    val isReanalyzing = (isSaving || isAnalyzing) && phaseKey != null
+                    val isAnalyzingLeftovers by viewModel.isAnalyzingLeftovers.collectAsState()
+                    val isReanalyzing = (isSaving || isAnalyzing || isAnalyzingLeftovers) && phaseKey != null
                     androidx.compose.animation.AnimatedVisibility(visible = isReanalyzing) {
                         TypingIndicatorBubble(
                             phaseText = tr(
@@ -3671,9 +3775,10 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                         editLog.forEach { entry ->
                             val d = java.util.Date(entry.epochMs)
                             val typeLabel = when (entry.type) {
-                                com.example.data.local.FoodEditType.ADDED  -> "Adicionado"
-                                com.example.data.local.FoodEditType.AUTO   -> "Atualiz. Auto"
-                                com.example.data.local.FoodEditType.MANUAL -> "Atualiz. Manual"
+                                com.example.data.local.FoodEditType.ADDED    -> "Adicionado"
+                                com.example.data.local.FoodEditType.AUTO     -> "Atualiz. Auto"
+                                com.example.data.local.FoodEditType.MANUAL   -> "Atualiz. Manual"
+                                com.example.data.local.FoodEditType.LEFTOVER -> "Ajustado (Sobras)"
                             }
                             // Append the LLM behind the write (e.g. "· gemini-3.5-flash").
                             // Null for purely manual edits and pre-field entries — those
