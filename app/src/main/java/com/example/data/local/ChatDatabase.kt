@@ -26,7 +26,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         PerformanceSnapshotEntity::class,
         PerformanceGoalEntity::class
     ],
-    version = 37,
+    version = 38,
     exportSchema = true
 )
 @androidx.room.TypeConverters(Converters::class)
@@ -787,6 +787,14 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        // v38: snapshot of a meal's pre-leftovers state so "eliminar sobras" can
+        // revert exactly. Additive, nullable — safe idempotent column add.
+        val MIGRATION_37_38 = object : Migration(37, 38) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.addColumnIfMissing("food_entries", "leftoverOriginalJson", "TEXT DEFAULT NULL")
+            }
+        }
+
         val MIGRATION_35_36 = object : Migration(35, 36) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // Silhouette photo paths
@@ -873,7 +881,8 @@ abstract class ChatDatabase : RoomDatabase() {
                     MIGRATION_33_34,
                     MIGRATION_34_35,
                     MIGRATION_35_36,
-                    MIGRATION_36_37
+                    MIGRATION_36_37,
+                    MIGRATION_37_38
                 )
                 // Hard guarantee that v9→v10 (and later) NEVER nukes user data:
                 // if a defined migration throws, the app crashes loudly instead of

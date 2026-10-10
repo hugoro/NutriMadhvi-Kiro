@@ -4,6 +4,9 @@ import com.example.BuildConfig
 import com.example.data.local.ActivityEntry
 import com.example.data.local.FoodEntry
 import com.example.data.local.MealCategory
+import com.example.data.local.decodeLeftoverSnapshot
+import com.example.data.local.toLeftoverSnapshot
+import com.example.data.local.encode
 import com.example.data.meal.ensemble.EnsembleAnalysisOrchestrator
 import com.example.data.meal.ensemble.EnsembleConfig
 import com.example.data.meal.ensemble.EnsembleMode
@@ -1277,18 +1280,93 @@ class MealAnalysisOrchestrator(
         }
 
         // Recalculate meal totals from consumed ingredients
-        val totalCalories = consumedIngredients.sumOf { it.calories ?: 0 }
-        val totalProtein = consumedIngredients.sumOf { it.protein ?: 0.0 }
-        val totalCarbs = consumedIngredients.sumOf { it.carbs ?: 0.0 }
-        val totalFat = consumedIngredients.sumOf { it.fat ?: 0.0 }
+        val ingTotalCalories = consumedIngredients.sumOf { it.calories ?: 0 }
+        val ingTotalProtein = consumedIngredients.sumOf { it.protein ?: 0.0 }
+        val ingTotalCarbs = consumedIngredients.sumOf { it.carbs ?: 0.0 }
+        val ingTotalFat = consumedIngredients.sumOf { it.fat ?: 0.0 }
 
-        val mergedIngredientsJson = encodeIngredients(consumedIngredients)
+        // The per-ingredient path is only trustworthy when the ingredient macros
+        // actually sum to (close to) the meal's stored totals. Flash models often
+        // emit ingredient weights WITHOUT per-ingredient macros, or macros that
+        // don't reconcile with the meal totals — then summing consumed ingredients
+        // produces numbers unrelated to reality (observed 2026-10-10: meal showed
+        // 390g consumed but macro bars came from a 2-item sum). When the
+        // ingredient sum diverges from the stored meal macros by >25%, fall back
+        // to subtracting the leftovers' TOTAL macros from the meal's TOTAL macros
+        // — coarser, but always consistent with what the user saw before.
+        val origCal = (original.calories ?: 0).toDouble()
+        val ingReconciles = origCal > 0 &&
+            kotlin.math.abs((consumedIngredients.sumOf { (it.calories ?: 0) } +
+                (leftoverIngredients.sumOf { it.calories ?: 0 })) - origCal) <= origCal * 0.25 &&
+            ingTotalProtein > 0.0
 
-        android.util.Log.d(
-            "MealAnalysis",
-            "mergeLeftovers result: consumed=${consumedIngredients.size} " +
-                "cal=$totalCalories (orig=${original.calories})"
+        val totalCalories: Int
+        val totalProtein: Double
+        val totalCarbs: Double
+        val totalFat: Double
+
+        if (ingReconciles) {
+            totalCalories = ingTotalCalories
+            totalProtein = ingTotalProtein
+            totalCarbs = ingTotalCarbs
+            totalFat = ingTotalFat
+            android.util.Log.i("FOOD_DIAG", "mergeLeftovers: using PER-INGREDIENT subtraction")
+        } else {
+            // Macro-total fallback: consumed = meal total − leftovers total.
+            totalCalories = ((original.calories ?: 0) - (leftoversResult.calories ?: 0)).coerceAtLeast(0)
+            totalProtein = ((original.protein) - (leftoversResult.protein ?: 0.0)).coerceAtLeast(0.0)
+            totalCarbs = ((original.carbs) - (leftoversResult.carbs ?: 0.0)).coerceAtLeast(0.0)
+            totalFat = ((original.fat) - (leftoversResult.fat ?: 0.0)).coerceAtLeast(0.0)
+            android.util.Log.i("FOOD_DIAG", "mergeLeftovers: using MACRO-TOTAL fallback (ingredients did not reconcile)")
+        }
+
+        // When per-ingredient subtraction reconciled, the consumed breakdown is
+        // trustworthy — persist it. In the macro-total fallback the per-ingredient
+        // weights are unreliable, so keep the ORIGINAL ingredient breakdown (which
+        // the macro bars already render correctly) rather than a bogus 2-item list.
+        val finalIngredientsJson = if (ingReconciles) {
+            encodeIngredients(consumedIngredients)
+        } else {
+            original.ingredientsJson
+        }
+        val mergedIngredientsJson = finalIngredientsJson
+
+        android.util.Log.i(
+            "FOOD_DIAG",
+            "mergeLeftovers: consumed=${consumedIngredients.size} ingredients | " +
+                "cal=$totalCalories (orig=${original.calories}) | " +
+                "P=$totalProtein (orig=${original.protein}) | " +
+                "C=$totalCarbs (orig=${original.carbs}) | " +
+                "F=$totalFat (orig=${original.fat})"
         )
+        android.util.Log.i(
+            "FOOD_DIAG",
+            "mergeLeftovers: per-ingredient macros present? " +
+                consumedIngredients.joinToString(" | ") {
+                    "${it.name}:cal=${it.calories},p=${it.protein},c=${it.carbs},f=${it.fat}"
+                }
+        )
+
+        // The consumed breakdown is now the ENTIRE fullSummary (one ingredient
+        // per line). The original-meal and leftovers sections no longer live in
+        // the text box — they would duplicate the dedicated leftovers card. The
+        // leftovers block is instead persisted structurally in the snapshot so
+        // the card renders from it. 2026-10-10.
+        val consumedBlock = FullSummaryRepair.repair(
+            "Consumido: ${original.name}",
+            mergedIngredientsJson,
+            language
+        ) ?: "Consumido: ${original.name}"
+
+        val leftoverBlock = buildLeftoverBlock(leftoversResult, language)
+
+        // Snapshot the pre-adjustment state so "eliminar sobras" can revert
+        // exactly. If the meal was ALREADY adjusted once, keep the earliest
+        // snapshot (the true original) rather than snapshotting the already-
+        // reduced values — but refresh the leftover block text to the latest.
+        val snapshotJson = (original.leftoverOriginalJson?.let { prev ->
+            decodeLeftoverSnapshot(prev)?.copy(leftoverBlockText = leftoverBlock)?.encode()
+        }) ?: original.toLeftoverSnapshot(leftoverBlock).encode()
 
         return original.copy(
             calories = totalCalories.coerceAtLeast(0),
@@ -1296,12 +1374,14 @@ class MealAnalysisOrchestrator(
             carbs = totalCarbs.coerceAtLeast(0.0),
             fat = totalFat.coerceAtLeast(0.0),
             ingredientsJson = mergedIngredientsJson,
-            fullSummary = FullSummaryRepair.repair(
-                "Consumido: ${original.name} (ajustado após sobras)",
-                mergedIngredientsJson,
-                language
-            ) ?: "Consumido: ${original.name}",
-            lastAiAnalyzedSummary = "Leftovers subtracted",
+            fullSummary = consumedBlock,
+            // CRITICAL: keep lastAiAnalyzedSummary == fullSummary so the save
+            // path's `summaryChanged` check (fullSummary != lastAiAnalyzedSummary)
+            // is false. Otherwise saving the meal after a leftover adjustment
+            // triggers a fresh AI re-analysis that OVERWRITES the subtracted
+            // macros with new estimates (observed 2026-10-10). 2026-10-10.
+            lastAiAnalyzedSummary = consumedBlock,
+            leftoverOriginalJson = snapshotJson,
             analysisModel = leftoversResult.analysisModel ?: original.analysisModel,
             // Recalculate free sugars and saturated fat proportionally
             freeSugarsG = original.freeSugarsG?.let { orig ->
@@ -1313,6 +1393,36 @@ class MealAnalysisOrchestrator(
                 (orig * ratio).coerceAtMost(totalFat).coerceAtLeast(0.0)
             }
         )
+    }
+
+    /**
+     * Builds the leftovers block: a header kcal line + one ingredient per line.
+     * Mirrors the one-ingredient-per-line format of [FullSummaryRepair] so the
+     * three sections read consistently.
+     */
+    private fun buildLeftoverBlock(
+        leftoversResult: FoodAnalysisResult,
+        language: String
+    ): String {
+        val ingredients = leftoversResult.ingredients.orEmpty()
+            .filter { !it.name.isNullOrBlank() && it.weightGrams > 0.0 }
+
+        val kcalLabel = when (language) {
+            "pt-PT", "pt" -> "Total sobras"
+            "gu" -> "કુલ બાકી"
+            else -> "Total leftovers"
+        }
+        val header = "$kcalLabel: ${leftoversResult.calories ?: 0} kcal"
+
+        if (ingredients.isEmpty()) return header
+
+        return buildString {
+            append(header)
+            ingredients.forEach { ing ->
+                val g = Math.round(ing.weightGrams)
+                append("\n• ${ing.name!!.trim()} (~${g}g)")
+            }
+        }
     }
 
     /**

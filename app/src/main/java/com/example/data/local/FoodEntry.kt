@@ -83,6 +83,13 @@ data class FoodEntry(
      * that don't stamp it; the UI falls back to a generic "Pro" label in that
      * case rather than showing a blank badge.
      */
-    val analysisModel: String? = null
+    val analysisModel: String? = null,
+    /** JSON snapshot of this meal's macros + summary + ingredients BEFORE a
+     *  leftovers adjustment, so "eliminar sobras" can revert the meal exactly to
+     *  its pre-adjustment state. Also carries the human-readable leftovers block
+     *  text so the persisted card can render without parsing `fullSummary`.
+     *  NULL = this meal was never adjusted via leftovers. Added in schema v38.
+     *  Encoder/decoder in [com.example.data.local.LeftoverSnapshot]. */
+    val leftoverOriginalJson: String? = null
 )
 

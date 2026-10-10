@@ -264,7 +264,8 @@ fun LeftoverResultCard(
                     Text(
                         tr("button_confirm_adjustment", language),
                         fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1
                     )
                 }
             }
@@ -316,4 +317,110 @@ private fun HorizontalDivider(
         color = color,
         thickness = thickness
     )
+}
+
+/**
+ * Parsed leftovers block for the persistent card.
+ * [headerLine] is the "Total sobras: N kcal" line; [bulletLines] are the
+ * per-ingredient "• name (~Xg)" lines.
+ */
+data class ParsedLeftovers(
+    val headerLine: String,
+    val bulletLines: List<String>
+)
+
+/**
+ * Parses the structured leftovers block text stored in the meal's snapshot
+ * ([com.example.data.local.LeftoverOriginalSnapshot.leftoverBlockText]). The
+ * block is "Total sobras: N kcal\n• name (~Xg)\n…". Returns null when blank
+ * (meal never adjusted) so the caller can skip the card. 2026-10-10 — replaces
+ * the previous fullSummary-section parser; the summary no longer embeds this.
+ */
+fun parseLeftoversFromBlock(blockText: String?): ParsedLeftovers? {
+    if (blockText.isNullOrBlank()) return null
+    val lines = blockText.split('\n').map { it.trim() }.filter { it.isNotEmpty() }
+    if (lines.isEmpty()) return null
+    val header = lines.first()
+    val bullets = lines.drop(1).filter { it.startsWith("•") }
+    return ParsedLeftovers(headerLine = header, bulletLines = bullets)
+}
+
+/**
+ * Read-only card showing leftovers that were previously registered for a meal,
+ * rendered persistently in the edit screen directly below the summary box. The
+ * X button requests deletion (the caller shows a confirmation dialog, then
+ * reverts the meal to its pre-leftovers state). 2026-10-10.
+ */
+@Composable
+fun PersistedLeftoverCard(
+    parsed: ParsedLeftovers,
+    onDelete: () -> Unit,
+    tr: (String, String) -> String,
+    language: String,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+        border = BorderStroke(1.dp, AccentPrimary.copy(alpha = 0.35f))
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Rounded.Check,
+                    contentDescription = null,
+                    tint = AccentPrimary,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = tr("leftover_registered_title", language),
+                    color = Color.White,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
+                )
+                // X — delete leftovers / revert to original (caller confirms first)
+                IconButton(
+                    onClick = onDelete,
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        Icons.Rounded.Close,
+                        contentDescription = tr("button_delete", language),
+                        tint = Color(0xFFEF4444),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+
+            HorizontalDivider()
+
+            // Header (Total sobras: N kcal)
+            Text(
+                text = parsed.headerLine,
+                color = Color(0xFFCBD5E1),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+
+            // One bullet per line
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                parsed.bulletLines.forEach { bullet ->
+                    Text(
+                        text = bullet,
+                        color = Color(0xFF94A3B8),
+                        fontSize = 12.sp
+                    )
+                }
+            }
+        }
+    }
 }

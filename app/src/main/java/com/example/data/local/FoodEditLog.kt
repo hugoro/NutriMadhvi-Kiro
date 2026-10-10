@@ -4,10 +4,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 enum class FoodEditType {
-    ADDED,      // Initial AI analysis
-    AUTO,       // Re-analyzed via "Substituir foto"
-    MANUAL,     // User edited manually
-    LEFTOVER    // Adjusted via "Registar sobras"
+    ADDED,            // Initial AI analysis
+    AUTO,             // Re-analyzed via "Substituir foto"
+    MANUAL,           // User edited manually
+    LEFTOVER,         // Adjusted via "Registar sobras"
+    LEFTOVER_REMOVED  // Leftovers deleted → meal reverted to original
 }
 
 /**

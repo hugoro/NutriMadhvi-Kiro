@@ -17,6 +17,7 @@ import com.example.data.local.ChatMessage
 import com.example.data.local.FoodEntry
 import com.example.data.local.FoodEditType
 import com.example.data.local.appendEditLog
+import com.example.data.local.restoreFromSnapshot
 import com.example.data.local.FoodHabit
 import com.example.data.local.MealCategory
 import com.example.data.local.ActivityEntry
@@ -692,6 +693,11 @@ class ChatViewModel(
                 }
                 android.util.Log.i("FOOD_DIAG", "confirmLeftoversAnyway: session updated")
 
+                // Clear the "summary edited" flag so a subsequent "Accept & Save"
+                // does NOT trigger a fresh AI re-analysis that would overwrite the
+                // subtracted macros. The leftover merge is authoritative. 2026-10-10.
+                _summaryWasEditedAfterAnalysis.value = false
+
                 // Feedback to user
                 val kcalDiff = (pending.original.calories ?: 0) - (pending.consumedPreview.calories ?: 0)
                 val message = tr("snack_leftovers_adjusted", _userProfile.value.language)
@@ -709,6 +715,55 @@ class ChatViewModel(
      */
     fun cancelLeftovers() {
         _leftoverValidationPending.value = null
+    }
+
+    // ── Delete leftovers / revert meal to its pre-adjustment state ──────────
+    // The persisted leftovers card has an X. Tapping it asks for confirmation
+    // (dialog driven by _leftoverDeletePending); confirming restores the meal
+    // exactly from the snapshot stored in leftoverOriginalJson. 2026-10-10.
+    private val _leftoverDeletePending = MutableStateFlow(false)
+    val leftoverDeletePending = _leftoverDeletePending.asStateFlow()
+
+    fun requestDeleteLeftovers() {
+        _leftoverDeletePending.value = true
+    }
+
+    fun cancelDeleteLeftovers() {
+        _leftoverDeletePending.value = false
+    }
+
+    fun confirmDeleteLeftovers() {
+        val entry = _pendingFoodSession.value.firstOrNull()
+        if (entry == null) {
+            _leftoverDeletePending.value = false
+            return
+        }
+        val snap = com.example.data.local.decodeLeftoverSnapshot(entry.leftoverOriginalJson)
+        if (snap == null) {
+            android.util.Log.e("FOOD_DIAG", "confirmDeleteLeftovers: no snapshot to revert from")
+            _leftoverDeletePending.value = false
+            return
+        }
+        viewModelScope.launch {
+            try {
+                val restored = entry.restoreFromSnapshot(snap)
+                    .appendEditLog(type = com.example.data.local.FoodEditType.LEFTOVER_REMOVED, model = null)
+                repository.updateFood(restored)
+                _pendingFoodSession.value = _pendingFoodSession.value.map {
+                    if (it.id == entry.id) restored else it
+                }
+                _summaryWasEditedAfterAnalysis.value = false
+                _oneShotSnack.emit(tr("snack_leftovers_removed", _userProfile.value.language))
+                android.util.Log.i(
+                    "FOOD_DIAG",
+                    "confirmDeleteLeftovers: reverted entry ${entry.id} to ${snap.calories} kcal"
+                )
+            } catch (e: Exception) {
+                android.util.Log.e("FOOD_DIAG", "confirmDeleteLeftovers failed", e)
+            } finally {
+                _leftoverDeletePending.value = false
+            }
+        }
     }
 
     /**
@@ -2008,7 +2063,13 @@ class ChatViewModel(
                     val summaryChanged = withGroup.fullSummary != withGroup.lastAiAnalyzedSummary
                     val notBlank = withGroup.fullSummary.isNotBlank()
                     val flagged = _summaryWasEditedAfterAnalysis.value
-                    val needsReanalysis = summaryChanged && notBlank && flagged
+                    // A meal adjusted via leftovers carries a non-null
+                    // leftoverOriginalJson snapshot. Its macros were computed by
+                    // deterministic subtraction and must NOT be overwritten by a
+                    // fresh AI re-analysis — the AI would re-estimate from the photo
+                    // and discard the subtraction. 2026-10-10.
+                    val hasLeftoverAdjustment = withGroup.leftoverOriginalJson != null
+                    val needsReanalysis = summaryChanged && notBlank && flagged && !hasLeftoverAdjustment
                     val finalEntry = if (needsReanalysis) {
                         // Streaming re-analysis: emits Phase events that the
                         // edit-meal screen renders as the typing bubble below
