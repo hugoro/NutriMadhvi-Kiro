@@ -384,6 +384,16 @@ class ChatViewModel(
     val summaryWasEditedAfterAnalysis: StateFlow<Boolean> =
         _summaryWasEditedAfterAnalysis.asStateFlow()
 
+    /** Tracks user-edited leftovers text when the persisted leftovers card is
+     *  edited. Consumed by [confirmAndSaveFoodEntry] to decide whether to run
+     *  the leftovers re-subtraction stream. Cleared after save. */
+    private val _editedLeftoversText = MutableStateFlow<String?>(null)
+    val editedLeftoversText: StateFlow<String?> = _editedLeftoversText.asStateFlow()
+
+    fun markLeftoversEdited(text: String) {
+        _editedLeftoversText.value = text
+    }
+
     /** Mirror flag for the activity edit screen — gated by
      *  [confirmAndSaveActivitySession] so the re-analysis stream only fires
      *  when the user actually changed the workout summary. */
@@ -670,6 +680,53 @@ class ChatViewModel(
     }
 
     /**
+     * Private helper to re-analyze and subtract leftovers from a meal entry.
+     * Used by [confirmAndSaveFoodEntry] when the persisted leftovers card was
+     * edited. Collects the streaming analysis and merges if successful.
+     *
+     * @param base The meal entry to subtract from (either the original via snapshot,
+     *             or the just-reanalyzed dish if the summary was also edited)
+     * @param leftoversText User-edited leftover text
+     * @param language User's language setting
+     * @return The merged entry with leftovers subtracted, or null on error
+     */
+    private suspend fun resubtractLeftovers(
+        base: FoodEntry,
+        leftoversText: String,
+        language: String
+    ): FoodEntry? {
+        var streamedResult: com.example.data.remote.FoodAnalysisResult? = null
+        var errorKey: String? = null
+
+        mealOrchestrator.analyzeLeftoversFromTextStreaming(
+            currentEntry = base,
+            leftoversText = leftoversText,
+            language = language
+        ).collect { event ->
+            when (event) {
+                is com.example.data.meal.MealAnalysisEvent.Phase ->
+                    _foodAnalysisPhase.value = event.key
+                is com.example.data.meal.MealAnalysisEvent.Done ->
+                    streamedResult = event.result
+                is com.example.data.meal.MealAnalysisEvent.Error -> {
+                    streamedResult = event.salvage
+                    errorKey = event.messageKey
+                }
+                else -> { /* Ignore Partial events */ }
+            }
+        }
+
+        val result = streamedResult ?: return null
+        android.util.Log.i("FOOD_DIAG", "resubtractLeftovers: got result, ${result.calories ?: 0} kcal leftovers")
+
+        return mealOrchestrator.mergeLeftovers(
+            original = base,
+            leftoversResult = result,
+            language = language
+        )
+    }
+
+    /**
      * Confirm leftovers anyway (user clicked "Confirm Adjustment" on result card).
      * Proceeds with merge despite plausibility warning.
      */
@@ -697,6 +754,7 @@ class ChatViewModel(
                 // does NOT trigger a fresh AI re-analysis that would overwrite the
                 // subtracted macros. The leftover merge is authoritative. 2026-10-10.
                 _summaryWasEditedAfterAnalysis.value = false
+                _editedLeftoversText.value = null
 
                 // Feedback to user
                 val kcalDiff = (pending.original.calories ?: 0) - (pending.consumedPreview.calories ?: 0)
@@ -753,6 +811,7 @@ class ChatViewModel(
                     if (it.id == entry.id) restored else it
                 }
                 _summaryWasEditedAfterAnalysis.value = false
+                _editedLeftoversText.value = null
                 _oneShotSnack.emit(tr("snack_leftovers_removed", _userProfile.value.language))
                 android.util.Log.i(
                     "FOOD_DIAG",
@@ -978,6 +1037,7 @@ class ChatViewModel(
         // re-analysis branch in confirmAndSaveFoodEntry is gated off until
         // markSummaryEdited() is called.
         _summaryWasEditedAfterAnalysis.value = false
+        _editedLeftoversText.value = null
         onSuccess()
     }
 
@@ -2063,13 +2123,15 @@ class ChatViewModel(
                     val summaryChanged = withGroup.fullSummary != withGroup.lastAiAnalyzedSummary
                     val notBlank = withGroup.fullSummary.isNotBlank()
                     val flagged = _summaryWasEditedAfterAnalysis.value
-                    // A meal adjusted via leftovers carries a non-null
-                    // leftoverOriginalJson snapshot. Its macros were computed by
-                    // deterministic subtraction and must NOT be overwritten by a
-                    // fresh AI re-analysis — the AI would re-estimate from the photo
-                    // and discard the subtraction. 2026-10-10.
-                    val hasLeftoverAdjustment = withGroup.leftoverOriginalJson != null
-                    val needsReanalysis = summaryChanged && notBlank && flagged && !hasLeftoverAdjustment
+                    // Re-analyse ONLY when the user genuinely edited the text
+                    // (`flagged`). A programmatic session refresh (e.g. after a
+                    // leftover merge) re-inits editSummary without firing
+                    // onValueChange, so `flagged` stays false and the subtracted
+                    // macros survive. But if the user DOES edit the description
+                    // after registering leftovers, that is an explicit request to
+                    // recompute — honour it (the edit supersedes the leftovers
+                    // adjustment). 2026-10-10.
+                    val needsReanalysis = summaryChanged && notBlank && flagged
                     val finalEntry = if (needsReanalysis) {
                         // Streaming re-analysis: emits Phase events that the
                         // edit-meal screen renders as the typing bubble below
@@ -2151,35 +2213,92 @@ class ChatViewModel(
                                 // applied it) as the next baseline so the
                                 // re-analysis branch only fires when the
                                 // user truly edits the summary again.
-                                lastAiAnalyzedSummary = merged.fullSummary
+                                lastAiAnalyzedSummary = merged.fullSummary,
+                                // A fresh re-analysis supersedes any prior leftovers
+                                // adjustment — the macros now come straight from the
+                                // model, so drop the snapshot and hide the leftovers
+                                // card. 2026-10-10.
+                                leftoverOriginalJson = null
                             )
                         }
                     } else {
                         withGroup
                     }
-                    val saved = if (finalEntry.id != 0L) {
-                        // AUTO when a fresh re-analysis actually ran and produced a
-                        // model-tagged result; MANUAL when only the user's own edit
-                        // changed. Keying off `needsReanalysis` + a resolved model is
-                        // reliable — the old "did analysisModel change" check marked a
-                        // genuine re-analysis MANUAL whenever it resolved to the same
-                        // engine (and mergeReanalysis used to drop the model entirely).
-                        val reanalysed = needsReanalysis && finalEntry.analysisModel != null
-                        val logType = if (reanalysed)
-                            FoodEditType.AUTO
-                        else
-                            FoodEditType.MANUAL
-                        val withLog = finalEntry.appendEditLog(
+
+                    // ── LEFTOVERS RECOMPUTE ON EDIT ────────────────────────────
+                    // If the persisted leftovers card was edited, re-analyze and
+                    // subtract from the correct base: if the description was just
+                    // reanalyzed (needsReanalysis=true), finalEntry is the fresh
+                    // dish with snapshot cleared → subtract from it. Otherwise,
+                    // rebuild the original from the existing pre-leftovers snapshot
+                    // so we subtract from the true original (idempotent), not from
+                    // already-reduced values. 2026-10-16.
+                    val leftoversText = _editedLeftoversText.value
+                    val leftoversEdited = !leftoversText.isNullOrBlank()
+                    val entryAfterLeftovers = if (leftoversEdited) {
+                        _foodAnalysisPhase.value =
+                            com.example.data.meal.MealAnalysisOrchestrator.PHASE_ANALYZING_LEFTOVERS
+                        val base = if (needsReanalysis) {
+                            // Summary was just reanalyzed → finalEntry is the fresh dish
+                            finalEntry
+                        } else {
+                            // Rebuild original from snapshot so subtraction is idempotent
+                            val snap = com.example.data.local.decodeLeftoverSnapshot(
+                                finalEntry.leftoverOriginalJson
+                            )
+                            if (snap != null) finalEntry.copy(
+                                calories = snap.calories,
+                                protein = snap.protein,
+                                carbs = snap.carbs,
+                                fat = snap.fat,
+                                fullSummary = snap.fullSummary,
+                                lastAiAnalyzedSummary = snap.lastAiAnalyzedSummary,
+                                ingredientsJson = snap.ingredientsJson,
+                                freeSugarsG = snap.freeSugarsG,
+                                saturatedFatG = snap.saturatedFatG,
+                                analysisModel = snap.analysisModel
+                            ) else finalEntry
+                        }
+                        val merged = resubtractLeftovers(base, leftoversText!!, _userProfile.value.language)
+                        if (merged != null) {
+                            merged
+                        } else {
+                            _oneShotSnack.tryEmit("snack_reanalysis_failed_saved_anyway")
+                            finalEntry
+                        }
+                    } else {
+                        finalEntry
+                    }
+
+                    val saved = if (entryAfterLeftovers.id != 0L) {
+                        // Determine edit log type based on what happened:
+                        // - LEFTOVER when leftovers were edited (takes precedence)
+                        // - AUTO when a fresh summary re-analysis ran and produced a model
+                        // - MANUAL when only the user's own edit changed
+                        val logType = if (leftoversEdited) {
+                            FoodEditType.LEFTOVER
+                        } else {
+                            val reanalysed = needsReanalysis && entryAfterLeftovers.analysisModel != null
+                            if (reanalysed) FoodEditType.AUTO else FoodEditType.MANUAL
+                        }
+                        val logModel = if (leftoversEdited) {
+                            // Use the leftovers result's analysis model if available
+                            entryAfterLeftovers.analysisModel
+                        } else {
+                            val reanalysed = needsReanalysis && entryAfterLeftovers.analysisModel != null
+                            if (reanalysed) entryAfterLeftovers.analysisModel else null
+                        }
+                        val withLog = entryAfterLeftovers.appendEditLog(
                             type = logType,
-                            model = if (reanalysed) finalEntry.analysisModel else null
+                            model = logModel
                         )
-                        android.util.Log.i("EditLog", "update id=${finalEntry.id} type=$logType log=${withLog.editLogJson?.take(60)}")
+                        android.util.Log.i("EditLog", "update id=${entryAfterLeftovers.id} type=$logType log=${withLog.editLogJson?.take(60)}")
                         repository.updateFood(withLog)
                         withLog
                     } else {
-                        val withLog = finalEntry.appendEditLog(
+                        val withLog = entryAfterLeftovers.appendEditLog(
                             type = FoodEditType.ADDED,
-                            model = finalEntry.analysisModel
+                            model = entryAfterLeftovers.analysisModel
                         )
                         android.util.Log.i("EditLog", "insert id=0 log=${withLog.editLogJson?.take(60)}")
                         val newId = repository.insertFood(withLog)
@@ -2207,6 +2326,7 @@ class ChatViewModel(
                 _perItemAnalysisErrors.value = emptyMap()
                 _analysisError.value = null
                 _summaryWasEditedAfterAnalysis.value = false
+                _editedLeftoversText.value = null
                 _oneShotSnack.tryEmit("snack_meal_saved")
                 // 2026-07-10 (Hugo) — after a successful save, let the
                 // "Refeição guardada" snackbar breathe for 2s, then close the
@@ -2378,6 +2498,7 @@ class ChatViewModel(
         _foodAnalysisProgress.value = com.example.data.meal.FoodAnalysisProgress()
         _foodAnalysisError.value = null
         _summaryWasEditedAfterAnalysis.value = false
+        _editedLeftoversText.value = null
         lastFoodAnalysisRequest = null
         _pendingClosed.tryEmit(Unit)
     }
@@ -2413,6 +2534,7 @@ class ChatViewModel(
         _foodAnalysisProgress.value = com.example.data.meal.FoodAnalysisProgress()
         _foodAnalysisError.value = null
         _summaryWasEditedAfterAnalysis.value = false
+        _editedLeftoversText.value = null
         _summaryWasEditedAfterActivityAnalysis.value = false
         lastFoodAnalysisRequest = null
     }

@@ -610,7 +610,8 @@ fun tr(key: String, lang: String): String {
         "snack_leftovers_adjusted" to "✓ Refeição ajustada: −{kcal} kcal",
         "error_leftovers_analysis_failed" to "Não foi possível analisar as sobras. Tenta de novo.",
         "error_leftovers_network_failed" to "Erro de rede ao analisar sobras. Verifica a ligação.",
-        "error_original_no_data" to "A refeição original não tem dados suficientes."
+        "error_original_no_data" to "A refeição original não tem dados suficientes.",
+        "leftover_edit_hint" to "Editar as sobras faz a IA recalcular os totais ao guardar.",
     )
     val gu = mapOf(
         "Dashboard" to "ડેશબોર્ડ",
@@ -1208,7 +1209,8 @@ fun tr(key: String, lang: String): String {
         "snack_leftovers_adjusted" to "✓ ભોજન ગોઠવાયું: −{kcal} kcal",
         "error_leftovers_analysis_failed" to "બાકીનું વિશ્લેષણ કરી શકાયું નહીં. ફરી પ્રયાસ કરો.",
         "error_leftovers_network_failed" to "બાકીનું વિશ્લેષણ કરતી વખતે નેટવર્ક ભૂલ. કનેક્શન તપાસો.",
-        "error_original_no_data" to "મૂળ ભોજનમાં પૂરતો ડેટા નથી."
+        "error_original_no_data" to "મૂળ ભોજનમાં પૂરતો ડેટા નથી.",
+        "leftover_edit_hint" to "બાકીનું સંપાદન કરવાથી AI સાચવતી વખતે કુલ ફરી ગણતરી કરે છે.",
     )
     // Small English map for keys whose identifier is opaque (e.g. `phase_*`
     // technical tokens used by the meal-analysis orchestrator). For all
@@ -1305,7 +1307,8 @@ fun tr(key: String, lang: String): String {
         "snack_leftovers_adjusted" to "✓ Meal adjusted: −{kcal} kcal",
         "error_leftovers_analysis_failed" to "Could not analyze leftovers. Try again.",
         "error_leftovers_network_failed" to "Network error analyzing leftovers. Check connection.",
-        "error_original_no_data" to "Original meal does not have enough data."
+        "error_original_no_data" to "Original meal does not have enough data.",
+        "leftover_edit_hint" to "Editing leftovers makes the AI recompute totals on save."
     )
     return when (lang) {
         "pt-PT", "pt", "" -> pt[key] ?: enExplicit[key] ?: key

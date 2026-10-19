@@ -1150,6 +1150,76 @@ class MealAnalysisOrchestrator(
     }
 
     /**
+     * Streaming analysis of LEFTOVERS from TEXT (user edited the leftover card).
+     * The AI re-estimates macros for the described leftovers so the system can
+     * re-subtract from the original meal (snapshot). Text-only variant of
+     * [analyzeLeftoversStreaming] — no photo involved.
+     *
+     * @param currentEntry The original FoodEntry (full meal before eating)
+     * @param leftoversText User-edited text describing the leftovers
+     * @param language User's language for prompt localization
+     * @return Flow of [MealAnalysisEvent] (Phase → Done/Error)
+     */
+    fun analyzeLeftoversFromTextStreaming(
+        currentEntry: FoodEntry,
+        leftoversText: String,
+        language: String = "pt-PT"
+    ): Flow<MealAnalysisEvent> = flow {
+        val apiKey = BuildConfig.GEMINI_API_KEY
+        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
+            emit(
+                MealAnalysisEvent.Error(
+                    messageKey = "analysis_failed_retry",
+                    cause = IllegalStateException("API Key not configured"),
+                    salvage = null
+                )
+            )
+            return@flow
+        }
+
+        emit(MealAnalysisEvent.Phase(PHASE_ANALYZING_LEFTOVERS))
+
+        // For leftovers, habits are less relevant (we're analyzing what's LEFT,
+        // not what was originally served), but we still pass them for consistency
+        // with the regular analysis flow.
+        val habits = repository.selectHabitsForPrompt(
+            repository.getActiveHabitsSnapshot(), currentEntry.mealCategory
+        )
+        val habitsBlock = repository.buildHabitsPromptBlock(habits, currentEntry.name)
+        val offeredIds = habits.map { it.id }.toSet()
+
+        val promptText = repository.buildLeftoversPromptCoreFromText(
+            currentEntry = currentEntry,
+            leftoversText = leftoversText,
+            language = language,
+            habitsBlock = habitsBlock
+        )
+
+        val parts = mutableListOf<Part>()
+        parts.add(Part(text = promptText))
+        // No inlineData — text-only
+
+        val request = GeminiRequest(
+            contents = listOf(Content(parts = parts)),
+            generationConfig = GenerationConfig(
+                temperature = 0.2f,
+                responseMimeType = "application/json",
+                thinkingConfig = ThinkingConfig(thinkingLevel = "low")
+            )
+        )
+
+        consumeStream(
+            collector = this,
+            request = request,
+            apiKey = apiKey,
+            offeredHabitIds = offeredIds,
+            isReanalysis = true,  // Reuse reanalysis phase logic
+            language = language,
+            allowEscalation = false  // No photo → Pro vision cannot help
+        )
+    }
+
+    /**
      * Streaming analysis of LEFTOVERS (food remaining on the plate after a meal).
      * Clone of [reanalyzeFoodFromSummaryStreaming] but adapted for the "register
      * leftovers" flow: the photo shows what REMAINED uneaten, not the full meal.
@@ -1348,17 +1418,18 @@ class MealAnalysisOrchestrator(
         )
 
         // The consumed breakdown is now the ENTIRE fullSummary (one ingredient
-        // per line). The original-meal and leftovers sections no longer live in
-        // the text box — they would duplicate the dedicated leftovers card. The
-        // leftovers block is instead persisted structurally in the snapshot so
-        // the card renders from it. 2026-10-10.
+        // per line). No "Consumido:" prefix — the dish name stands on its own
+        // (2026-10-10). The leftovers block is persisted structurally in the
+        // snapshot so the card renders from it, not from the summary text.
         val consumedBlock = FullSummaryRepair.repair(
-            "Consumido: ${original.name}",
+            original.name,
             mergedIngredientsJson,
             language
-        ) ?: "Consumido: ${original.name}"
+        ) ?: original.name
 
-        val leftoverBlock = buildLeftoverBlock(leftoversResult, language)
+        // Leftovers block shows "name (~Xg de ~Yg)" — leftover weight out of the
+        // matched original weight — so the user sees proportion left vs eaten.
+        val leftoverBlock = buildLeftoverBlock(leftoversResult, originalIngredients, language)
 
         // Snapshot the pre-adjustment state so "eliminar sobras" can revert
         // exactly. If the meal was ALREADY adjusted once, keep the earliest
@@ -1397,11 +1468,14 @@ class MealAnalysisOrchestrator(
 
     /**
      * Builds the leftovers block: a header kcal line + one ingredient per line.
-     * Mirrors the one-ingredient-per-line format of [FullSummaryRepair] so the
-     * three sections read consistently.
+     * Each line shows the leftover weight out of the matched original weight,
+     * e.g. "• bife de vaca grelhado (~35g de ~125g)", so the user sees how much
+     * of each item was left vs originally served. Falls back to just the
+     * leftover weight when no original match is found.
      */
     private fun buildLeftoverBlock(
         leftoversResult: FoodAnalysisResult,
+        originalIngredients: List<IngredientDto>,
         language: String
     ): String {
         val ingredients = leftoversResult.ingredients.orEmpty()
@@ -1412,6 +1486,11 @@ class MealAnalysisOrchestrator(
             "gu" -> "કુલ બાકી"
             else -> "Total leftovers"
         }
+        val ofLabel = when (language) {
+            "pt-PT", "pt" -> "de"
+            "gu" -> "માંથી"
+            else -> "of"
+        }
         val header = "$kcalLabel: ${leftoversResult.calories ?: 0} kcal"
 
         if (ingredients.isEmpty()) return header
@@ -1420,7 +1499,28 @@ class MealAnalysisOrchestrator(
             append(header)
             ingredients.forEach { ing ->
                 val g = Math.round(ing.weightGrams)
-                append("\n• ${ing.name!!.trim()} (~${g}g)")
+                // Find the best-matching original ingredient to show the "de ~Yg".
+                val origWeight = originalIngredients
+                    .filter { !it.name.isNullOrBlank() }
+                    .minByOrNull {
+                        levenshteinDistance(
+                            it.name!!.trim().lowercase(),
+                            ing.name!!.trim().lowercase()
+                        )
+                    }
+                    ?.let { cand ->
+                        val maxLen = maxOf(cand.name!!.length, ing.name!!.length)
+                        val dist = levenshteinDistance(
+                            cand.name!!.trim().lowercase(),
+                            ing.name!!.trim().lowercase()
+                        )
+                        if (dist <= (maxLen * 0.3).toInt()) Math.round(cand.weightGrams) else null
+                    }
+                if (origWeight != null) {
+                    append("\n• ${ing.name!!.trim()} (~${g}g $ofLabel ~${origWeight}g)")
+                } else {
+                    append("\n• ${ing.name!!.trim()} (~${g}g)")
+                }
             }
         }
     }

@@ -2951,9 +2951,9 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
             )
         }
         var editCalories by remember(entry.id, entry.timestamp, entry.calories) { mutableStateOf(entry.calories.toString()) }
-        var editProtein by remember(entry.id, entry.timestamp) { mutableStateOf(roundedGramsValue(entry.protein)) }
-        var editCarbs by remember(entry.id, entry.timestamp) { mutableStateOf(roundedGramsValue(entry.carbs)) }
-        var editFat by remember(entry.id, entry.timestamp) { mutableStateOf(roundedGramsValue(entry.fat)) }
+        var editProtein by remember(entry.id, entry.timestamp, entry.protein) { mutableStateOf(roundedGramsValue(entry.protein)) }
+        var editCarbs by remember(entry.id, entry.timestamp, entry.carbs) { mutableStateOf(roundedGramsValue(entry.carbs)) }
+        var editFat by remember(entry.id, entry.timestamp, entry.fat) { mutableStateOf(roundedGramsValue(entry.fat)) }
         var selectedCategory by remember(entry.id, entry.timestamp, entry.mealCategory) { mutableStateOf(entry.mealCategory) }
 
         val parsedCals = editCalories.toIntOrNull() ?: entry.calories
@@ -3285,6 +3285,7 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                         com.example.ui.components.PersistedLeftoverCard(
                             parsed = parsed,
                             onDelete = { viewModel.requestDeleteLeftovers() },
+                            onLeftoversEdited = { txt -> viewModel.markLeftoversEdited(txt) },
                             tr = { key, lang -> tr(key, lang) },
                             language = userProfile.language
                         )

@@ -9,6 +9,10 @@ import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -346,19 +350,38 @@ fun parseLeftoversFromBlock(blockText: String?): ParsedLeftovers? {
 }
 
 /**
- * Read-only card showing leftovers that were previously registered for a meal,
+ * Editable card showing leftovers that were previously registered for a meal,
  * rendered persistently in the edit screen directly below the summary box. The
- * X button requests deletion (the caller shows a confirmation dialog, then
- * reverts the meal to its pre-leftovers state). 2026-10-10.
+ * user can edit the leftovers text, which triggers AI re-estimation on Save
+ * (the single "Aceitar e Guardar Refeição" button). The X button requests
+ * deletion (the caller shows a confirmation dialog, then reverts the meal to
+ * its pre-leftovers state). 2026-10-16.
+ *
+ * @param onLeftoversEdited Called when user edits text — receives edited text
  */
 @Composable
 fun PersistedLeftoverCard(
     parsed: ParsedLeftovers,
     onDelete: () -> Unit,
+    onLeftoversEdited: (String) -> Unit,
     tr: (String, String) -> String,
     language: String,
     modifier: Modifier = Modifier
 ) {
+    // Build initial text from parsed leftovers
+    val initialText = remember(parsed) {
+        buildString {
+            append(parsed.headerLine)
+            parsed.bulletLines.forEach { bullet ->
+                append("\n")
+                append(bullet)
+            }
+        }
+    }
+
+    // Editable text state
+    var editedText by remember(parsed) { mutableStateOf(initialText) }
+
     Card(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -403,24 +426,39 @@ fun PersistedLeftoverCard(
 
             HorizontalDivider()
 
-            // Header (Total sobras: N kcal)
-            Text(
-                text = parsed.headerLine,
-                color = Color(0xFFCBD5E1),
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold
+            // Editable multi-line text field (dark theme)
+            OutlinedTextField(
+                value = editedText,
+                onValueChange = { newText ->
+                    editedText = newText
+                    // Notify parent when text differs from original
+                    if (newText.trim() != initialText.trim()) {
+                        onLeftoversEdited(newText)
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                textStyle = LocalTextStyle.current.copy(
+                    color = Color(0xFFCBD5E1),
+                    fontSize = 13.sp
+                ),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = AccentPrimary,
+                    unfocusedBorderColor = Color(0xFF475569),
+                    focusedContainerColor = Color.Transparent,
+                    unfocusedContainerColor = Color(0xFF0F172A),
+                    cursorColor = AccentPrimary
+                ),
+                minLines = 3,
+                maxLines = 10
             )
 
-            // One bullet per line
-            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                parsed.bulletLines.forEach { bullet ->
-                    Text(
-                        text = bullet,
-                        color = Color(0xFF94A3B8),
-                        fontSize = 12.sp
-                    )
-                }
-            }
+            // Help caption
+            Text(
+                text = tr("leftover_edit_hint", language),
+                color = Color(0xFF64748B),
+                fontSize = 11.sp,
+                lineHeight = 14.sp
+            )
         }
     }
 }

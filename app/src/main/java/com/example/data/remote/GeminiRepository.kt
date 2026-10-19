@@ -1592,6 +1592,109 @@ If you used any of the patterns above, return their numeric ids in an "appliedHa
     }
 
     /**
+     * Build prompt for analyzing leftovers from text description (no photo).
+     * The user edited the leftover card text; the AI re-estimates those leftovers
+     * so the system can re-subtract from the original meal.
+     *
+     * @param currentEntry The original FoodEntry (full meal before eating)
+     * @param leftoversText User-edited text describing the leftovers
+     * @param language User's language for prompt localization
+     * @param habitsBlock Habits prompt block (included for consistency)
+     * @return Prompt string for Gemini API
+     */
+    internal fun buildLeftoversPromptCoreFromText(
+        currentEntry: FoodEntry,
+        leftoversText: String,
+        language: String,
+        habitsBlock: String
+    ): String {
+        // Build original meal context block (same as photo-based prompt)
+        val originalBlock = buildString {
+            appendLine("ORIGINAL MEAL (for reference):")
+            appendLine("- Name: \"${currentEntry.name}\"")
+            appendLine("- Description: \"${currentEntry.fullSummary}\"")
+            val freeSugPart = currentEntry.freeSugarsG
+                ?.let { ", ${it}g free sugars" }
+                ?: ""
+            val satFatPart = currentEntry.saturatedFatG
+                ?.let { ", ${it}g saturated fat" }
+                ?: ""
+            appendLine(
+                "- ORIGINAL macros (full meal): ${currentEntry.calories} kcal, " +
+                    "${currentEntry.protein}g protein, ${currentEntry.carbs}g carbs, " +
+                    "${currentEntry.fat}g fat$freeSugPart$satFatPart"
+            )
+
+            // Parse and list original ingredient names to help model match
+            val origIngredients = parseIngredientsJsonSafe(currentEntry.ingredientsJson)
+            if (origIngredients.isNotEmpty()) {
+                appendLine("- Original ingredients: ${origIngredients.joinToString { it.name }}")
+            }
+            appendLine()
+        }
+
+        return """
+            You are analyzing the LEFTOVERS from a meal (food remaining on the plate after eating, NOT consumed).
+
+            The user listed the LEFTOVERS (food NOT eaten) below as text. Your task:
+            1. Estimate macros for EACH listed leftover ingredient and its weight
+            2. Do NOT analyze the original meal — only the listed leftovers
+            3. The system will compute: meal_consumed = original - leftovers
+
+            LEFTOVERS (as described by the user):
+            $leftoversText
+
+            CRITICAL INSTRUCTIONS:
+            - Analyze ONLY the leftovers listed above. Do NOT analyze the original meal.
+            - Try to match ingredient names with the original ingredients listed below (e.g., if the original had "arroz basmati integral" and the leftovers mention "arroz", call it "arroz basmati integral").
+            - If you cannot identify an ingredient confidently, omit it — do not invent.
+            - The system will automatically compute: meal_consumed = original - leftovers.
+            $habitsBlock
+
+            INTERNAL CHECKLIST (think through these steps silently before emitting JSON):
+              1. Estimate portions for each listed leftover ingredient.
+              2. List every leftover ingredient with individual gram weights.
+              3. Compute per-ingredient macros from each weight using standard reference values (USDA / CIQUAL).
+                 Raw whole produce carries near-zero fat: fruit and non-starchy vegetables (papaya/papaia, melon, apple, banana, berries, orange, grapes, tomato, cucumber, lettuce, spinach, carrot, pepper…) MUST get < 0.3 g fat per 100 g UNLESS there is visible added oil, dressing, cheese, or nuts. (Avocado, coconut, olives, and nuts/seeds are the fatty exceptions.) Zero-fat beverages carry NO fat: water, black coffee/tea, soft drinks / sodas (Coca-Cola, refrigerantes, incl. diet/zero), and fruit juices MUST get 0 g fat and 0 g saturatedFatG. (Milk, lattes, milkshakes, and smoothies DO carry fat — those are the exception.) Do NOT spread the meal's total fat evenly across ingredients — attribute fat to its real sources (oils, dairy, meat, nuts, fatty fish).
+              4. Sum the per-ingredient macros and verify totals (≤5% drift).
+              5. Self-rate confidence ("low" | "medium" | "high"). Use "low" or "medium" when text is unclear or portions are ambiguous.
+              6. Estimate freeSugarsG for leftovers. Same WHO definition: free sugars = mono/disaccharides ADDED to foods + sugars naturally present in honey, syrups, and fruit juices. Whole fruit, vegetables, unsweetened dairy, and starches do NOT count. Must satisfy `0 ≤ freeSugarsG ≤ carbs`. **Every entry in `ingredients` must ALSO emit `freeSugarsG` clamped against ingredient's own `carbs`.**
+              7. Estimate saturatedFatG for leftovers. Must satisfy `0 ≤ saturatedFatG ≤ fat`. **Every entry in `ingredients` must ALSO emit `saturatedFatG` clamped against ingredient's own `fat`.**
+
+            You MUST return a JSON structure matching this model exactly, without backticks, preamble, or markdown blocks:
+            {
+              "name": "Sobras de ${currentEntry.name}",
+              "mealCategory": "Snack",
+              "calories": 120,
+              "protein": 5.0,
+              "carbs": 15.0,
+              "fat": 3.0,
+              "freeSugarsG": 2.0,
+              "saturatedFatG": 1.0,
+              "fullSummary": "<three lines separated by literal \\n>",
+              "confidence": "low|medium|high",
+              "appliedHabitIds": [],
+              "ingredients": [
+                { "name": "arroz basmati integral", "weightGrams": 50, "calories": 65, "protein": 1.5, "carbs": 14.0, "fat": 0.5, "saturatedFatG": 0.1, "freeSugarsG": 0.0 }
+              ]
+            }
+
+            fullSummary FORMAT (exactly 3 lines, separated by the literal two-character escape \n inside the JSON string):
+              Line 1: "Sobras: <ingredient1> (~Xg), <ingredient2> (~Yg)"
+              Line 2: "<INGREDIENTS_LABEL>: <ingredient1> (~Xg), <ingredient2> (~Yg)"
+              Line 3: "<ASSUMED_LABEL>: <assumptions>; <CONFIDENCE_LABEL> <low|medium|high translated>"
+
+            Field emission order: "name", "mealCategory", calories/protein/carbs/fat, "freeSugarsG", "saturatedFatG", "fullSummary", "confidence", "appliedHabitIds", "ingredients".
+
+            Ensure macro grams are double values and calories is an integer. weightGrams in ingredients is the actual portion weight (not per-100g). Translate ingredient names into the user's language.
+
+            ${originalBlock}
+            ${languageInstruction(language)}
+            ${summaryLabelInstruction(language)}
+        """.trimIndent()
+    }
+
+    /**
      * Parse ingredientsJson string to List<IngredientDto>, returning empty list on failure.
      * Helper for buildLeftoversPromptCore.
      */
