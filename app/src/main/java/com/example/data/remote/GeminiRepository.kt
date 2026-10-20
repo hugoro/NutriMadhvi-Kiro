@@ -175,6 +175,8 @@ class GeminiRepository(
     private val performanceSnapshotDao: com.example.data.local.PerformanceSnapshotDao? = null,
     /** Performance goals DAO (schema v37). Optional for same reason. */
     private val performanceGoalDao: com.example.data.local.PerformanceGoalDao? = null,
+    /** Body-plan checkpoints DAO (schema v39). Optional for same reason. */
+    private val bodyPlanCheckpointDao: com.example.data.local.BodyPlanCheckpointDao? = null,
 ) {
 
     /** Aggregates the correction-gap history into a directional calibration
@@ -496,6 +498,49 @@ class GeminiRepository(
         )
         return generateContentWithFallback(apiKey, "gemini-3.5-flash", request, "pt")
             .getOrNull()
+    }
+
+    /**
+     * Low-cost structured call for the body-plan system (v39): routine
+     * extraction/reporting routed through [com.example.data.ai.ModelRoles.ROUTINE_CHAIN]
+     * (flash-lite primary → flash compatibility fallback). NOT the vision
+     * cascade — this is a text-only, short-output call, so the cheapest
+     * capable model first. Returns null on API key misconfiguration or
+     * hard failure (the caller then falls back to deterministic tactics).
+     */
+    suspend fun generateBodyPlanContent(prompt: String, language: String): String? {
+        val apiKey = BuildConfig.GEMINI_API_KEY
+        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") return null
+        val request = GeminiRequest(
+            contents = listOf(Content(parts = listOf(Part(text = prompt)))),
+            generationConfig = GenerationConfig(temperature = 0.3f),
+        )
+        return generateWithModelChain(apiKey, com.example.data.ai.ModelRoles.ROUTINE_CHAIN, request, language)
+            .getOrNull()
+    }
+
+    // ── Body-plan checkpoints (schema v39) ──────────────────────────────────
+
+    suspend fun insertBodyPlanCheckpoint(
+        checkpoint: com.example.data.local.BodyPlanCheckpointEntity
+    ): Long = bodyPlanCheckpointDao?.insert(checkpoint) ?: -1L
+
+    fun observeAllBodyPlanCheckpoints(): kotlinx.coroutines.flow.Flow<List<com.example.data.local.BodyPlanCheckpointEntity>> =
+        bodyPlanCheckpointDao?.observeAll()
+            ?: kotlinx.coroutines.flow.flowOf(emptyList())
+
+    suspend fun latestBodyPlanCheckpoint(): com.example.data.local.BodyPlanCheckpointEntity? =
+        bodyPlanCheckpointDao?.latest()
+
+    suspend fun recentBodyPlanCheckpoints(limit: Int = 4): List<com.example.data.local.BodyPlanCheckpointEntity> =
+        bodyPlanCheckpointDao?.recent(limit) ?: emptyList()
+
+    suspend fun updateBodyPlanCheckpointTactics(id: Long, json: String, source: String) {
+        bodyPlanCheckpointDao?.updateTactics(id, json, source)
+    }
+
+    suspend fun updateBodyPlanCheckpointReport(id: Long, report: String, ts: Long) {
+        bodyPlanCheckpointDao?.updateReport(id, report, ts)
     }
 
     // Phase E: persistent user-insight API. The data-card builder reads from
@@ -868,9 +913,25 @@ class GeminiRepository(
             "gemini-3.5-flash",
             "gemini-3.5-flash-lite",
         ).distinct()
+        return generateWithModelChain(apiKey, models, request, language)
+    }
+
+    /**
+     * Non-streaming text call against an explicit, ordered model chain with
+     * per-model retry/backoff on transient errors. Shared by the vision
+     * cascade ([generateContentWithFallback]) and the low-cost routine
+     * structured-work paths (body plan, [generateBodyPlanContent]) that
+     * route through [com.example.data.ai.ModelRoles].
+     */
+    private suspend fun generateWithModelChain(
+        apiKey: String,
+        modelChain: List<String>,
+        request: GeminiRequest,
+        language: String
+    ): Result<String> {
         var lastError: Exception? = null
 
-        for ((index, modelName) in models.withIndex()) {
+        for ((index, modelName) in modelChain.withIndex()) {
             val maxAttempts = if (index == 0) 3 else 2
             for (attempt in 1..maxAttempts) {
                 try {

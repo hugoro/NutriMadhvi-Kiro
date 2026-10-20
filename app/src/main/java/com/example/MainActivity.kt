@@ -109,9 +109,10 @@ class MainActivity : ComponentActivity() {
         val mealCorrectionDao = database.mealCorrectionDao
         val performanceSnapshotDao = database.performanceSnapshotDao
         val performanceGoalDao = database.performanceGoalDao
+        val bodyPlanCheckpointDao = database.bodyPlanCheckpointDao
 
         // 2. Initialize network & caching repository
-        val repository = GeminiRepository(chatDao, foodDao, activityDao, foodHabitDao, targetSnapshotDao, bmrSnapshotDao, bodyCompositionSnapshotDao, dailyActivitySnapshotDao, userInsightDao, predictedQaDao, mealCorrectionDao, performanceSnapshotDao, performanceGoalDao)
+        val repository = GeminiRepository(chatDao, foodDao, activityDao, foodHabitDao, targetSnapshotDao, bmrSnapshotDao, bodyCompositionSnapshotDao, dailyActivitySnapshotDao, userInsightDao, predictedQaDao, mealCorrectionDao, performanceSnapshotDao, performanceGoalDao, bodyPlanCheckpointDao)
         val nutritionLookupService = com.example.data.nutrition.NutritionLookupService(
             context = applicationContext,
             dao = ingredientNutritionDao,

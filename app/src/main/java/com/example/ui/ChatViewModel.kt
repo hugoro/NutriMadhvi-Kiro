@@ -219,11 +219,18 @@ class ChatViewModel(
 
     /** Saves a silhouette snapshot then generates the coach report async.
      *  The entity is persisted immediately (UI can show a spinner); once the
-     *  LLM responds the report is written back via [updateCoachReport]. */
+     *  LLM responds the report is written back via [updateCoachReport].
+     *  Also creates the deterministic body-plan checkpoint (v39) — the
+     *  checkpoint core is local and its LLM enrichment is independent of
+     *  the coach report, so a failure of either never blocks the other. */
     fun savePerformanceSnapshotAndRequestReport(entity: com.example.data.local.PerformanceSnapshotEntity) {
         viewModelScope.launch {
             val id = repository.insertPerformanceSnapshot(entity)
-            if (id > 0) generateCoachReport(entity.copy(id = id))
+            if (id > 0) {
+                val saved = entity.copy(id = id)
+                generateCoachReport(saved)
+                createBodyPlanCheckpoint(saved)
+            }
         }
     }
 
@@ -291,6 +298,286 @@ class ChatViewModel(
         // Strip the block from the visible report before saving
         val cleanReport = stripCoachTargetsBlock(report)
         repository.updatePerformanceCoachReport(entity.id, cleanReport, System.currentTimeMillis())
+    }
+
+    // ── Body plan checkpoints (v39) ─────────────────────────────────────────
+    //
+    // The deterministic core (phase, priorities, deltas) is computed LOCALLY
+    // by com.example.data.performance.BodyPlanEngine and persisted immediately
+    // — the Plan view works offline. The LLM (routin cheap models via
+    // ModelRoles) only enriches: tactics text + checkpoint report. On any LLM
+    // failure the deterministic fallback tactics are stored (source
+    // "deterministic_fallback") and the report stays null → the UI shows a
+    // retry button instead of an infinite spinner.
+
+    /** Live flow of body-plan checkpoints, newest first (Progresso view). */
+    val bodyPlanCheckpoints: StateFlow<List<com.example.data.local.BodyPlanCheckpointEntity>> =
+        repository.observeAllBodyPlanCheckpoints()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /** Creates a checkpoint for a just-saved silhouette snapshot.
+     *  Deterministic part is synchronous + persisted; LLM enrichment is
+     *  async and independently retryable via [requestCheckpointEnrichment]. */
+    fun createBodyPlanCheckpoint(snapshot: com.example.data.local.PerformanceSnapshotEntity) {
+        viewModelScope.launch {
+            val goal = latestPerformanceGoal.value
+            // recent() is newest-first — reverse to oldest→newest for trend math.
+            val bodyComp = repository.recentBodyCompositionSnapshots(10).reversed()
+            val prev = repository.latestBodyPlanCheckpoint()
+            val prevSnapshot = prev?.snapshotId?.let { sid ->
+                repository.recentPerformanceSnapshots(20).firstOrNull { it.id == sid }
+            }
+            val hasComp = bodyComp.any { it.bodyFatPct != null || it.muscleMassKg != null }
+
+            val phase = com.example.data.performance.BodyPlanEngine.classifyPhase(bodyComp, goal?.goalText)
+            val targets = goal?.coachTargetJson?.let {
+                com.example.data.performance.BodyPlanEngine.targetsFromJson(it)
+            } ?: emptyMap()
+            val priorities = com.example.data.performance.BodyPlanEngine.rankPriorities(
+                snapshot, targets, hasComp
+            )
+            val deltas = com.example.data.performance.BodyPlanEngine.deltasBetween(
+                snapshot, prevSnapshot,
+                bodyComp.lastOrNull(),
+                bodyComp.dropLast(1).lastOrNull(),
+            )
+            val deltaSummary = formatDeltaSummary(deltas)
+
+            val id = repository.insertBodyPlanCheckpoint(
+                com.example.data.local.BodyPlanCheckpointEntity(
+                    checkpointAtMs = System.currentTimeMillis(),
+                    snapshotId = snapshot.id,
+                    bodyCompRowId = bodyComp.lastOrNull()?.id,
+                    phase = phase?.name,
+                    prioritiesJson = prioritiesToJson(priorities),
+                    deltaSummary = deltaSummary,
+                )
+            )
+            if (id <= 0) {
+                android.util.Log.w("SHD", "[body-plan] checkpoint insert failed")
+                return@launch
+            }
+            android.util.Log.i(
+                "SHD", "[body-plan] checkpoint#$id phase=$phase priorities=${priorities.size} " +
+                    "prev=${prev?.id ?: "none"} delta=\"$deltaSummary\""
+            )
+            enrichCheckpoint(id, snapshot, prev, prevSnapshot, bodyComp, goal, phase, priorities)
+        }
+    }
+
+    /** Explicit retry for the LLM enrichment of an existing checkpoint
+     *  (tactics + report) — the "Gerar novamente" button. No-op for a
+     *  checkpoint that already has both an LLM-sourced tactics list and a
+     *  report. */
+    fun requestCheckpointEnrichment(checkpointId: Long) {
+        viewModelScope.launch {
+            val all = repository.recentBodyPlanCheckpoints(50)
+            val cp = all.firstOrNull { it.id == checkpointId } ?: return@launch
+            val snapshot = cp.snapshotId?.let { sid ->
+                repository.recentPerformanceSnapshots(20).firstOrNull { it.id == sid }
+            } ?: return@launch
+            val goal = latestPerformanceGoal.value
+            // recent() is newest-first — reverse to oldest→newest for trend math.
+            val bodyComp = repository.recentBodyCompositionSnapshots(10).reversed()
+            val prev = all.firstOrNull { it.checkpointAtMs < cp.checkpointAtMs }
+            val prevSnapshot = prev?.snapshotId?.let { sid ->
+                repository.recentPerformanceSnapshots(20).firstOrNull { it.id == sid }
+            }
+            val hasComp = bodyComp.any { it.bodyFatPct != null || it.muscleMassKg != null }
+            val phase = com.example.data.performance.BodyPlanEngine.classifyPhase(bodyComp, goal?.goalText)
+            val priorities = com.example.data.performance.BodyPlanEngine.rankPriorities(
+                snapshot,
+                goal?.coachTargetJson?.let { com.example.data.performance.BodyPlanEngine.targetsFromJson(it) } ?: emptyMap(),
+                hasComp,
+            )
+            enrichCheckpoint(checkpointId, snapshot, prev, prevSnapshot, bodyComp, goal, phase, priorities)
+        }
+    }
+
+    private suspend fun enrichCheckpoint(
+        checkpointId: Long,
+        snapshot: com.example.data.local.PerformanceSnapshotEntity,
+        previous: com.example.data.local.BodyPlanCheckpointEntity?,
+        previousSnapshot: com.example.data.local.PerformanceSnapshotEntity?,
+        bodyComp: List<com.example.data.local.BodyCompositionSnapshotEntity>,
+        goal: com.example.data.local.PerformanceGoalEntity?,
+        phase: com.example.data.performance.BodyPlanEngine.BodyPhase?,
+        priorities: List<com.example.data.performance.BodyPlanEngine.ZonePriority>,
+    ) {
+        val name = _userProfile.value.name.ifBlank { "Utilizador" }
+        val lang = _userProfile.value.language.ifBlank { "pt-PT" }
+        val latestComp = bodyComp.lastOrNull()
+
+        val tacticsPrompt = com.example.data.performance.BodyPlanPromptBuilder.buildTacticsPrompt(
+            phase = phase,
+            priorities = priorities,
+            goalText = goal?.goalText,
+            latestComp = latestComp,
+            name = name,
+            lang = lang,
+            previousPhase = previous?.phase,
+            previousRatios = previous?.let {
+                com.example.data.performance.BodyPlanPromptBuilder.ratiosLine(previousSnapshot)
+            },
+            deltaSummary = previous?.let {
+                com.example.data.performance.BodyPlanEngine.deltasBetween(
+                    snapshot, previousSnapshot,
+                    bodyComp.lastOrNull(), bodyComp.dropLast(1).lastOrNull(),
+                ).let { d -> formatDeltaSummary(d) }
+            },
+        )
+        val raw = repository.generateBodyPlanContent(tacticsPrompt, lang)
+
+        if (raw == null) {
+            // Hard failure (no key / network / quota): deterministic fallback.
+            repository.updateBodyPlanCheckpointTactics(
+                checkpointId,
+                fallbackTacticsJson(phase, priorities, latestComp?.weightKg, lang),
+                "deterministic_fallback",
+            )
+            android.util.Log.w("SHD", "[body-plan] checkpoint#$checkpointId LLM null → fallback tactics")
+            return
+        }
+        // Parse the [TACTICS] block; the remaining text is the checkpoint report.
+        val tacticsJson = extractTacticsJson(raw)
+        val reportText = stripTacticsBlock(raw).trim()
+        val validTactics = tacticsJson?.let { normalizeTacticsJson(it) }
+        if (validTactics != null) {
+            repository.updateBodyPlanCheckpointTactics(checkpointId, validTactics, "llm")
+        } else {
+            repository.updateBodyPlanCheckpointTactics(
+                checkpointId,
+                fallbackTacticsJson(phase, priorities, latestComp?.weightKg, lang),
+                "deterministic_fallback",
+            )
+            android.util.Log.w("SHD", "[body-plan] checkpoint#$checkpointId invalid tactics JSON → fallback")
+        }
+        if (reportText.isNotBlank()) {
+            repository.updateBodyPlanCheckpointReport(
+                checkpointId, reportText, System.currentTimeMillis()
+            )
+        }
+        android.util.Log.i(
+            "SHD", "[body-plan] checkpoint#$checkpointId enriched " +
+                "(tactics=${if (validTactics != null) "llm" else "fallback"}, report=${reportText.isNotEmpty()})"
+        )
+    }
+
+    /** Deterministic, localized fallback tactics (engine templates → I18n). */
+    private fun fallbackTacticsJson(
+        phase: com.example.data.performance.BodyPlanEngine.BodyPhase?,
+        priorities: List<com.example.data.performance.BodyPlanEngine.ZonePriority>,
+        weightKg: Float?,
+        lang: String,
+    ): String {
+        val sb = StringBuilder("[")
+        var first = true
+        for (t in com.example.data.performance.BodyPlanEngine.defaultTactics(phase, priorities, weightKg)) {
+            if (!first) sb.append(",")
+            first = false
+            var text = tr(t.i18nKey, lang)
+            for ((k, v) in t.i18nArgs) text = text.replace("{${k}}", v)
+            if (text.isBlank()) text = t.i18nKey
+            sb.append("{\"category\":\"${t.category}\",\"text\":\"${text.replace("\"", "'")}\",\"windowDays\":${t.windowDays}}")
+        }
+        return sb.append("]").toString()
+    }
+
+    /** Formats the numeric deltas into a short localized summary string
+     *  (e.g. "cintura −0.3pp · peso +0.4kg · gordura −0.8pp"). Empty when
+     *  this is the first checkpoint (no deltas). */
+    private fun formatDeltaSummary(
+        d: com.example.data.performance.BodyPlanEngine.Deltas,
+    ): String? {
+        if (d.zoneDeltasPp.isEmpty() && d.weightDeltaKg == null &&
+            d.fatDeltaPp == null && d.muscleDeltaKg == null
+        ) return null
+        val lang = _userProfile.value.language.ifBlank { "pt-PT" }
+        val zoneName = { zone: String -> tr("zone_${zone}", lang) }
+        val parts = mutableListOf<String>()
+        for ((zone, pp) in d.zoneDeltasPp) {
+            parts += "${zoneName(zone)} ${fmtSigned(pp)}pp"
+        }
+        d.weightDeltaKg?.let { parts += "${tr("delta_weight", lang)} ${fmtSigned(it)}kg" }
+        d.fatDeltaPp?.let { parts += "${tr("delta_fat", lang)} ${fmtSigned(it)}pp" }
+        d.muscleDeltaKg?.let { parts += "${tr("delta_muscle", lang)} ${fmtSigned(it)}kg" }
+        return parts.joinToString(" · ")
+    }
+
+    private fun fmtSigned(v: Float): String = (if (v >= 0) "+" else "") + v.roundTo1()
+
+    private fun Float.roundTo1(): String {
+        val r = kotlin.math.round(this * 10f) / 10f
+        return if (r == kotlin.math.floor(r)) r.toInt().toString() else r.toString()
+    }
+
+    private fun prioritiesToJson(
+        priorities: List<com.example.data.performance.BodyPlanEngine.ZonePriority>,
+    ): String {
+        val sb = StringBuilder("[")
+        var first = true
+        for (p in priorities) {
+            if (!first) sb.append(",")
+            first = false
+            sb.append(
+                """{"zone":"${p.zone}","direction":"${p.direction.name}",""" +
+                    """"gapPp":${p.gapPp},"tissue":"${p.tissue.name}"}"""
+            )
+        }
+        return sb.append("]").toString()
+    }
+
+    private fun extractTacticsJson(text: String): String? {
+        val open = "[TACTICS]"
+        val close = "[/TACTICS]"
+        val start = text.indexOf(open).takeIf { it >= 0 } ?: return null
+        val end = text.indexOf(close, start).takeIf { it >= 0 } ?: return null
+        val between = text.substring(start + open.length, end).trim()
+        val jsonStart = between.indexOf('[').takeIf { it >= 0 } ?: return null
+        val jsonEnd = between.lastIndexOf(']').takeIf { it >= 0 } ?: return null
+        return between.substring(jsonStart, jsonEnd + 1)
+    }
+
+    private fun stripTacticsBlock(text: String): String {
+        val open = "[TACTICS]"
+        val close = "[/TACTICS]"
+        val start = text.indexOf(open).takeIf { it >= 0 } ?: return text.trim()
+        val end = text.indexOf(close, start).takeIf { it >= 0 } ?: return text.trim()
+        return (text.substring(0, start) + text.substring(end + close.length)).trim()
+    }
+
+    /** Validates + normalizes the LLM tactics JSON. Returns the cleaned JSON
+     *  string, or null when the payload is unusable (→ deterministic
+     *  fallback). Rules: array of 1–6 objects; category in the allowed set;
+     *  non-empty text ≤ 200 chars; windowDays clamped to 7–120 (default 28);
+     *  target optional string ≤ 80 chars. Never throws. */
+    private fun normalizeTacticsJson(json: String): String? {
+        val allowedCategories = setOf("protein", "strength", "steps", "sleep", "calories", "zone")
+        return try {
+            val arr = org.json.JSONArray(json)
+            if (arr.length() < 1 || arr.length() > 6) return null
+            val out = org.json.JSONArray()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val category = o.optString("category", "").lowercase().trim()
+                if (category !in allowedCategories) return null
+                val text = o.optString("text", "").trim()
+                if (text.isEmpty() || text.length > 200) return null
+                val clean = org.json.JSONObject()
+                clean.put("category", category)
+                clean.put("text", text)
+                if (o.has("target")) {
+                    val target = o.optString("target", "").trim()
+                    if (target.isNotEmpty()) clean.put("target", target.take(80))
+                }
+                val windowDays = (o.optInt("windowDays", 28)).coerceIn(7, 120)
+                clean.put("windowDays", windowDays)
+                out.put(clean)
+            }
+            out.toString()
+        } catch (e: Exception) {
+            null
+        }
     }
 
     /** Legacy projection: extracts just the weight from [latestBodyComposition]
