@@ -284,4 +284,37 @@ class GeminiCascadeChatProviderTest {
         val terminals = events.filter { it is ChatEvent.Completed || it is ChatEvent.Failed }
         assertEquals(1, terminals.size)
     }
+
+    // --- 2026-10-06 (Frente Thinking) --------------------------------------
+
+    @Test
+    fun onThinking_maps_to_thinking_and_never_touches_answer() = runTest {
+        val events = provider { cb ->
+            cb.onThinking("a avaliar os dados")
+            cb.onThinking("a avaliar os dados do peso")
+            cb.onPartial("Tens 82,5 kg")
+            "Tens 82,5 kg"
+        }.stream(textRequest()).toList()
+
+        assertEquals(4, events.size)
+        assertEquals(ChatEvent.Thinking("a avaliar os dados", "a avaliar os dados"), events[0])
+        assertEquals(ChatEvent.Thinking("a avaliar os dados do peso", "a avaliar os dados do peso"), events[1])
+        assertEquals(ChatEvent.Delta("Tens 82,5 kg", "Tens 82,5 kg"), events[2])
+    }
+
+    @Test
+    fun thinking_only_turn_is_not_an_answer() = runTest {
+        // Engine that only ever emits thinking and then a blank answer →
+        // INVALID_RESPONSE (the thinking is feedback, not content).
+        val events = provider { cb ->
+            cb.onThinking("a pensar")
+            ""
+        }.stream(textRequest()).toList()
+
+        assertTrue(events.any { it is ChatEvent.Thinking })
+        val failed = events.filterIsInstance<ChatEvent.Failed>()
+        assertEquals(1, failed.size)
+        assertEquals(ChatErrorKind.INVALID_RESPONSE, failed[0].error.kind)
+    }
+
 }

@@ -80,5 +80,22 @@ data class PerformanceSnapshotEntity(
 
     // ── LLM coach report (v36) — generated async after save ──────────────────
     val coachReport: String? = null,
-    val reportGeneratedAtMs: Long? = null
+    val reportGeneratedAtMs: Long? = null,
+
+    // ── v39/v40 — which convention produced the silhouette ratios ───────────
+    /** v39 — single (legacy) normalization marker: which convention produced
+     *  the silhouette ratios ("image_height" legacy vs "pose_person_height"
+     *  pose-anchored). Kept for backward compatibility. v40 replaced it with
+     *  per-side markers because frontal and lateral can legitimately use
+     *  different conventions in the same capture. */
+    val silhouetteNormalization: String? = null,
+    /** v40 — convention that produced the FRONTAL ratios:
+     *  "image_height" (legacy) or "pose_person_height" (pose-anchored),
+     *  null = pre-v40 legacy capture. Compare frontal metrics only within
+     *  matching frontal conventions. */
+    val frontalNormalization: String? = null,
+    /** v40 — convention that produced the LATERAL ratios (same values as
+     *  [frontalNormalization]). Compare lateral metrics only within matching
+     *  lateral conventions. */
+    val lateralNormalization: String? = null
 )

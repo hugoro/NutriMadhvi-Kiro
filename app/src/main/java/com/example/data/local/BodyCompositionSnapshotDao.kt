@@ -94,6 +94,9 @@ interface BodyCompositionSnapshotDao {
     """)
     suspend fun getForSourceTimestamp(sourceTimestampMs: Long): BodyCompositionSnapshotEntity?
 
+    @Query("SELECT * FROM body_composition_snapshots WHERE id=:id")
+    suspend fun getById(id: Long): BodyCompositionSnapshotEntity?
+
     /** Deletes the row(s) for a single source timestamp. This is the ONE
      *  mutation exception to the append-only contract, used exclusively by
      *  the VitaDock sync's upgrade-in-place path: when the portal returns a

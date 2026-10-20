@@ -36,23 +36,51 @@ class FullSummaryRepairTest {
         val repaired = FullSummaryRepair.repair(broken, churrosJson, "pt-PT")!!
 
         val lines = repaired.split("\n")
-        assertEquals(2, lines.size)
+        assertEquals(6, lines.size)
         // Line 1 keeps the model's prose + appends the total (30+20+50+3=103)
         assertTrue("line1: ${lines[0]}", lines[0].startsWith("Meia dose de churros com calda de chocolate e iogurte grego aromatizado, finalizada com amêndoas laminadas"))
         assertTrue("line1: ${lines[0]}", lines[0].endsWith("(~103g)"))
-        // Line 2 is the deterministic ingredient line with per-item weights
-        assertEquals(
-            "Ingredientes visíveis: Churros (~30g), Calda de chocolate (~20g), Iogurte grego aromatizado (~50g), Amêndoas laminadas (~3g)",
-            lines[1]
-        )
+        // Line 2 is the header; lines 3-6 are one ingredient per line
+        // (2026-10-10 format, replaces the legacy comma-run line).
+        assertEquals("Ingredientes visíveis:", lines[1])
+        assertEquals("• Churros (~30g)", lines[2])
+        assertEquals("• Calda de chocolate (~20g)", lines[3])
+        assertEquals("• Iogurte grego aromatizado (~50g)", lines[4])
+        assertEquals("• Amêndoas laminadas (~3g)", lines[5])
+    }
+
+    @Test
+    fun `legacy comma-separated ingredient line is rebuilt into bullet lines`() {
+        // Pre-2026-10-10 entries carry the old one-line "A (~Xg), B (~Yg)"
+        // run. They are no longer considered compliant — heal-on-read/write
+        // rewrites them into the vertical bullet format (idempotent after).
+        val legacy = "Café com leite Vly e mini sandes de salmão fumado (~240 g total).\n" +
+            "Ingredientes visíveis: Pão de massa mãe (~20g), salmão fumado (~15g), creme de caju light (~5g), tomate (~15g), café solúvel com bebida Vly Barista (~200g).\n" +
+            "Assumido: Bebida de ervilha Vly Barista conforme padrão habitual; confiança alta."
+        val repaired = FullSummaryRepair.repair(legacy, churrosJson, "pt-PT")!!
+        val lines = repaired.split("\n")
+        assertEquals(7, lines.size)
+        assertEquals("Café com leite Vly e mini sandes de salmão fumado (~240 g total).", lines[0])
+        assertEquals("Ingredientes visíveis:", lines[1])
+        assertTrue(lines[2].startsWith("• "))
+        assertEquals("Assumido: Bebida de ervilha Vly Barista conforme padrão habitual; confiança alta.", lines[6])
+        // Idempotency: running the repair again on the rebuilt summary is a no-op.
+        assertEquals(repaired, FullSummaryRepair.repair(repaired, churrosJson, "pt-PT"))
     }
 
     // ── Non-regression: compliant summaries pass through unchanged ──────────
 
     @Test
     fun `compliant 3-line summary from gemini-3-6-flash is untouched`() {
+        // Compliant = the 2026-10-10 vertical format: header line + one
+        // "• name (~Xg)" bullet per ingredient.
         val compliant = "Café com leite Vly e mini sandes de salmão fumado (~240 g total).\n" +
-            "Ingredientes visíveis: Pão de massa mãe (~20g), salmão fumado (~15g), creme de caju light (~5g), tomate (~15g), café solúvel com bebida Vly Barista (~200g).\n" +
+            "Ingredientes visíveis:\n" +
+            "• Pão de massa mãe (~20g)\n" +
+            "• salmão fumado (~15g)\n" +
+            "• creme de caju light (~5g)\n" +
+            "• tomate (~15g)\n" +
+            "• café solúvel com bebida Vly Barista (~200g)\n" +
             "Assumido: Bebida de ervilha Vly Barista conforme padrão habitual; confiança alta."
         assertEquals(compliant, FullSummaryRepair.repair(compliant, churrosJson, "pt-PT"))
     }
@@ -102,15 +130,16 @@ class FullSummaryRepairTest {
     }
 
     @Test
-    fun `assumptions line present on last line is preserved as line 3`() {
+    fun `assumptions line present on last line is preserved as last line`() {
         val twoLines = "Koftas de carne com cuscuz e Coca-Cola Zero\n" +
             "Assumido: sem molho adicionado; confiança média — porção difícil de estimar."
         val repaired = FullSummaryRepair.repair(twoLines, churrosJson, "pt-PT")!!
         val lines = repaired.split("\n")
-        assertEquals(3, lines.size)
+        // 1 dish line + 1 header + 4 bullets + 1 assumptions line
+        assertEquals(7, lines.size)
         assertTrue("line1: ${lines[0]}", lines[0].endsWith("(~103g)"))
-        assertTrue("line2: ${lines[1]}", lines[1].startsWith("Ingredientes visíveis:"))
-        assertEquals("Assumido: sem molho adicionado; confiança média — porção difícil de estimar.", lines[2])
+        assertEquals("Ingredientes visíveis:", lines[1])
+        assertEquals("Assumido: sem molho adicionado; confiança média — porção difícil de estimar.", lines[6])
     }
 
     @Test

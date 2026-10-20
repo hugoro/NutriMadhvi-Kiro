@@ -255,13 +255,75 @@ class TtsController(context: Context) {
             s = s.replace(Regex("\\bkJ\\b"), "quilojoules")
 
             // ── Macro compact notation ────────────────────────────────────────
-            // "P30/C45/F12" → "proteína 30, carbos 45, gordura 12"
+            // "P30/C45/F12" → "proteína 30, carbos 45, gordura 12".
+            // 2026-10-05: the model very often writes the compact macros with
+            // SPACES ("P24 / C14 / F17") — the original no-space-only regex
+            // missed those and the TTS engine spelled the letters one by one.
             s = s.replace(Regex("\\bP(\\d+(?:\\.\\d+)?)/C(\\d+(?:\\.\\d+)?)/F(\\d+(?:\\.\\d+)?)\\b")) { m ->
+                "proteína ${m.groupValues[1]}, carbos ${m.groupValues[2]}, gordura ${m.groupValues[3]}"
+            }
+            s = s.replace(Regex("\\bP\\s?(\\d+(?:\\.\\d+)?)\\s*/\\s*C\\s?(\\d+(?:\\.\\d+)?)\\s*/\\s*F\\s?(\\d+(?:\\.\\d+)?)\\b")) { m ->
                 "proteína ${m.groupValues[1]}, carbos ${m.groupValues[2]}, gordura ${m.groupValues[3]}"
             }
             // "8g/45g" → "8 gramas de 45" (free-sugar / sat-fat ratio pattern)
             s = s.replace(Regex("(\\d+(?:\\.\\d+)?)g/(\\d+(?:\\.\\d+)?)g\\b")) { m ->
                 "${m.groupValues[1]} gramas de ${m.groupValues[2]}"
+            }
+
+            // ── Percentage over a quantity ───────────────────────────────────
+            // "~10% de 1900 kcal" reads fine, but "%gordura/músculo" (the
+            // "no new body-fat/muscle reading" idiom) was read as "%gordura"
+            // followed by a slash. Say it the way a presenter would.
+            s = s.replace(Regex("%\\s*(\\S+)\\s*/\\s*(\\S+)")) { m ->
+                "por cento de ${m.groupValues[1]} e ${m.groupValues[2]}"
+            }
+
+            // ── Code-like identifiers ─────────────────────────────────────────
+            // The model sometimes leaks snake_case data keys into prose
+            // ("a tua aggregate_pattern de alta performance") — the ear hears
+            // "underscore" and loses the thread.
+            s = s.replace("aggregate_pattern", "padrão agregado")
+            s = s.replace(Regex("\\b\\w+_\\w+\\b"), " ")
+
+            // ── Acronyms / English technical terms ───────────────────────────
+            // The visible reply uses them (SH, HRV, DEXA, …); the ear cannot
+            // expand them, so the script-cleaner expands the ones that appear
+            // in practice. Order: multi-letter first so SH is not eaten by a
+            // broader rule, and word-anchored so "SH" never matches inside a
+            // longer word. 2026-10-05 (chat TTS mode, camada 2).
+            s = s.replace(Regex("\\bHbA1c\\b"), "hemoglobina glicada")
+            s = s.replace(Regex("\\bHRV\\b"), "variabilidade da frequência cardíaca")
+            s = s.replace(Regex("\\bCGM\\b"), "sensor de glicose")
+            s = s.replace(Regex("\\bDEXA\\b"), "densitometria óssea")
+            s = s.replace(Regex("\\bBIA\\b"), "análise de bioimpedância")
+            s = s.replace(Regex("\\bBMR\\b"), "metabolismo basal")
+            s = s.replace(Regex("\\bTMB\\b"), "metabolismo basal")
+            s = s.replace(Regex("\\bBMI\\b"), "imc")
+            s = s.replace(Regex("\\bPPG\\b"), "sensor ótico de pulso")
+            s = s.replace(Regex("[Ss][Hh]\\b"), "relógio")
+            s = s.replace(Regex("\\bWeight machine\\b"), "máquina de pesos")
+            s = s.replace(Regex("\\bTrack running\\b"), "corrida em pista")
+            s = s.replace(Regex("\\bTrail run\\b"), "corrida em trilho")
+            s = s.replace(Regex("\\bMountain biking\\b"), "bicicleta em montanha")
+            s = s.replace(Regex("\\bPool swimming\\b"), "natação em piscina")
+            s = s.replace(Regex("\\bfast pacing walk\\b"), "caminhada rápida")
+            s = s.replace(Regex("\\bRunning\\b"), "corrida")
+
+            // ── Thousands separators ─────────────────────────────────────────
+            // pt-PT written thousands use a dot ("110.724 passos", "6.835
+            // kcal"); the engine reads it as a decimal ("cento e dez
+            // vírgula sete…") or a period pause. The locale-SAFE spelling is
+            // the bare digit string ("110724"), which every engine renders
+            // as "cento e dez mil e setecentos e vinte e quatro" — no
+            // separator char survives for the engine to misinterpret.
+            // 2026-10-05. Dates in DD/MM form were already expanded to words
+            // above, and decimals never have a 3-4 digit group after the
+            // dot, so this cannot touch them.
+            s = s.replace(Regex("(?<!\\d)\\d{1,3}(?:\\s\\d{3})+(?!\\d)")) { m ->
+                " " + m.value.replace(" ", "") + " "
+            }
+            s = s.replace(Regex("(?<!\\d)\\d{1,3}(?:\\.\\d{3,4}){1,3}(?!\\d)")) { m ->
+                " " + m.value.replace(".", "") + " "
             }
 
             // ── Percentage points ─────────────────────────────────────────────

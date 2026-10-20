@@ -230,4 +230,51 @@ class RouterStreamConsumptionTest {
         val answer = outcome as ChatOrchestrator.Companion.RouterOutcome.Answer
         assertEquals("groq:q", answer.resolvedModel)
     }
+
+    // --- 2026-10-06 (Frente Thinking) --------------------------------------
+
+    @Test
+    fun thinking_events_map_to_handle_thinking_and_stay_out_of_answer() = runTest {
+        val groqId = ProviderModelId.of("groq", "q")
+        val groq = FakeProvider("groq", "q") {
+            flow {
+                emit(ChatEvent.Thinking("a pensar…", "a pensar…"))
+                emit(ChatEvent.Thinking("a pensar no défice", "a pensar no défice"))
+                emit(ChatEvent.Delta("resposta", "resposta"))
+                emit(ChatEvent.Completed("resposta", groqId))
+            }
+        }
+        val router = ChatProviderRouter(listOf(groq), breaker())
+
+        val (outcome, events) = consume(router, resolvedModelSoFar = null)
+
+        val answer = outcome as ChatOrchestrator.Companion.RouterOutcome.Answer
+        assertEquals("resposta", answer.text)
+        // Thinking surfaced, answer text clean.
+        val thinking = events.filterIsInstance<com.example.data.chat.HandleEvent.Thinking>()
+        assertEquals(2, thinking.size)
+        assertEquals("a pensar no défice", thinking[1].text)
+        val partials = events.filterIsInstance<com.example.data.chat.HandleEvent.Partial>()
+        assertEquals(1, partials.size)
+        assertEquals("resposta", partials[0].accumulatedText)
+    }
+
+    @Test
+    fun thinking_only_turn_is_not_an_answer_even_when_provider_completes_blank() = runTest {
+        // A Completed with blank text is treated as no-answer by the seam;
+        // thinking alone must never fabricate an Answer.
+        val groqId = ProviderModelId.of("groq", "q")
+        val groq = FakeProvider("groq", "q") {
+            flow {
+                emit(ChatEvent.Thinking("a pensar…", "a pensar…"))
+                emit(ChatEvent.Completed("", groqId))
+            }
+        }
+        val router = ChatProviderRouter(listOf(groq), breaker())
+
+        val (outcome, _) = consume(router, resolvedModelSoFar = null)
+        assertFalse("blank answer + thinking is not an Answer",
+            outcome is ChatOrchestrator.Companion.RouterOutcome.Answer)
+    }
+
 }

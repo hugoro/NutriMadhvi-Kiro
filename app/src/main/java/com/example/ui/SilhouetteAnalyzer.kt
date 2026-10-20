@@ -10,7 +10,8 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 
 /** Body-zone width ratios extracted from a single silhouette mask. */
 data class SilhouetteRatios(
-    /** Zone width (foreground span) normalised by image pixel height.
+    /** Zone width (foreground span) normalised by the plan's normalizer
+     *  (image height for legacy captures, person height for pose captures).
      *  A null means that zone had < 30% row coverage — person not visible there. */
     val shoulderRatio: Float?,   // frontal: bioacromial
     val waistRatio: Float?,      // frontal
@@ -21,21 +22,26 @@ data class SilhouetteRatios(
     val lateralThighRatio: Float?, // lateral
 )
 
+/** Result of [SilhouetteAnalyzer.analysis]: the ratios plus which convention
+ *  produced them (persisted on `performance_snapshots.silhouetteNormalization`). */
+data class SilhouetteAnalysis(
+    val ratios: SilhouetteRatios,
+    val normalization: String, // SilhouetteZoneMath.NORMALIZATION_*
+)
+
 /**
  * Runs ML Kit Selfie Segmentation on [bitmap], splits the resulting foreground
- * mask into anatomical vertical zones, and returns zone width / image-height ratios.
+ * mask into anatomical vertical zones, and returns zone width ratios.
  *
  * Validated approach: Farina et al. 2022 — silhouette-based ratios correlate
  * R²=0.91–0.95 with DEXA body-fat distribution.
  *
- * Zone boundaries are defined as fixed fractions of image height (no ML Kit
- * Pose needed for the segmentation pass):
- *   0–20%  head/neck  (ignored)
- *   20–32% shoulder
- *   32–50% waist/chest (frontal=waist, lateral=chest)
- *   50–65% hip/belly   (frontal=hip, lateral=belly)
- *   65–80% thigh
- *   80–100% shin/foot  (ignored)
+ * Zone bands (see [SilhouetteZoneMath]):
+ *  - **pose path** (v39+): when a full-body pose is detected, zones are
+ *    anchored on shoulder/hip/knee landmarks and ratios are normalised by the
+ *    person's on-screen height — invariant to camera distance.
+ *  - **legacy path**: fixed fractions of the frame height, normalised by
+ *    image height (pre-v39 behavior).
  *
  * For FRONTAL photos use [isFrontal]=true (returns shoulder/waist/hip/thigh).
  * For LATERAL photos use [isFrontal]=false (returns chest/belly/thighLateral).
@@ -47,7 +53,19 @@ object SilhouetteAnalyzer {
 
     private const val MIN_ZONE_COVERAGE = 0.30f  // 30% of rows must have foreground
 
-    suspend fun analyze(bitmap: Bitmap, isFrontal: Boolean): SilhouetteRatios {
+    /** Legacy entry point — fixed frame-fraction zones, image-height
+     *  normalizer (identical output to the pre-v39 analyzer). */
+    suspend fun analyze(bitmap: Bitmap, isFrontal: Boolean): SilhouetteRatios =
+        analysis(bitmap, isFrontal, null).ratios
+
+    /** Zone extraction with optional pose landmarks. When [landmarks] is a
+     *  full-body pose the pose-normalised convention is used; otherwise the
+     *  legacy frame-fraction convention. */
+    suspend fun analysis(
+        bitmap: Bitmap,
+        isFrontal: Boolean,
+        landmarks: Map<Int, com.google.mlkit.vision.pose.PoseLandmark>?,
+    ): SilhouetteAnalysis {
         val mask = runSegmentation(bitmap)
         val w = mask.width
         val h = mask.height
@@ -66,23 +84,18 @@ object SilhouetteAnalyzer {
         }
         mask.recycle()
 
-        fun zoneRatio(startFrac: Float, endFrac: Float): Float? {
-            val r0 = (h * startFrac).toInt().coerceIn(0, h - 1)
-            val r1 = (h * endFrac).toInt().coerceIn(0, h - 1)
-            val zoneRows = r1 - r0 + 1
-            if (zoneRows <= 0) return null
-            val coveredRows = (r0..r1).count { rowSpan[it] > 0 }
-            if (coveredRows.toFloat() / zoneRows < MIN_ZONE_COVERAGE) return null
-            val meanSpan = (r0..r1).sumOf { rowSpan[it].toLong() }.toFloat() / zoneRows
-            return meanSpan / h
+        val plan = SilhouetteZoneMath.plan(isFrontal, h, landmarks?.toLandmarkKeys())
+        fun ratio(zone: String): Float? {
+            val band = plan.bands[zone] ?: return null
+            return SilhouetteZoneMath.zoneRatio(rowSpan, band, plan.normalizer, MIN_ZONE_COVERAGE)
         }
 
-        return if (isFrontal) {
+        val ratios = if (isFrontal) {
             SilhouetteRatios(
-                shoulderRatio      = zoneRatio(0.20f, 0.32f),
-                waistRatio         = zoneRatio(0.38f, 0.52f),
-                hipRatio           = zoneRatio(0.52f, 0.65f),
-                thighRatio         = zoneRatio(0.65f, 0.78f),
+                shoulderRatio      = ratio(SilhouetteZoneMath.SHOULDER),
+                waistRatio         = ratio(SilhouetteZoneMath.WAIST),
+                hipRatio           = ratio(SilhouetteZoneMath.HIP),
+                thighRatio         = ratio(SilhouetteZoneMath.THIGH),
                 chestRatio         = null,
                 bellyRatio         = null,
                 lateralThighRatio  = null,
@@ -93,11 +106,12 @@ object SilhouetteAnalyzer {
                 waistRatio         = null,
                 hipRatio           = null,
                 thighRatio         = null,
-                chestRatio         = zoneRatio(0.30f, 0.50f),
-                bellyRatio         = zoneRatio(0.50f, 0.65f),
-                lateralThighRatio  = zoneRatio(0.65f, 0.78f),
+                chestRatio         = ratio(SilhouetteZoneMath.CHEST),
+                bellyRatio         = ratio(SilhouetteZoneMath.BELLY),
+                lateralThighRatio  = ratio(SilhouetteZoneMath.LATERAL_THIGH),
             )
         }
+        return SilhouetteAnalysis(ratios, plan.normalization)
     }
 
     // ── ML Kit Segmentation bridge ───────────────────────────────────────────

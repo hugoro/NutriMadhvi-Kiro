@@ -102,6 +102,9 @@ class GeminiChatProvider(
                 is StreamChunk.Partial ->
                     emit(ChatEvent.Delta(chunk.deltaText, chunk.accumulatedSoFar))
 
+                is StreamChunk.Thought ->
+                    emit(ChatEvent.Thinking(chunk.deltaText, chunk.accumulatedSoFar))
+
                 is StreamChunk.Done ->
                     emit(
                         ChatEvent.Completed(

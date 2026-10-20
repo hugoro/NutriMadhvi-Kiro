@@ -34,6 +34,27 @@ sealed interface ChatEvent {
     ) : ChatEvent
 
     /**
+     * 2026-10-06 (Frente Thinking) — extended-thinking fragment: the model's
+     *  reasoning, streamed (usually) before the answer text. [text] is the
+     *  fragment; [accumulated] is the full thinking text so far this turn.
+     *
+     *  UI feedback ONLY: never persisted, never part of the answer, and a
+     *  well-behaved provider keeps it OUT of [Delta]/[Completed] (Gemini's
+     *  `thought: true` parts and Qwen's `delta.reasoning` field map here,
+     *  not to [Delta]). The router forwards these transparently (they
+     *  neither commit output nor trigger [Reset] logic), and the consumer
+     *  may drop them when reasoning display is not wanted.
+     *
+     *  Sequencing: Thinking fragments may appear before the first [Delta]
+     *  (the common case) and in principle interleaved — they are pure
+     *  side-channel feedback and carry no §13 commit semantics.
+     */
+    data class Thinking(
+        val text: String,
+        val accumulated: String,
+    ) : ChatEvent
+
+    /**
      * A mid-stream failover boundary (plan §13 "replace the transient buffer").
      * Emitted ONLY by [ChatProviderRouter] when a provider dies *after* it had
      * already streamed partial output and a healthy fallback exists. The

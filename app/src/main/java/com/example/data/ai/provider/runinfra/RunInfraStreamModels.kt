@@ -19,6 +19,12 @@ import com.squareup.moshi.JsonClass
  * it, so it is omitted rather than sent speculatively. Endpoint and model id
  * are validated live before promotion (§9 items 1–2).
  *
+ * 2026-10-06 (Frente Thinking) correction: a live probe (api.runinfra.ai,
+ * model qwen3-8-27b) showed the endpoint DOES accept `reasoning_effort` and
+ * streams the reasoning in `delta.reasoning_content` (OpenAI convention;
+ * Groq uses `delta.reasoning`). The field is now sent — `low` for chat,
+ * `none` for structured turns — so the thinking card works on this link too.
+ *
  * Text-only: chat streaming carries plain-text `content` (a `String`), never
  * the multimodal content-part array — RunInfra must not receive image-required
  * turns (§18; "Do not route Vision through RunInfra", §16/§17).
@@ -31,6 +37,12 @@ data class RunInfraStreamRequest(
     @Json(name = "temperature") val temperature: Double? = null,
     @Json(name = "top_p") val topP: Double? = null,
     @Json(name = "max_tokens") val maxTokens: Int? = null,
+    /** 2026-10-06 (Frente Thinking) — verified live: RunInfra DOES accept
+     *  `reasoning_effort` and streams Qwen's reasoning in the
+     *  `delta.reasoning_content` field (see [RunInfraStreamDelta]). `low`
+     *  for chat turns, `none` for structured output (JSON answer, no
+     *  thinking budget). */
+    @Json(name = "reasoning_effort") val reasoningEffort: String? = null,
     /** Ask for a trailing usage chunk so token accounting needs no 2nd call. */
     @Json(name = "stream_options") val streamOptions: RunInfraStreamOptions? =
         RunInfraStreamOptions(includeUsage = true),
@@ -71,6 +83,11 @@ data class RunInfraStreamChoice(
 @JsonClass(generateAdapter = true)
 data class RunInfraStreamDelta(
     @Json(name = "content") val content: String? = null,
+    /** 2026-10-06 (Frente Thinking) — RunInfra uses the OpenAI-convention
+     *  field name `reasoning_content` for Qwen's reasoning (Groq uses
+     *  `reasoning`). Separate channel from [content]: thinking feeds the
+     *  live card, never the persisted answer. */
+    @Json(name = "reasoning_content") val reasoningContent: String? = null,
 )
 
 @JsonClass(generateAdapter = true)

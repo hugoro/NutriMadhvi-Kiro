@@ -84,12 +84,14 @@ class GroqChatProviderTest {
         assertEquals(70, done.usage?.totalTokens)
 
         // Request shaping: system message first, then user; stream=true;
-        // reasoning_effort=none (latency); no response_format for plain text.
+        // reasoning_effort=low (2026-10-06: the thinking streams in
+        // delta.reasoning, so the reasoning pass no longer costs latency in
+        // the answer text); no response_format for plain text.
         assertEquals("system", captured?.messages?.get(0)?.role)
         assertEquals("És a NutriMadhvi. PT-PT.", captured?.messages?.get(0)?.content)
         assertEquals("user", captured?.messages?.get(1)?.role)
         assertTrue(captured?.stream == true)
-        assertEquals("none", captured?.reasoningEffort)
+        assertEquals("low", captured?.reasoningEffort)
         assertNull(captured?.responseFormat)
     }
 
@@ -187,4 +189,44 @@ class GroqChatProviderTest {
         assertEquals("json_object", captured?.responseFormat?.type)
         assertEquals(512, captured?.maxTokens)
     }
+
+    // --- 2026-10-06 (Frente Thinking) --------------------------------------
+
+    @Test
+    fun reasoning_chunks_map_to_thinking_never_delta() = runTest {
+        val p = provider { _, _ ->
+            flow {
+                emit(GroqStreamChunk.Reasoning("Vou ", "Vou "))
+                emit(GroqStreamChunk.Reasoning("ver as refeições", "Vou ver as refeições"))
+                emit(GroqStreamChunk.Partial("Comeste 1800 kcal", "Comeste 1800 kcal"))
+                emit(GroqStreamChunk.Done("Comeste 1800 kcal", "stop"))
+            }
+        }
+        val events = p.stream(textRequest()).toList()
+
+        assertEquals(4, events.size)
+        assertEquals(ChatEvent.Thinking("Vou ", "Vou "), events[0])
+        assertEquals(ChatEvent.Thinking("ver as refeições", "Vou ver as refeições"), events[1])
+        // The answer text is clean: thinking never merged into content.
+        assertEquals(ChatEvent.Delta("Comeste 1800 kcal", "Comeste 1800 kcal"), events[2])
+        val completed = events[3] as ChatEvent.Completed
+        assertEquals("Comeste 1800 kcal", completed.fullText)
+    }
+
+    @Test
+    fun reasoning_effort_is_low_for_chat_none_for_structured() = runTest {
+        var captured: GroqStreamRequest? = null
+        val p = provider { _, req ->
+            captured = req
+            flowOf(GroqStreamChunk.Done("ok", "stop"))
+        }
+        p.stream(textRequest()).toList()
+        assertEquals("low", captured?.reasoningEffort)
+
+        captured = null
+        val req = textRequest().copy(generation = ChatGeneration(structured = true, maxOutputTokens = 512))
+        p.stream(req).toList()
+        assertEquals("none", captured?.reasoningEffort)
+    }
+
 }

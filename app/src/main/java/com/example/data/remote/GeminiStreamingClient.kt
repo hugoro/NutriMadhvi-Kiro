@@ -37,6 +37,12 @@ sealed class StreamChunk {
      *  (NOT replace) — Gemini emits incrementals. */
     data class Partial(val deltaText: String, val accumulatedSoFar: String) : StreamChunk()
 
+    /** 2026-10-06 (Frente Thinking) — extended-thinking fragment (a
+     *  `thought: true` part), streamed BEFORE the answer when the request
+     *  sets `includeThoughts`. Excluded from [Partial]/[Done] text — the
+     *  thinking is UI feedback, not part of the persisted answer. */
+    data class Thought(val deltaText: String, val accumulatedSoFar: String) : StreamChunk()
+
     /** Final accumulated text. Emitted only when Gemini's final candidate
      *  reported [finishReason] == "STOP". Any other value (`MAX_TOKENS`,
      *  `SAFETY`, `RECITATION`, `OTHER`, or the socket closing without ever
@@ -141,6 +147,7 @@ object GeminiStreamingClient {
                 var finishReason: String? = null
                 var truncatedRead = false
                 var lastUsage: UsageMetadata? = null
+                val thoughtText = StringBuilder()
                 while (!source.exhausted()) {
                     val line = source.readUtf8Line()
                     if (line == null) {
@@ -166,10 +173,19 @@ object GeminiStreamingClient {
                     val cand = resp.candidates?.firstOrNull()
                     cand?.finishReason?.let { finishReason = it }
                     resp.usageMetadata?.let { lastUsage = it }
-                    val delta = cand?.content?.parts?.firstOrNull()?.text
+                    val part = cand?.content?.parts?.firstOrNull()
+                    val delta = part?.text
                     if (delta != null) {
-                        fullText.append(delta)
-                        trySend(StreamChunk.Partial(delta, fullText.toString()))
+                        if (part?.thought == true) {
+                            // Extended-thinking fragment — route to the
+                            // Thought channel (live reasoning UI), never into
+                            // the answer text that gets persisted.
+                            thoughtText.append(delta)
+                            trySend(StreamChunk.Thought(delta, thoughtText.toString()))
+                        } else {
+                            fullText.append(delta)
+                            trySend(StreamChunk.Partial(delta, fullText.toString()))
+                        }
                     }
                 }
 

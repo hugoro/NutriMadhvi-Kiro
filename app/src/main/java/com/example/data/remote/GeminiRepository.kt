@@ -152,7 +152,7 @@ Rules specific to multiline (in addition to the general rules above):
 - The top KPI tiles ARE the "headline number" — DO NOT also state them verbatim in the surrounding prose. Instead, spend those sentences on interpretation ("the trajectory is consistent — 6 readings, monotonic loss") rather than repeating the KPIs.
 """
 
-class GeminiRepository(
+open class GeminiRepository(
     private val chatDao: ChatDao,
     private val foodDao: FoodDao,
     private val activityDao: ActivityDao,
@@ -175,6 +175,8 @@ class GeminiRepository(
     private val performanceSnapshotDao: com.example.data.local.PerformanceSnapshotDao? = null,
     /** Performance goals DAO (schema v37). Optional for same reason. */
     private val performanceGoalDao: com.example.data.local.PerformanceGoalDao? = null,
+    /** Body-plan checkpoints DAO (schema v39). Optional for same reason. */
+    private val bodyPlanCheckpointDao: com.example.data.local.BodyPlanCheckpointDao? = null,
 ) {
 
     /** Aggregates the correction-gap history into a directional calibration
@@ -486,8 +488,9 @@ class GeminiRepository(
     }
 
     /** Calls Gemini (text-only, ~180-word output) to produce the silhouette coach report.
-     *  Returns null on API key misconfiguration or hard failure. */
-    suspend fun generateCoachReport(prompt: String): String? {
+     *  Returns null on API key misconfiguration or hard failure.
+     *  [open] so headless ViewModel tests can stub the network call. */
+    suspend open fun generateCoachReport(prompt: String): String? {
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") return null
         val request = GeminiRequest(
@@ -497,6 +500,80 @@ class GeminiRepository(
         return generateContentWithFallback(apiKey, "gemini-3.5-flash", request, "pt")
             .getOrNull()
     }
+
+    /**
+     * Low-cost structured call for the body-plan system (v39): routine
+     * extraction/reporting routed through [com.example.data.ai.ModelRoles.ROUTINE_CHAIN]
+     * (flash-lite primary → flash compatibility fallback). NOT the vision
+     * cascade — this is a text-only, short-output call, so the cheapest
+     * capable model first. On hard failure [BodyPlanLlmResult.text] is null
+     * (the caller then falls back to deterministic tactics). [BodyPlanLlmResult.modelUsed]
+     * names the model that actually produced the text so the caller can
+     * persist real "llm:<model>" traceability.
+     */
+    suspend open fun generateBodyPlanContent(
+        prompt: String,
+        language: String
+    ): BodyPlanLlmResult {
+        val apiKey = BuildConfig.GEMINI_API_KEY
+        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
+            return BodyPlanLlmResult(text = null, modelUsed = null)
+        }
+        val request = GeminiRequest(
+            contents = listOf(Content(parts = listOf(Part(text = prompt)))),
+            generationConfig = GenerationConfig(temperature = 0.3f),
+        )
+        return generateWithModelChain(apiKey, com.example.data.ai.ModelRoles.ROUTINE_CHAIN, request, language)
+            .fold(
+                onSuccess = { BodyPlanLlmResult(text = it.text, modelUsed = it.modelUsed) },
+                onFailure = { BodyPlanLlmResult(text = null, modelUsed = null) },
+            )
+    }
+
+    // ── Body-plan checkpoints (schema v39) ──────────────────────────────────
+
+    suspend fun insertBodyPlanCheckpoint(
+        checkpoint: com.example.data.local.BodyPlanCheckpointEntity
+    ): Long = bodyPlanCheckpointDao?.insert(checkpoint) ?: -1L
+
+    fun observeAllBodyPlanCheckpoints(): kotlinx.coroutines.flow.Flow<List<com.example.data.local.BodyPlanCheckpointEntity>> =
+        bodyPlanCheckpointDao?.observeAll()
+            ?: kotlinx.coroutines.flow.flowOf(emptyList())
+
+    suspend fun latestBodyPlanCheckpoint(): com.example.data.local.BodyPlanCheckpointEntity? =
+        bodyPlanCheckpointDao?.latest()
+
+    suspend fun recentBodyPlanCheckpoints(limit: Int = 4): List<com.example.data.local.BodyPlanCheckpointEntity> =
+        bodyPlanCheckpointDao?.recent(limit) ?: emptyList()
+
+    suspend fun updateBodyPlanCheckpointTactics(id: Long, json: String, source: String) {
+        bodyPlanCheckpointDao?.updateTactics(id, json, source)
+    }
+
+    suspend fun updateBodyPlanCheckpointReport(id: Long, report: String, ts: Long) {
+        bodyPlanCheckpointDao?.updateReport(id, report, ts)
+    }
+
+    suspend fun bodyPlanCheckpointById(id: Long): com.example.data.local.BodyPlanCheckpointEntity? =
+        bodyPlanCheckpointDao?.getById(id)
+
+    suspend fun bodyPlanCheckpointBySnapshotId(snapshotId: Long): com.example.data.local.BodyPlanCheckpointEntity? =
+        bodyPlanCheckpointDao?.getBySnapshotId(snapshotId)
+
+    suspend fun latestBodyPlanCheckpointBefore(checkpointAtMs: Long): com.example.data.local.BodyPlanCheckpointEntity? =
+        bodyPlanCheckpointDao?.latestBefore(checkpointAtMs)
+
+    /** Idempotent one-checkpoint-per-snapshot insert (v40). Returns the
+     *  existing checkpoint's id when the snapshot already has one. */
+    suspend fun insertBodyPlanCheckpointIfAbsent(
+        checkpoint: com.example.data.local.BodyPlanCheckpointEntity
+    ): Long = bodyPlanCheckpointDao?.insertIfAbsentBySnapshotId(checkpoint) ?: -1L
+
+    suspend fun performanceSnapshotById(id: Long): com.example.data.local.PerformanceSnapshotEntity? =
+        performanceSnapshotDao?.getById(id)
+
+    suspend fun bodyCompositionSnapshotById(id: Long): com.example.data.local.BodyCompositionSnapshotEntity? =
+        bodyCompositionSnapshotDao.getById(id)
 
     // Phase E: persistent user-insight API. The data-card builder reads from
     // topConfirmedInsights() each turn; the chat parser writes pending or
@@ -868,9 +945,34 @@ class GeminiRepository(
             "gemini-3.5-flash",
             "gemini-3.5-flash-lite",
         ).distinct()
+        return generateWithModelChain(apiKey, models, request, language).map { it.text }
+    }
+
+    /** Result of a model-chain call: the text AND which model actually
+     *  produced it (traceability — persisted as "llm:<model>" in
+     *  body_plan_checkpoints.tacticSource). */
+    data class LlmChainOutcome(val text: String, val modelUsed: String)
+
+    /** Result of the body-plan routine call. [text] null = hard failure
+     *  (no key / network / all models failed); [modelUsed] null with it. */
+    data class BodyPlanLlmResult(val text: String?, val modelUsed: String?)
+
+    /**
+     * Non-streaming text call against an explicit, ordered model chain with
+     * per-model retry/backoff on transient errors. Shared by the vision
+     * cascade ([generateContentWithFallback]) and the low-cost routine
+     * structured-work paths (body plan, [generateBodyPlanContent]) that
+     * route through [com.example.data.ai.ModelRoles].
+     */
+    private suspend fun generateWithModelChain(
+        apiKey: String,
+        modelChain: List<String>,
+        request: GeminiRequest,
+        language: String
+    ): Result<LlmChainOutcome> {
         var lastError: Exception? = null
 
-        for ((index, modelName) in models.withIndex()) {
+        for ((index, modelName) in modelChain.withIndex()) {
             val maxAttempts = if (index == 0) 3 else 2
             for (attempt in 1..maxAttempts) {
                 try {
@@ -903,7 +1005,7 @@ class GeminiRepository(
                         break
                     }
                     
-                    return Result.success(rawText)
+                    return Result.success(LlmChainOutcome(text = rawText, modelUsed = modelName))
                 } catch (e: Exception) {
                     lastError = e
                     val isRateLimit = e is retrofit2.HttpException && isTransientCode(e.code())
@@ -1486,6 +1588,233 @@ If you used any of the patterns above, return their numeric ids in an "appliedHa
         """.trimIndent()
     }
 
+    /**
+     * Build prompt for analyzing LEFTOVERS (food remaining on plate after a meal).
+     * Clone of [buildFoodReanalysisPromptCore] adapted for the "register leftovers" flow.
+     *
+     * Key differences from re-analysis prompt:
+     * - Shows original meal macros as REFERENCE (not "previous estimate to ignore")
+     * - Instructs model to analyze ONLY what's LEFT, not the full meal
+     * - Lists original ingredient names to help model match names consistently
+     * - Explains that consumed = original - leftovers will be computed by caller
+     *
+     * @param currentEntry The original FoodEntry (full meal before eating)
+     * @param language User's language for prompt localization
+     * @param habitsBlock Habits prompt block (less relevant for leftovers but included for consistency)
+     * @return Prompt string for Gemini API
+     */
+    internal fun buildLeftoversPromptCore(
+        currentEntry: FoodEntry,
+        language: String,
+        habitsBlock: String
+    ): String {
+        // Build original meal context block
+        val originalBlock = buildString {
+            appendLine("ORIGINAL MEAL (for reference):")
+            appendLine("- Name: \"${currentEntry.name}\"")
+            appendLine("- Description: \"${currentEntry.fullSummary}\"")
+            val freeSugPart = currentEntry.freeSugarsG
+                ?.let { ", ${it}g free sugars" }
+                ?: ""
+            val satFatPart = currentEntry.saturatedFatG
+                ?.let { ", ${it}g saturated fat" }
+                ?: ""
+            appendLine(
+                "- ORIGINAL macros (full meal): ${currentEntry.calories} kcal, " +
+                    "${currentEntry.protein}g protein, ${currentEntry.carbs}g carbs, " +
+                    "${currentEntry.fat}g fat$freeSugPart$satFatPart"
+            )
+
+            // Parse and list original ingredient names to help model match
+            val origIngredients = parseIngredientsJsonSafe(currentEntry.ingredientsJson)
+            if (origIngredients.isNotEmpty()) {
+                appendLine("- Original ingredients: ${origIngredients.joinToString { it.name }}")
+            }
+            appendLine()
+        }
+
+        return """
+            You are analyzing the LEFTOVERS from a meal (food remaining on the plate after eating, NOT consumed).
+
+            The attached photo shows ONLY what remained uneaten. Your task:
+            1. Identify each ingredient visible in the LEFTOVERS
+            2. Estimate the quantity of each leftover ingredient (in grams)
+            3. Calculate macros for the LEFTOVERS
+
+            CRITICAL INSTRUCTIONS:
+            - Analyze ONLY what you see in the photo (the leftovers). Do NOT analyze the original meal.
+            - If you see a nearly empty plate, the leftovers are very small (e.g., 20-50g total).
+            - If you see a still-full plate, the leftovers are large (e.g., 200-400g total).
+            - Try to match ingredient names with the original ingredients listed above (e.g., if the original had "arroz basmati integral" and you see rice in the leftovers, call it "arroz basmati integral").
+            - If you cannot identify an ingredient confidently, omit it — do not invent.
+            - The system will automatically compute: meal_consumed = original - leftovers.
+            $habitsBlock
+
+            INTERNAL CHECKLIST (think through these steps silently before emitting JSON):
+              1. Estimate portions for each visible leftover ingredient.
+              2. List every leftover ingredient with individual gram weights.
+              3. Compute per-ingredient macros from each weight using standard reference values (USDA / CIQUAL).
+                 Raw whole produce carries near-zero fat: fruit and non-starchy vegetables (papaya/papaia, melon, apple, banana, berries, orange, grapes, tomato, cucumber, lettuce, spinach, carrot, pepper…) MUST get < 0.3 g fat per 100 g UNLESS there is visible added oil, dressing, cheese, or nuts. (Avocado, coconut, olives, and nuts/seeds are the fatty exceptions.) Zero-fat beverages carry NO fat: water, black coffee/tea, soft drinks / sodas (Coca-Cola, refrigerantes, incl. diet/zero), and fruit juices MUST get 0 g fat and 0 g saturatedFatG. (Milk, lattes, milkshakes, and smoothies DO carry fat — those are the exception.) Do NOT spread the meal's total fat evenly across ingredients — attribute fat to its real sources (oils, dairy, meat, nuts, fatty fish).
+              4. Sum the per-ingredient macros and verify totals (≤5% drift).
+              5. Self-rate confidence ("low" | "medium" | "high"). Use "low" or "medium" when lighting is poor or portions are unclear.
+              6. Estimate freeSugarsG for leftovers. Same WHO definition: free sugars = mono/disaccharides ADDED to foods + sugars naturally present in honey, syrups, and fruit juices. Whole fruit, vegetables, unsweetened dairy, and starches do NOT count. Must satisfy `0 ≤ freeSugarsG ≤ carbs`. **Every entry in `ingredients` must ALSO emit `freeSugarsG` clamped against ingredient's own `carbs`.**
+              7. Estimate saturatedFatG for leftovers. Must satisfy `0 ≤ saturatedFatG ≤ fat`. **Every entry in `ingredients` must ALSO emit `saturatedFatG` clamped against ingredient's own `fat`.**
+
+            You MUST return a JSON structure matching this model exactly, without backticks, preamble, or markdown blocks:
+            {
+              "name": "Sobras de ${currentEntry.name}",
+              "mealCategory": "Snack",
+              "calories": 120,
+              "protein": 5.0,
+              "carbs": 15.0,
+              "fat": 3.0,
+              "freeSugarsG": 2.0,
+              "saturatedFatG": 1.0,
+              "fullSummary": "<three lines separated by literal \\n>",
+              "confidence": "low|medium|high",
+              "appliedHabitIds": [],
+              "ingredients": [
+                { "name": "arroz basmati integral", "weightGrams": 50, "calories": 65, "protein": 1.5, "carbs": 14.0, "fat": 0.5, "saturatedFatG": 0.1, "freeSugarsG": 0.0 }
+              ]
+            }
+
+            fullSummary FORMAT (exactly 3 lines, separated by the literal two-character escape \n inside the JSON string):
+              Line 1: "Sobras: <ingredient1> (~Xg), <ingredient2> (~Yg)"
+              Line 2: "<INGREDIENTS_LABEL>: <ingredient1> (~Xg), <ingredient2> (~Yg)"
+              Line 3: "<ASSUMED_LABEL>: <assumptions>; <CONFIDENCE_LABEL> <low|medium|high translated>"
+
+            Field emission order: "name", "mealCategory", calories/protein/carbs/fat, "freeSugarsG", "saturatedFatG", "fullSummary", "confidence", "appliedHabitIds", "ingredients".
+
+            Ensure macro grams are double values and calories is an integer. weightGrams in ingredients is the actual portion weight (not per-100g). Translate ingredient names into the user's language.
+
+            ${originalBlock}
+            ${languageInstruction(language)}
+            ${summaryLabelInstruction(language)}
+        """.trimIndent()
+    }
+
+    /**
+     * Build prompt for analyzing leftovers from text description (no photo).
+     * The user edited the leftover card text; the AI re-estimates those leftovers
+     * so the system can re-subtract from the original meal.
+     *
+     * @param currentEntry The original FoodEntry (full meal before eating)
+     * @param leftoversText User-edited text describing the leftovers
+     * @param language User's language for prompt localization
+     * @param habitsBlock Habits prompt block (included for consistency)
+     * @return Prompt string for Gemini API
+     */
+    internal fun buildLeftoversPromptCoreFromText(
+        currentEntry: FoodEntry,
+        leftoversText: String,
+        language: String,
+        habitsBlock: String
+    ): String {
+        // Build original meal context block (same as photo-based prompt)
+        val originalBlock = buildString {
+            appendLine("ORIGINAL MEAL (for reference):")
+            appendLine("- Name: \"${currentEntry.name}\"")
+            appendLine("- Description: \"${currentEntry.fullSummary}\"")
+            val freeSugPart = currentEntry.freeSugarsG
+                ?.let { ", ${it}g free sugars" }
+                ?: ""
+            val satFatPart = currentEntry.saturatedFatG
+                ?.let { ", ${it}g saturated fat" }
+                ?: ""
+            appendLine(
+                "- ORIGINAL macros (full meal): ${currentEntry.calories} kcal, " +
+                    "${currentEntry.protein}g protein, ${currentEntry.carbs}g carbs, " +
+                    "${currentEntry.fat}g fat$freeSugPart$satFatPart"
+            )
+
+            // Parse and list original ingredient names to help model match
+            val origIngredients = parseIngredientsJsonSafe(currentEntry.ingredientsJson)
+            if (origIngredients.isNotEmpty()) {
+                appendLine("- Original ingredients: ${origIngredients.joinToString { it.name }}")
+            }
+            appendLine()
+        }
+
+        return """
+            You are analyzing the LEFTOVERS from a meal (food remaining on the plate after eating, NOT consumed).
+
+            The user listed the LEFTOVERS (food NOT eaten) below as text. Your task:
+            1. Estimate macros for EACH listed leftover ingredient and its weight
+            2. Do NOT analyze the original meal — only the listed leftovers
+            3. The system will compute: meal_consumed = original - leftovers
+
+            LEFTOVERS (as described by the user):
+            $leftoversText
+
+            CRITICAL INSTRUCTIONS:
+            - Analyze ONLY the leftovers listed above. Do NOT analyze the original meal.
+            - Try to match ingredient names with the original ingredients listed below (e.g., if the original had "arroz basmati integral" and the leftovers mention "arroz", call it "arroz basmati integral").
+            - If you cannot identify an ingredient confidently, omit it — do not invent.
+            - The system will automatically compute: meal_consumed = original - leftovers.
+            $habitsBlock
+
+            INTERNAL CHECKLIST (think through these steps silently before emitting JSON):
+              1. Estimate portions for each listed leftover ingredient.
+              2. List every leftover ingredient with individual gram weights.
+              3. Compute per-ingredient macros from each weight using standard reference values (USDA / CIQUAL).
+                 Raw whole produce carries near-zero fat: fruit and non-starchy vegetables (papaya/papaia, melon, apple, banana, berries, orange, grapes, tomato, cucumber, lettuce, spinach, carrot, pepper…) MUST get < 0.3 g fat per 100 g UNLESS there is visible added oil, dressing, cheese, or nuts. (Avocado, coconut, olives, and nuts/seeds are the fatty exceptions.) Zero-fat beverages carry NO fat: water, black coffee/tea, soft drinks / sodas (Coca-Cola, refrigerantes, incl. diet/zero), and fruit juices MUST get 0 g fat and 0 g saturatedFatG. (Milk, lattes, milkshakes, and smoothies DO carry fat — those are the exception.) Do NOT spread the meal's total fat evenly across ingredients — attribute fat to its real sources (oils, dairy, meat, nuts, fatty fish).
+              4. Sum the per-ingredient macros and verify totals (≤5% drift).
+              5. Self-rate confidence ("low" | "medium" | "high"). Use "low" or "medium" when text is unclear or portions are ambiguous.
+              6. Estimate freeSugarsG for leftovers. Same WHO definition: free sugars = mono/disaccharides ADDED to foods + sugars naturally present in honey, syrups, and fruit juices. Whole fruit, vegetables, unsweetened dairy, and starches do NOT count. Must satisfy `0 ≤ freeSugarsG ≤ carbs`. **Every entry in `ingredients` must ALSO emit `freeSugarsG` clamped against ingredient's own `carbs`.**
+              7. Estimate saturatedFatG for leftovers. Must satisfy `0 ≤ saturatedFatG ≤ fat`. **Every entry in `ingredients` must ALSO emit `saturatedFatG` clamped against ingredient's own `fat`.**
+
+            You MUST return a JSON structure matching this model exactly, without backticks, preamble, or markdown blocks:
+            {
+              "name": "Sobras de ${currentEntry.name}",
+              "mealCategory": "Snack",
+              "calories": 120,
+              "protein": 5.0,
+              "carbs": 15.0,
+              "fat": 3.0,
+              "freeSugarsG": 2.0,
+              "saturatedFatG": 1.0,
+              "fullSummary": "<three lines separated by literal \\n>",
+              "confidence": "low|medium|high",
+              "appliedHabitIds": [],
+              "ingredients": [
+                { "name": "arroz basmati integral", "weightGrams": 50, "calories": 65, "protein": 1.5, "carbs": 14.0, "fat": 0.5, "saturatedFatG": 0.1, "freeSugarsG": 0.0 }
+              ]
+            }
+
+            fullSummary FORMAT (exactly 3 lines, separated by the literal two-character escape \n inside the JSON string):
+              Line 1: "Sobras: <ingredient1> (~Xg), <ingredient2> (~Yg)"
+              Line 2: "<INGREDIENTS_LABEL>: <ingredient1> (~Xg), <ingredient2> (~Yg)"
+              Line 3: "<ASSUMED_LABEL>: <assumptions>; <CONFIDENCE_LABEL> <low|medium|high translated>"
+
+            Field emission order: "name", "mealCategory", calories/protein/carbs/fat, "freeSugarsG", "saturatedFatG", "fullSummary", "confidence", "appliedHabitIds", "ingredients".
+
+            Ensure macro grams are double values and calories is an integer. weightGrams in ingredients is the actual portion weight (not per-100g). Translate ingredient names into the user's language.
+
+            ${originalBlock}
+            ${languageInstruction(language)}
+            ${summaryLabelInstruction(language)}
+        """.trimIndent()
+    }
+
+    /**
+     * Parse ingredientsJson string to List<IngredientDto>, returning empty list on failure.
+     * Helper for buildLeftoversPromptCore.
+     */
+    private fun parseIngredientsJsonSafe(json: String?): List<IngredientDto> {
+        if (json.isNullOrBlank()) return emptyList()
+        return try {
+            val type = com.squareup.moshi.Types.newParameterizedType(
+                List::class.java,
+                IngredientDto::class.java
+            )
+            val adapter = com.squareup.moshi.Moshi.Builder().build()
+                .adapter<List<IngredientDto>>(type)
+            adapter.fromJson(json) ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
     suspend fun analyzeFoodImage(
         base64Image: String?,
         mimeType: String = "image/jpeg",
@@ -1769,6 +2098,40 @@ If you used any of the patterns above, return their numeric ids in an "appliedHa
             sessionType = sessionType
         )
         return chatDao.insertSession(session)
+    }
+
+    /**
+     * 2026-10-05 (chat TTS mode) — one-shot repair for sessions whose stored
+     *  systemInstruction predates the TTS-mode persona (no [TTS_SUMMARY]
+     *  spoken-script rules). Rewrites the prompt column to [freshInstruction]
+     *  and clears the server-side cachedContent reference so the next turn
+     *  re-creates the cache with the NEW prompt.
+     *
+     *  Data-safety: touches ONLY `chat_sessions.systemInstruction` and
+     *  `chat_sessions.cachedContentName` for a single row — no messages,
+     *  no schema, no destructive path. No-op when the stored prompt already
+     *  contains the marker (refresh fires exactly once per session).
+     *
+     *  @return the stale cache name that was dropped (caller may delete it
+     *          server-side best-effort), or null when no refresh was needed.
+     */
+    suspend fun refreshStaleSystemInstruction(
+        session: com.example.data.local.ChatSession,
+        freshInstruction: String
+    ): String? {
+        val stored = session.systemInstruction
+        if (stored.contains(com.example.data.chat.TtsPromptConstants.TTS_SUMMARY_MARKER)) return null
+        android.util.Log.i(
+            "CHAT_PROMPT_REFRESH",
+            "stale prompt detected (no TTS marker; stored=${stored.length}chars) — " +
+                "refreshing session=${session.id} fresh=${freshInstruction.length}chars"
+        )
+        chatDao.updateSession(session.copy(systemInstruction = freshInstruction))
+        val staleCache = session.cachedContentName
+        if (!staleCache.isNullOrBlank()) {
+            chatDao.updateCachedContentName(session.id, null)
+        }
+        return staleCache
     }
 
     suspend fun updateSession(session: ChatSession) {

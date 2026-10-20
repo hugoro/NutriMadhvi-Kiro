@@ -4,6 +4,9 @@ import com.example.BuildConfig
 import com.example.data.local.ActivityEntry
 import com.example.data.local.FoodEntry
 import com.example.data.local.MealCategory
+import com.example.data.local.decodeLeftoverSnapshot
+import com.example.data.local.toLeftoverSnapshot
+import com.example.data.local.encode
 import com.example.data.meal.ensemble.EnsembleAnalysisOrchestrator
 import com.example.data.meal.ensemble.EnsembleConfig
 import com.example.data.meal.ensemble.EnsembleMode
@@ -1146,6 +1149,537 @@ class MealAnalysisOrchestrator(
         )
     }
 
+    /**
+     * Streaming analysis of LEFTOVERS from TEXT (user edited the leftover card).
+     * The AI re-estimates macros for the described leftovers so the system can
+     * re-subtract from the original meal (snapshot). Text-only variant of
+     * [analyzeLeftoversStreaming] — no photo involved.
+     *
+     * @param currentEntry The original FoodEntry (full meal before eating)
+     * @param leftoversText User-edited text describing the leftovers
+     * @param language User's language for prompt localization
+     * @return Flow of [MealAnalysisEvent] (Phase → Done/Error)
+     */
+    fun analyzeLeftoversFromTextStreaming(
+        currentEntry: FoodEntry,
+        leftoversText: String,
+        language: String = "pt-PT"
+    ): Flow<MealAnalysisEvent> = flow {
+        val apiKey = BuildConfig.GEMINI_API_KEY
+        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
+            emit(
+                MealAnalysisEvent.Error(
+                    messageKey = "analysis_failed_retry",
+                    cause = IllegalStateException("API Key not configured"),
+                    salvage = null
+                )
+            )
+            return@flow
+        }
+
+        emit(MealAnalysisEvent.Phase(PHASE_ANALYZING_LEFTOVERS))
+
+        // For leftovers, habits are less relevant (we're analyzing what's LEFT,
+        // not what was originally served), but we still pass them for consistency
+        // with the regular analysis flow.
+        val habits = repository.selectHabitsForPrompt(
+            repository.getActiveHabitsSnapshot(), currentEntry.mealCategory
+        )
+        val habitsBlock = repository.buildHabitsPromptBlock(habits, currentEntry.name)
+        val offeredIds = habits.map { it.id }.toSet()
+
+        val promptText = repository.buildLeftoversPromptCoreFromText(
+            currentEntry = currentEntry,
+            leftoversText = leftoversText,
+            language = language,
+            habitsBlock = habitsBlock
+        )
+
+        val parts = mutableListOf<Part>()
+        parts.add(Part(text = promptText))
+        // No inlineData — text-only
+
+        val request = GeminiRequest(
+            contents = listOf(Content(parts = parts)),
+            generationConfig = GenerationConfig(
+                temperature = 0.2f,
+                responseMimeType = "application/json",
+                thinkingConfig = ThinkingConfig(thinkingLevel = "low")
+            )
+        )
+
+        consumeStream(
+            collector = this,
+            request = request,
+            apiKey = apiKey,
+            offeredHabitIds = offeredIds,
+            isReanalysis = true,  // Reuse reanalysis phase logic
+            language = language,
+            allowEscalation = false  // No photo → Pro vision cannot help
+        )
+    }
+
+    /**
+     * Streaming analysis of LEFTOVERS (food remaining on the plate after a meal).
+     * Clone of [reanalyzeFoodFromSummaryStreaming] but adapted for the "register
+     * leftovers" flow: the photo shows what REMAINED uneaten, not the full meal.
+     *
+     * The prompt instructs the model to analyze ONLY the leftovers; the caller
+     * then computes consumed = original - leftovers via [mergeLeftovers].
+     *
+     * @param currentEntry The original FoodEntry (full meal before eating)
+     * @param base64Image Photo of the LEFTOVERS (required)
+     * @param language User's language for prompt localization
+     * @param mimeType Image mime type
+     * @return Flow of [MealAnalysisEvent] (Phase → Done/Error)
+     */
+    fun analyzeLeftoversStreaming(
+        currentEntry: FoodEntry,
+        base64Image: String,
+        language: String = "pt-PT",
+        mimeType: String = "image/jpeg"
+    ): Flow<MealAnalysisEvent> = flow {
+        val apiKey = BuildConfig.GEMINI_API_KEY
+        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
+            emit(
+                MealAnalysisEvent.Error(
+                    messageKey = "analysis_failed_retry",
+                    cause = IllegalStateException("API Key not configured"),
+                    salvage = null
+                )
+            )
+            return@flow
+        }
+
+        emit(MealAnalysisEvent.Phase(PHASE_ANALYZING_LEFTOVERS))
+
+        // For leftovers, habits are less relevant (we're analyzing what's LEFT,
+        // not what was originally served), but we still pass them for consistency
+        // with the regular analysis flow.
+        val habits = repository.selectHabitsForPrompt(
+            repository.getActiveHabitsSnapshot(), currentEntry.mealCategory
+        )
+        val habitsBlock = repository.buildHabitsPromptBlock(habits, currentEntry.name)
+        val offeredIds = habits.map { it.id }.toSet()
+
+        val promptText = repository.buildLeftoversPromptCore(
+            currentEntry = currentEntry,
+            language = language,
+            habitsBlock = habitsBlock
+        )
+
+        val parts = mutableListOf<Part>()
+        parts.add(Part(text = promptText))
+        parts.add(Part(inlineData = InlineData(mimeType = mimeType, data = base64Image)))
+
+        val request = GeminiRequest(
+            contents = listOf(Content(parts = parts)),
+            generationConfig = GenerationConfig(
+                temperature = 0.2f,
+                responseMimeType = "application/json",
+                thinkingConfig = ThinkingConfig(thinkingLevel = "low")
+            )
+        )
+
+        consumeStream(
+            collector = this,
+            request = request,
+            apiKey = apiKey,
+            offeredHabitIds = offeredIds,
+            isReanalysis = true,  // Reuse reanalysis phase logic
+            language = language,
+            allowEscalation = true  // Allow Pro escalation for photo-based analysis
+        )
+    }
+
+    /**
+     * Merge leftovers analysis result into the original FoodEntry by computing:
+     * consumed = original - leftovers (ingredient-by-ingredient with fuzzy matching).
+     *
+     * @param original The original FoodEntry (full meal)
+     * @param leftoversResult Analysis result of the leftovers photo
+     * @param language User's language for fullSummary repair
+     * @return Updated FoodEntry with consumed quantities (original - leftovers)
+     */
+    fun mergeLeftovers(
+        original: FoodEntry,
+        leftoversResult: FoodAnalysisResult,
+        language: String = "pt-PT"
+    ): FoodEntry {
+        // Parse both ingredient lists
+        val originalIngredients = parseIngredientsJson(original.ingredientsJson)
+        val leftoverIngredients = leftoversResult.ingredients ?: emptyList()
+
+        android.util.Log.d(
+            "MealAnalysis",
+            "mergeLeftovers: original=${originalIngredients.size} leftovers=${leftoverIngredients.size}"
+        )
+
+        // Fuzzy match leftovers to original ingredients
+        val matched = fuzzyMatchIngredients(originalIngredients, leftoverIngredients)
+
+        // Compute consumed = original - leftover for each matched pair
+        val consumedIngredients = mutableListOf<IngredientDto>()
+        val matchedOriginalIndices = mutableSetOf<Int>()
+
+        matched.forEach { (origIdx, leftoverIng) ->
+            val origIng = originalIngredients[origIdx]
+            matchedOriginalIndices.add(origIdx)
+
+            val consumedQuantity = (origIng.weightGrams - leftoverIng.weightGrams).coerceAtLeast(0.0)
+
+            // Recalculate macros proportionally
+            val ratio = if (origIng.weightGrams > 0) consumedQuantity / origIng.weightGrams else 0.0
+
+            consumedIngredients.add(
+                origIng.copy(
+                    weightGrams = consumedQuantity,
+                    calories = ((origIng.calories ?: 0) * ratio).toInt(),
+                    protein = (origIng.protein ?: 0.0) * ratio,
+                    carbs = (origIng.carbs ?: 0.0) * ratio,
+                    fat = (origIng.fat ?: 0.0) * ratio
+                )
+            )
+        }
+
+        // Add unmatched original ingredients (assume fully consumed)
+        originalIngredients.forEachIndexed { idx, ing ->
+            if (idx !in matchedOriginalIndices) {
+                consumedIngredients.add(ing)
+            }
+        }
+
+        // Recalculate meal totals from consumed ingredients
+        val ingTotalCalories = consumedIngredients.sumOf { it.calories ?: 0 }
+        val ingTotalProtein = consumedIngredients.sumOf { it.protein ?: 0.0 }
+        val ingTotalCarbs = consumedIngredients.sumOf { it.carbs ?: 0.0 }
+        val ingTotalFat = consumedIngredients.sumOf { it.fat ?: 0.0 }
+
+        // The per-ingredient path is only trustworthy when the ingredient macros
+        // actually sum to (close to) the meal's stored totals. Flash models often
+        // emit ingredient weights WITHOUT per-ingredient macros, or macros that
+        // don't reconcile with the meal totals — then summing consumed ingredients
+        // produces numbers unrelated to reality (observed 2026-10-10: meal showed
+        // 390g consumed but macro bars came from a 2-item sum). When the
+        // ingredient sum diverges from the stored meal macros by >25%, fall back
+        // to subtracting the leftovers' TOTAL macros from the meal's TOTAL macros
+        // — coarser, but always consistent with what the user saw before.
+        val origCal = (original.calories ?: 0).toDouble()
+        val ingReconciles = origCal > 0 &&
+            kotlin.math.abs((consumedIngredients.sumOf { (it.calories ?: 0) } +
+                (leftoverIngredients.sumOf { it.calories ?: 0 })) - origCal) <= origCal * 0.25 &&
+            ingTotalProtein > 0.0
+
+        val totalCalories: Int
+        val totalProtein: Double
+        val totalCarbs: Double
+        val totalFat: Double
+
+        if (ingReconciles) {
+            totalCalories = ingTotalCalories
+            totalProtein = ingTotalProtein
+            totalCarbs = ingTotalCarbs
+            totalFat = ingTotalFat
+            android.util.Log.i("FOOD_DIAG", "mergeLeftovers: using PER-INGREDIENT subtraction")
+        } else {
+            // Macro-total fallback: consumed = meal total − leftovers total.
+            totalCalories = ((original.calories ?: 0) - (leftoversResult.calories ?: 0)).coerceAtLeast(0)
+            totalProtein = ((original.protein) - (leftoversResult.protein ?: 0.0)).coerceAtLeast(0.0)
+            totalCarbs = ((original.carbs) - (leftoversResult.carbs ?: 0.0)).coerceAtLeast(0.0)
+            totalFat = ((original.fat) - (leftoversResult.fat ?: 0.0)).coerceAtLeast(0.0)
+            android.util.Log.i("FOOD_DIAG", "mergeLeftovers: using MACRO-TOTAL fallback (ingredients did not reconcile)")
+        }
+
+        // When per-ingredient subtraction reconciled, the consumed breakdown is
+        // trustworthy — persist it. In the macro-total fallback the per-ingredient
+        // weights are unreliable, so keep the ORIGINAL ingredient breakdown (which
+        // the macro bars already render correctly) rather than a bogus 2-item list.
+        val finalIngredientsJson = if (ingReconciles) {
+            encodeIngredients(consumedIngredients)
+        } else {
+            original.ingredientsJson
+        }
+        val mergedIngredientsJson = finalIngredientsJson
+
+        android.util.Log.i(
+            "FOOD_DIAG",
+            "mergeLeftovers: consumed=${consumedIngredients.size} ingredients | " +
+                "cal=$totalCalories (orig=${original.calories}) | " +
+                "P=$totalProtein (orig=${original.protein}) | " +
+                "C=$totalCarbs (orig=${original.carbs}) | " +
+                "F=$totalFat (orig=${original.fat})"
+        )
+        android.util.Log.i(
+            "FOOD_DIAG",
+            "mergeLeftovers: per-ingredient macros present? " +
+                consumedIngredients.joinToString(" | ") {
+                    "${it.name}:cal=${it.calories},p=${it.protein},c=${it.carbs},f=${it.fat}"
+                }
+        )
+
+        // The consumed breakdown is now the ENTIRE fullSummary (one ingredient
+        // per line). No "Consumido:" prefix — the dish name stands on its own
+        // (2026-10-10). The leftovers block is persisted structurally in the
+        // snapshot so the card renders from it, not from the summary text.
+        val consumedBlock = FullSummaryRepair.repair(
+            original.name,
+            mergedIngredientsJson,
+            language
+        ) ?: original.name
+
+        // Leftovers block shows "name (~Xg de ~Yg)" — leftover weight out of the
+        // matched original weight — so the user sees proportion left vs eaten.
+        val leftoverBlock = buildLeftoverBlock(leftoversResult, originalIngredients, language)
+
+        // Snapshot the pre-adjustment state so "eliminar sobras" can revert
+        // exactly. If the meal was ALREADY adjusted once, keep the earliest
+        // snapshot (the true original) rather than snapshotting the already-
+        // reduced values — but refresh the leftover block text to the latest.
+        val snapshotJson = (original.leftoverOriginalJson?.let { prev ->
+            decodeLeftoverSnapshot(prev)?.copy(leftoverBlockText = leftoverBlock)?.encode()
+        }) ?: original.toLeftoverSnapshot(leftoverBlock).encode()
+
+        return original.copy(
+            calories = totalCalories.coerceAtLeast(0),
+            protein = totalProtein.coerceAtLeast(0.0),
+            carbs = totalCarbs.coerceAtLeast(0.0),
+            fat = totalFat.coerceAtLeast(0.0),
+            ingredientsJson = mergedIngredientsJson,
+            fullSummary = consumedBlock,
+            // CRITICAL: keep lastAiAnalyzedSummary == fullSummary so the save
+            // path's `summaryChanged` check (fullSummary != lastAiAnalyzedSummary)
+            // is false. Otherwise saving the meal after a leftover adjustment
+            // triggers a fresh AI re-analysis that OVERWRITES the subtracted
+            // macros with new estimates (observed 2026-10-10). 2026-10-10.
+            lastAiAnalyzedSummary = consumedBlock,
+            leftoverOriginalJson = snapshotJson,
+            analysisModel = leftoversResult.analysisModel ?: original.analysisModel,
+            // Recalculate free sugars and saturated fat proportionally
+            freeSugarsG = original.freeSugarsG?.let { orig ->
+                val ratio = if (original.carbs ?: 0.0 > 0) totalCarbs / (original.carbs ?: 1.0) else 0.0
+                (orig * ratio).coerceAtMost(totalCarbs).coerceAtLeast(0.0)
+            },
+            saturatedFatG = original.saturatedFatG?.let { orig ->
+                val ratio = if (original.fat ?: 0.0 > 0) totalFat / (original.fat ?: 1.0) else 0.0
+                (orig * ratio).coerceAtMost(totalFat).coerceAtLeast(0.0)
+            }
+        )
+    }
+
+    /**
+     * Builds the leftovers block: a header kcal line + one ingredient per line.
+     * Each line shows the leftover weight out of the matched original weight,
+     * e.g. "• bife de vaca grelhado (~35g de ~125g)", so the user sees how much
+     * of each item was left vs originally served. Falls back to just the
+     * leftover weight when no original match is found.
+     */
+    private fun buildLeftoverBlock(
+        leftoversResult: FoodAnalysisResult,
+        originalIngredients: List<IngredientDto>,
+        language: String
+    ): String {
+        val ingredients = leftoversResult.ingredients.orEmpty()
+            .filter { !it.name.isNullOrBlank() && it.weightGrams > 0.0 }
+
+        val kcalLabel = when (language) {
+            "pt-PT", "pt" -> "Total sobras"
+            "gu" -> "કુલ બાકી"
+            else -> "Total leftovers"
+        }
+        val ofLabel = when (language) {
+            "pt-PT", "pt" -> "de"
+            "gu" -> "માંથી"
+            else -> "of"
+        }
+        val header = "$kcalLabel: ${leftoversResult.calories ?: 0} kcal"
+
+        if (ingredients.isEmpty()) return header
+
+        return buildString {
+            append(header)
+            ingredients.forEach { ing ->
+                val g = Math.round(ing.weightGrams)
+                // Find the best-matching original ingredient to show the "de ~Yg".
+                val origWeight = originalIngredients
+                    .filter { !it.name.isNullOrBlank() }
+                    .minByOrNull {
+                        levenshteinDistance(
+                            it.name!!.trim().lowercase(),
+                            ing.name!!.trim().lowercase()
+                        )
+                    }
+                    ?.let { cand ->
+                        val maxLen = maxOf(cand.name!!.length, ing.name!!.length)
+                        val dist = levenshteinDistance(
+                            cand.name!!.trim().lowercase(),
+                            ing.name!!.trim().lowercase()
+                        )
+                        if (dist <= (maxLen * 0.3).toInt()) Math.round(cand.weightGrams) else null
+                    }
+                if (origWeight != null) {
+                    append("\n• ${ing.name!!.trim()} (~${g}g $ofLabel ~${origWeight}g)")
+                } else {
+                    append("\n• ${ing.name!!.trim()} (~${g}g)")
+                }
+            }
+        }
+    }
+
+    /**
+     * Fuzzy match leftover ingredients to original ingredients using Levenshtein
+     * distance. Returns a list of (originalIndex, leftoverIngredient) pairs.
+     *
+     * Algorithm:
+     * - For each leftover, find the original with the most similar name
+     * - Threshold: distance <= 0.3 * max(len(a), len(b))
+     * - If no match meets threshold, the leftover is ignored (assumed AI error)
+     */
+    private fun fuzzyMatchIngredients(
+        original: List<IngredientDto>,
+        leftovers: List<IngredientDto>
+    ): List<Pair<Int, IngredientDto>> {
+        val matched = mutableListOf<Pair<Int, IngredientDto>>()
+
+        leftovers.forEach { leftover ->
+            var bestMatchIdx = -1
+            var bestDistance = Int.MAX_VALUE
+
+            original.forEachIndexed { idx, orig ->
+                val dist = levenshteinDistance(
+                    orig.name.trim().lowercase(),
+                    leftover.name.trim().lowercase()
+                )
+                if (dist < bestDistance) {
+                    bestDistance = dist
+                    bestMatchIdx = idx
+                }
+            }
+
+            if (bestMatchIdx >= 0) {
+                val origName = original[bestMatchIdx].name
+                val maxLen = maxOf(origName.length, leftover.name.length)
+                val threshold = (maxLen * 0.3).toInt()
+
+                if (bestDistance <= threshold) {
+                    matched.add(bestMatchIdx to leftover)
+                    android.util.Log.d(
+                        "MealAnalysis",
+                        "fuzzyMatch: '${leftover.name}' → '${origName}' (dist=$bestDistance)"
+                    )
+                } else {
+                    android.util.Log.d(
+                        "MealAnalysis",
+                        "fuzzyMatch: '${leftover.name}' no match (best='${origName}' dist=$bestDistance > $threshold)"
+                    )
+                }
+            }
+        }
+
+        return matched
+    }
+
+    /**
+     * Levenshtein distance (edit distance) between two strings.
+     * Classic DP algorithm — O(m*n) time, O(min(m,n)) space.
+     */
+    private fun levenshteinDistance(a: String, b: String): Int {
+        if (a == b) return 0
+        if (a.isEmpty()) return b.length
+        if (b.isEmpty()) return a.length
+
+        // Ensure a is the shorter string for space optimization
+        val (s, t) = if (a.length <= b.length) a to b else b to a
+
+        var prev = IntArray(s.length + 1) { it }
+        var curr = IntArray(s.length + 1)
+
+        for (j in 1..t.length) {
+            curr[0] = j
+            for (i in 1..s.length) {
+                val cost = if (s[i - 1] == t[j - 1]) 0 else 1
+                curr[i] = minOf(
+                    prev[i] + 1,      // deletion
+                    curr[i - 1] + 1,  // insertion
+                    prev[i - 1] + cost // substitution
+                )
+            }
+            val temp = prev
+            prev = curr
+            curr = temp
+        }
+
+        return prev[s.length]
+    }
+
+    /**
+     * Validate leftovers analysis result against the original meal.
+     * Returns validation status + warning key for implausible cases.
+     *
+     * Plausibility checks:
+     * - Leftovers > 110% of original → likely AI error
+     * - Leftovers > 80% of original → user ate very little (confirm)
+     * - Leftovers < 5% and non-zero → suspiciously small (confirm)
+     */
+    fun validateLeftovers(
+        original: FoodEntry,
+        leftovers: FoodAnalysisResult
+    ): LeftoversValidation {
+        val origKcal = original.calories ?: 0
+        val leftKcal = leftovers.calories ?: 0
+
+        if (origKcal == 0) {
+            return LeftoversValidation(
+                isPlausible = false,
+                warningKey = "error_original_no_data",
+                leftoverPercent = 0.0
+            )
+        }
+
+        val percent = (leftKcal.toDouble() / origKcal.toDouble()) * 100.0
+
+        return when {
+            leftKcal > origKcal * 1.1 ->
+                LeftoversValidation(false, "warning_leftovers_exceed_original", percent)
+            percent > 80.0 ->
+                LeftoversValidation(false, "warning_leftovers_too_large", percent)
+            percent < 5.0 && leftKcal > 0 ->
+                LeftoversValidation(false, "warning_leftovers_too_small", percent)
+            else ->
+                LeftoversValidation(true, null, percent)
+        }
+    }
+
+    /**
+     * Parse ingredientsJson string to List<IngredientDto>.
+     * Returns empty list if JSON is null/blank or parse fails.
+     */
+    private fun parseIngredientsJson(json: String?): List<IngredientDto> {
+        if (json.isNullOrBlank()) return emptyList()
+        return try {
+            val type = com.squareup.moshi.Types.newParameterizedType(
+                List::class.java,
+                IngredientDto::class.java
+            )
+            val adapter = moshi.adapter<List<IngredientDto>>(type)
+            adapter.fromJson(json) ?: emptyList()
+        } catch (e: Exception) {
+            android.util.Log.e("MealAnalysis", "parseIngredientsJson failed", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * Validation result for leftovers analysis.
+     * @property isPlausible True if leftovers seem reasonable relative to original
+     * @property warningKey i18n key for the warning message (null if plausible)
+     * @property leftoverPercent Percentage of leftovers relative to original (0-100+)
+     */
+    data class LeftoversValidation(
+        val isPlausible: Boolean,
+        val warningKey: String?,
+        val leftoverPercent: Double
+    )
+
     companion object {
         const val PHASE_UPLOADING = "phase_uploading_image"
         const val PHASE_ANALYZING = "phase_analyzing_meal"
@@ -1155,6 +1689,7 @@ class MealAnalysisOrchestrator(
         const val PHASE_FINALIZING = "phase_finalizing"
         const val PHASE_REANALYZING = "phase_reanalyzing_meal"
         const val PHASE_REANALYZING_ACTIVITY = "phase_reanalyzing_activity"
+        const val PHASE_ANALYZING_LEFTOVERS = "phase_analyzing_leftovers"
         /** Streaming Flash done, but `confidence` came back `low`/`medium` →
          *  orchestrator is silently re-running the analysis through the more
          *  capable Pro model. UI swaps the "Aceitar e guardar refeição"

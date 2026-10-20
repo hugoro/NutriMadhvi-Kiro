@@ -59,10 +59,18 @@ internal object FullSummaryRepair {
     ): String? {
         val summary = fullSummary?.sanitizeAiNewlines()
         if (summary.isNullOrBlank()) return fullSummary
-        if (hasGrams(summary)) return summary
 
         val weighted = decode(ingredientsJson).orEmpty()
             .filter { !it.name.isNullOrBlank() && it.weightGrams > 0.0 }
+
+        // Already in the new one-ingredient-per-line format (bullet markers):
+        // leave it untouched so repeated reads/writes are idempotent and the
+        // user's manual edits to the block survive. 2026-10-10.
+        if (summary.contains("\n•") || summary.startsWith("•")) return summary
+
+        // No weighted ingredients to rebuild from: keep the model's prose
+        // rather than fabricate a breakdown. If the prose already carries
+        // gram markers we still return it unchanged (nothing better to do).
         if (weighted.isEmpty()) return summary
 
         val lines = summary.split('\n').map { it.trim() }.filter { it.isNotEmpty() }
@@ -78,9 +86,13 @@ internal object FullSummaryRepair {
             first.trimEnd('.', '!', '?') + " (~${formatGrams(totalG)}g)"
         }
 
-        // Rebuilt ingredient line.
-        val line2 = "${ingredientsLabel(language)}: " + weighted.joinToString(", ") {
-            "${it.name.trim()} (~${formatGrams(it.weightGrams)}g)"
+        // Ingredient block: one ingredient per line (2026-10-10). Each
+        // ingredient on its own `• name (~Xg)` line so the user can scan the
+        // breakdown vertically instead of parsing a comma-run. The header
+        // label stays on its own line above the bullet list.
+        val ingredientLines = buildList {
+            add("${ingredientsLabel(language)}:")
+            weighted.forEach { add("• ${it.name.trim()} (~${formatGrams(it.weightGrams)}g)") }
         }
 
         // Line 3: keep an assumptions line the model actually produced
@@ -90,7 +102,7 @@ internal object FullSummaryRepair {
         val lastIsAssumptions = lines.size >= 2 && lines.last().startsWith(assumedLabel, ignoreCase = true)
         val line3 = if (lastIsAssumptions) lines.last() else null
 
-        return listOfNotNull(line1, line2, line3).joinToString("\n")
+        return (listOf(line1) + ingredientLines + listOfNotNull(line3)).joinToString("\n")
     }
 
     private fun hasGrams(text: String): Boolean =

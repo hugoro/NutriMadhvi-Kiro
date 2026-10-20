@@ -46,6 +46,13 @@ import java.util.concurrent.TimeUnit
  */
 sealed class GroqStreamChunk {
     data class Partial(val deltaText: String, val accumulatedSoFar: String) : GroqStreamChunk()
+
+    /** 2026-10-06 (Frente Thinking) — a `delta.reasoning` fragment (Qwen's
+     *  extended thinking, streamed separately from `delta.content` when
+     *  `reasoning_effort` != "none"). Never merged into [Partial] text: the
+     *  persisted answer stays clean, the thinking feeds the live card. */
+    data class Reasoning(val deltaText: String, val accumulatedSoFar: String) : GroqStreamChunk()
+
     data class Done(
         val fullText: String,
         val finishReason: String,
@@ -103,6 +110,7 @@ object GroqStreamingClient {
 
         val call = streamingClient.newCall(httpReq)
         val fullText = StringBuilder()
+        val reasoningText = StringBuilder()
 
         try {
             call.execute().use { response ->
@@ -147,6 +155,14 @@ object GroqStreamingClient {
                     }
                     val choice = chunk.choices?.firstOrNull()
                     choice?.finishReason?.let { finishReason = it }
+                    val reasoningDelta = choice?.delta?.reasoning
+                    if (!reasoningDelta.isNullOrEmpty()) {
+                        // Extended-thinking fragment — its own channel, kept
+                        // OUT of the answer text (persisted text is identical
+                        // with or without reasoning enabled).
+                        reasoningText.append(reasoningDelta)
+                        trySend(GroqStreamChunk.Reasoning(reasoningDelta, reasoningText.toString()))
+                    }
                     val delta = choice?.delta?.content
                     if (!delta.isNullOrEmpty()) {
                         fullText.append(delta)

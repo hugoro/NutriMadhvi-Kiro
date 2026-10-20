@@ -17,6 +17,7 @@ import com.example.data.local.ChatMessage
 import com.example.data.local.FoodEntry
 import com.example.data.local.FoodEditType
 import com.example.data.local.appendEditLog
+import com.example.data.local.restoreFromSnapshot
 import com.example.data.local.FoodHabit
 import com.example.data.local.MealCategory
 import com.example.data.local.ActivityEntry
@@ -86,7 +87,7 @@ enum class CaptureMode { FOOD, ACTIVITY }
  */
 enum class VoiceMode { Idle, Listening, Thinking, Speaking }
 
-class ChatViewModel(
+open class ChatViewModel(
     private val repository: GeminiRepository,
     private val shRepository: SamsungHealthRepository,
     /** Optional — set by [ChatViewModelFactory] for the foreground UI
@@ -216,13 +217,40 @@ class ChatViewModel(
         }
     }
 
-    /** Saves a silhouette snapshot then generates the coach report async.
-     *  The entity is persisted immediately (UI can show a spinner); once the
-     *  LLM responds the report is written back via [updateCoachReport]. */
+    /** Saves a silhouette snapshot, then:
+     *  1) persists the deterministic body-plan checkpoint FIRST — local-only
+     *     DB work, guaranteed to complete before ANY network call, so a
+     *     network hang or process interruption can never leave the Plan
+     *     view without its checkpoint (v40 hardening);
+     *  2) runs the legacy coach report and the checkpoint LLM enrichment as
+     *     INDEPENDENT jobs with isolated failures — a failure of either
+     *     never blocks the other. */
     fun savePerformanceSnapshotAndRequestReport(entity: com.example.data.local.PerformanceSnapshotEntity) {
         viewModelScope.launch {
             val id = repository.insertPerformanceSnapshot(entity)
-            if (id > 0) generateCoachReport(entity.copy(id = id))
+            if (id <= 0) return@launch
+            val saved = entity.copy(id = id)
+            // 1) Deterministic checkpoint — local-only, awaited here, so the
+            //    row is persisted before the network jobs below even start.
+            val checkpointId = createBodyPlanCheckpointLocal(saved)
+            // 2) Legacy coach report — independent network job, isolated failure.
+            viewModelScope.launch {
+                runCatching { generateCoachReport(saved) }
+                    .onFailure { android.util.Log.w("SHD", "[coach-report] generation failed", it) }
+            }
+            // 3) Checkpoint LLM enrichment — independent network job,
+            //    independently retryable via [requestCheckpointEnrichment].
+            if (checkpointId != null) {
+                if (acquireEnrichmentSlot(checkpointId)) {
+                    viewModelScope.launch {
+                        try {
+                            enrichCheckpoint(checkpointId)
+                        } finally {
+                            releaseEnrichmentSlot(checkpointId)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -290,6 +318,390 @@ class ChatViewModel(
         // Strip the block from the visible report before saving
         val cleanReport = stripCoachTargetsBlock(report)
         repository.updatePerformanceCoachReport(entity.id, cleanReport, System.currentTimeMillis())
+    }
+
+    // ── Body plan checkpoints (v39, hardened in v40) ───────────────────────
+    //
+    // The deterministic core (phase, priorities, deltas) is computed LOCALLY
+    // by com.example.data.performance.BodyPlanEngine and persisted
+    // IMMEDIATELY after the snapshot insert — BEFORE any network call — so
+    // the Plan view works offline and a network hang / process interruption
+    // never leaves the checkpoint missing. The LLM (routine cheap models via
+    // ModelRoles) only enriches: tactics text + checkpoint report, in an
+    // independent job with isolated failure. On any LLM failure the
+    // deterministic fallback tactics are stored (source
+    // "deterministic_fallback") and a VISIBLE per-checkpoint error is
+    // exposed to the UI → retry button, never a silent return or an
+    // infinite spinner.
+    //
+    // Re-enrichment ("Gerar novamente") runs from the CHECKPOINT-ANCHORED
+    // inputs — persisted phase/priorities, the snapshot and the goal fixed
+    // at checkpoint time — never from today's possibly-changed composition
+    // or goal (v40). One checkpoint per snapshot (unique index +
+    // transactional idempotent insert). In-flight retries are debounced.
+
+    /** Live flow of body-plan checkpoints, newest first (Progresso view). */
+    val bodyPlanCheckpoints: StateFlow<List<com.example.data.local.BodyPlanCheckpointEntity>> =
+        repository.observeAllBodyPlanCheckpoints()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _enrichingCheckpointIds = MutableStateFlow<Set<Long>>(emptySet())
+    private val _checkpointEnrichmentErrors = MutableStateFlow<Map<Long, String>>(emptyMap())
+
+    /** Checkpoint ids whose LLM enrichment is currently in flight. A retry
+     *  for an id already in flight is ignored (debounce) so repeated taps
+     *  cannot race the same row's writes (v40). */
+    val enrichingCheckpointIds: StateFlow<Set<Long>> =
+        _enrichingCheckpointIds.asStateFlow()
+
+    /** Visible per-checkpoint enrichment errors as i18n key names:
+     *  "checkpoint_gone" | "snapshot_missing" | "llm_failed" |
+     *  "tactics_rejected". The UI localizes and renders a retry next to the
+     *  affected checkpoint. Empty = healthy. */
+    val checkpointEnrichmentErrors: StateFlow<Map<Long, String>> =
+        _checkpointEnrichmentErrors.asStateFlow()
+
+    private fun acquireEnrichmentSlot(checkpointId: Long): Boolean {
+        var acquired = false
+        _enrichingCheckpointIds.update { cur ->
+            if (checkpointId in cur) cur else { acquired = true; cur + checkpointId }
+        }
+        return acquired
+    }
+
+    private fun releaseEnrichmentSlot(checkpointId: Long) {
+        _enrichingCheckpointIds.update { it - checkpointId }
+    }
+
+    private fun setCheckpointError(checkpointId: Long, key: String) {
+        _checkpointEnrichmentErrors.update { it + (checkpointId to key) }
+    }
+
+    private fun clearCheckpointError(checkpointId: Long) {
+        _checkpointEnrichmentErrors.update { it - checkpointId }
+    }
+
+    /** Creates a checkpoint for a just-saved silhouette snapshot.
+     *  Deterministic part is local-only + persisted first; LLM enrichment
+     *  is async and independently retryable via [requestCheckpointEnrichment]. */
+    fun createBodyPlanCheckpoint(snapshot: com.example.data.local.PerformanceSnapshotEntity) {
+        viewModelScope.launch {
+            val id = createBodyPlanCheckpointLocal(snapshot)
+            if (id != null && acquireEnrichmentSlot(id)) {
+                viewModelScope.launch {
+                    try {
+                        enrichCheckpoint(id)
+                    } finally {
+                        releaseEnrichmentSlot(id)
+                    }
+                }
+            }
+        }
+    }
+
+    /** Local-only, idempotent checkpoint creation (one per snapshot, v40).
+     *  Runs the deterministic engine + the transactional insert and returns
+     *  the persisted checkpoint id — or null when the insert failed. NO
+     *  network work here: the caller decides afterwards which independent
+     *  jobs to launch (coach report, LLM enrichment). */
+    private suspend fun createBodyPlanCheckpointLocal(
+        snapshot: com.example.data.local.PerformanceSnapshotEntity,
+    ): Long? {
+        val goal = latestPerformanceGoal.value
+        // recent() is newest-first — reverse to oldest→newest for trend math.
+        val bodyComp = repository.recentBodyCompositionSnapshots(10).reversed()
+        val prev = repository.latestBodyPlanCheckpoint()
+        val prevSnapshot = prev?.snapshotId?.let { sid ->
+            repository.performanceSnapshotById(sid)
+        }
+        val hasComp = bodyComp.any { it.bodyFatPct != null || it.muscleMassKg != null }
+
+        val phase = com.example.data.performance.BodyPlanEngine.classifyPhase(bodyComp, goal?.goalText)
+        val targets = goal?.coachTargetJson?.let {
+            com.example.data.performance.BodyPlanEngine.targetsFromJson(it)
+        } ?: emptyMap()
+        val priorities = com.example.data.performance.BodyPlanEngine.rankPriorities(
+            snapshot, targets, hasComp
+        )
+        val deltas = com.example.data.performance.BodyPlanEngine.deltasBetween(
+            snapshot, prevSnapshot,
+            bodyComp.lastOrNull(),
+            bodyComp.dropLast(1).lastOrNull(),
+        )
+        val deltaSummary = formatDeltaSummary(deltas)
+
+        val id = repository.insertBodyPlanCheckpointIfAbsent(
+            com.example.data.local.BodyPlanCheckpointEntity(
+                checkpointAtMs = System.currentTimeMillis(),
+                snapshotId = snapshot.id,
+                bodyCompRowId = bodyComp.lastOrNull()?.id,
+                phase = phase?.name,
+                prioritiesJson = prioritiesToJson(priorities),
+                deltaSummary = deltaSummary,
+                goalText = goal?.goalText,
+                goalTargetsJson = goal?.coachTargetJson,
+            )
+        )
+        if (id <= 0) {
+            android.util.Log.w("SHD", "[body-plan] checkpoint insert failed snapshot=${snapshot.id}")
+            return null
+        }
+        android.util.Log.i(
+            "SHD", "[body-plan] checkpoint#$id phase=$phase priorities=${priorities.size} " +
+                "prev=${prev?.id ?: "none"} delta=\"$deltaSummary\""
+        )
+        // The goal's ratio targets were derived from the PREVIOUS capture's
+        // ratios. If the normalization convention changed between captures
+        // (e.g. this time the camera got a full-body pose), the old targets
+        // are not same-unit data — re-derive them (v40).
+        if (goal != null && goal.coachTargetJson != null && prevSnapshot != null) {
+            val prevConv = prevSnapshot.frontalNormalization to prevSnapshot.lateralNormalization
+            val newConv = snapshot.frontalNormalization to snapshot.lateralNormalization
+            if (prevConv != newConv) {
+                android.util.Log.i(
+                    "SHD", "[body-plan] normalization convention changed $prevConv → $newConv — regenerating goal targets"
+                )
+                viewModelScope.launch { generateCoachTargets(goal) }
+            }
+        }
+        return id
+    }
+
+    /** Explicit retry for the LLM enrichment of an existing checkpoint
+     *  (tactics + report) — the "Gerar novamente" button. The enrichment
+     *  re-runs from the CHECKPOINT-ANCHORED inputs (persisted phase,
+     *  priorities, snapshot and goal fixed at checkpoint time) — never from
+     *  today's recomputed composition/goal (v40). In-flight retries for the
+     *  same checkpoint are debounced; every outcome is visible via
+     *  [checkpointEnrichmentErrors] — no silent returns. */
+    fun requestCheckpointEnrichment(checkpointId: Long) {
+        if (!acquireEnrichmentSlot(checkpointId)) {
+            android.util.Log.i("SHD", "[body-plan] retry#$checkpointId ignored — already in flight")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                enrichCheckpoint(checkpointId)
+            } catch (t: Throwable) {
+                android.util.Log.w("SHD", "[body-plan] retry#$checkpointId crashed", t)
+                setCheckpointError(checkpointId, "llm_failed")
+            } finally {
+                releaseEnrichmentSlot(checkpointId)
+            }
+        }
+    }
+
+    /** Enriches one checkpoint with a single routine LLM call (report +
+     *  [TACTICS] block), loading every input from the checkpoint's own
+     *  persisted anchors (v40). LLM tactics pass the semantic safety
+     *  validator against the persisted priorities/tissues; any violation or
+     *  hard failure stores the deterministic fallback and surfaces a
+     *  visible error for the UI's retry. */
+    private suspend fun enrichCheckpoint(checkpointId: Long) {
+        val cp = repository.bodyPlanCheckpointById(checkpointId)
+        if (cp == null) {
+            setCheckpointError(checkpointId, "checkpoint_gone")
+            return
+        }
+        val snapshot = cp.snapshotId?.let { repository.performanceSnapshotById(it) }
+        if (snapshot == null) {
+            setCheckpointError(checkpointId, "snapshot_missing")
+            return
+        }
+        val name = _userProfile.value.name.ifBlank { "Utilizador" }
+        val lang = _userProfile.value.language.ifBlank { "pt-PT" }
+
+        // Checkpoint-anchored inputs: the persisted (safety-gated) phase and
+        // priorities, plus the snapshot and goal fixed at checkpoint time.
+        val phase = cp.phase?.let { p ->
+            runCatching { com.example.data.performance.BodyPlanEngine.BodyPhase.valueOf(p) }.getOrNull()
+        }
+        val priorities = com.example.data.performance.BodyPlanEngine.parsePrioritiesJson(cp.prioritiesJson)
+        val anchoredComp = cp.bodyCompRowId?.let { repository.bodyCompositionSnapshotById(it) }
+        val prev = repository.latestBodyPlanCheckpointBefore(cp.checkpointAtMs)
+        val prevSnapshot = prev?.snapshotId?.let { repository.performanceSnapshotById(it) }
+
+        val tacticsPrompt = com.example.data.performance.BodyPlanPromptBuilder.buildTacticsPrompt(
+            phase = phase,
+            priorities = priorities,
+            goalText = cp.goalText,
+            latestComp = anchoredComp,
+            name = name,
+            lang = lang,
+            previousPhase = prev?.phase,
+            previousRatios = prev?.let {
+                com.example.data.performance.BodyPlanPromptBuilder.ratiosLine(prevSnapshot)
+            },
+            deltaSummary = cp.deltaSummary,
+        )
+        val result = repository.generateBodyPlanContent(tacticsPrompt, lang)
+
+        if (result.text == null) {
+            // Hard failure (no key / network / quota): deterministic fallback
+            // tactics so the Plan keeps working, plus a VISIBLE error (the UI
+            // shows "Gerar novamente" instead of a silent state).
+            repository.updateBodyPlanCheckpointTactics(
+                checkpointId,
+                fallbackTacticsJson(phase, priorities, anchoredComp?.weightKg, lang),
+                "deterministic_fallback",
+            )
+            setCheckpointError(checkpointId, "llm_failed")
+            android.util.Log.w("SHD", "[body-plan] checkpoint#$checkpointId LLM null → fallback tactics + visible error")
+            return
+        }
+        val raw = result.text
+        val tacticsJson = extractTacticsJson(raw)
+        val reportText = stripTacticsBlock(raw).trim()
+        // SEMANTIC safety validation (v40): the LLM tactics must agree with
+        // the persisted, safety-gated priorities and tissue classification.
+        // Any violation (unknown zone, conflicting direction, reduce-advice
+        // for a muscle-dominant zone, out-of-bounds calorie/protein numbers)
+        // rejects the whole block → deterministic fallback.
+        val candidates = tacticsJson?.let { parseTacticCandidates(it) }
+        val hasAnchoredComp = anchoredComp?.let {
+            it.bodyFatPct != null || it.muscleMassKg != null
+        } ?: false
+        val verdict = com.example.data.performance.TacticSafetyValidator.validate(
+            candidates, priorities, anchoredComp?.weightKg, hasAnchoredComp
+        )
+        if (candidates != null && verdict.safeJson != null) {
+            repository.updateBodyPlanCheckpointTactics(checkpointId, verdict.safeJson, "llm:${result.modelUsed}")
+            clearCheckpointError(checkpointId)
+        } else {
+            repository.updateBodyPlanCheckpointTactics(
+                checkpointId,
+                fallbackTacticsJson(phase, priorities, anchoredComp?.weightKg, lang),
+                "deterministic_fallback",
+            )
+            setCheckpointError(checkpointId, if (candidates == null) "llm_failed" else "tactics_rejected")
+            android.util.Log.w(
+                "SHD", "[body-plan] checkpoint#$checkpointId tactics rejected " +
+                    "(${verdict.reasons.joinToString("; ")}) → deterministic fallback"
+            )
+        }
+        if (reportText.isNotBlank()) {
+            repository.updateBodyPlanCheckpointReport(checkpointId, reportText, System.currentTimeMillis())
+        }
+        android.util.Log.i(
+            "SHD", "[body-plan] checkpoint#$checkpointId enriched " +
+                "(tactics=${if (candidates != null && verdict.safeJson != null) "llm:${result.modelUsed}" else "fallback"}, report=${reportText.isNotEmpty()})"
+        )
+    }
+
+    /** Deterministic, localized fallback tactics (engine templates → I18n). */
+    private fun fallbackTacticsJson(
+        phase: com.example.data.performance.BodyPlanEngine.BodyPhase?,
+        priorities: List<com.example.data.performance.BodyPlanEngine.ZonePriority>,
+        weightKg: Float?,
+        lang: String,
+    ): String {
+        val sb = StringBuilder("[")
+        var first = true
+        for (t in com.example.data.performance.BodyPlanEngine.defaultTactics(phase, priorities, weightKg)) {
+            if (!first) sb.append(",")
+            first = false
+            var text = tr(t.i18nKey, lang)
+            for ((k, v) in t.i18nArgs) text = text.replace("{${k}}", v)
+            if (text.isBlank()) text = t.i18nKey
+            sb.append("{\"category\":\"${t.category}\",\"text\":\"${text.replace("\"", "'")}\",\"windowDays\":${t.windowDays}}")
+        }
+        return sb.append("]").toString()
+    }
+
+    /** Formats the numeric deltas into a short localized summary string
+     *  (e.g. "cintura −0.3pp · peso +0.4kg · gordura −0.8pp"). Empty when
+     *  this is the first checkpoint (no deltas). */
+    private fun formatDeltaSummary(
+        d: com.example.data.performance.BodyPlanEngine.Deltas,
+    ): String? {
+        if (d.zoneDeltasPp.isEmpty() && d.weightDeltaKg == null &&
+            d.fatDeltaPp == null && d.muscleDeltaKg == null
+        ) return null
+        val lang = _userProfile.value.language.ifBlank { "pt-PT" }
+        val zoneName = { zone: String -> tr("zone_${zone}", lang) }
+        val parts = mutableListOf<String>()
+        for ((zone, pp) in d.zoneDeltasPp) {
+            parts += "${zoneName(zone)} ${fmtSigned(pp)}pp"
+        }
+        d.weightDeltaKg?.let { parts += "${tr("delta_weight", lang)} ${fmtSigned(it)}kg" }
+        d.fatDeltaPp?.let { parts += "${tr("delta_fat", lang)} ${fmtSigned(it)}pp" }
+        d.muscleDeltaKg?.let { parts += "${tr("delta_muscle", lang)} ${fmtSigned(it)}kg" }
+        return parts.joinToString(" · ")
+    }
+
+    private fun fmtSigned(v: Float): String = (if (v >= 0) "+" else "") + v.roundTo1()
+
+    private fun Float.roundTo1(): String {
+        val r = kotlin.math.round(this * 10f) / 10f
+        return if (r == kotlin.math.floor(r)) r.toInt().toString() else r.toString()
+    }
+
+    private fun prioritiesToJson(
+        priorities: List<com.example.data.performance.BodyPlanEngine.ZonePriority>,
+    ): String {
+        val sb = StringBuilder("[")
+        var first = true
+        for (p in priorities) {
+            if (!first) sb.append(",")
+            first = false
+            sb.append(
+                """{"zone":"${p.zone}","direction":"${p.direction.name}",""" +
+                    """"gapPp":${p.gapPp},"tissue":"${p.tissue.name}"}"""
+            )
+        }
+        return sb.append("]").toString()
+    }
+
+    private fun extractTacticsJson(text: String): String? {
+        val open = "[TACTICS]"
+        val close = "[/TACTICS]"
+        val start = text.indexOf(open).takeIf { it >= 0 } ?: return null
+        val end = text.indexOf(close, start).takeIf { it >= 0 } ?: return null
+        val between = text.substring(start + open.length, end).trim()
+        val jsonStart = between.indexOf('[').takeIf { it >= 0 } ?: return null
+        val jsonEnd = between.lastIndexOf(']').takeIf { it >= 0 } ?: return null
+        return between.substring(jsonStart, jsonEnd + 1)
+    }
+
+    private fun stripTacticsBlock(text: String): String {
+        val open = "[TACTICS]"
+        val close = "[/TACTICS]"
+        val start = text.indexOf(open).takeIf { it >= 0 } ?: return text.trim()
+        val end = text.indexOf(close, start).takeIf { it >= 0 } ?: return text.trim()
+        return (text.substring(0, start) + text.substring(end + close.length)).trim()
+    }
+
+    /** Parses the [TACTICS] block JSON into semantic candidates for the
+     *  safety validator. Malformed JSON / non-integer windowDays → null
+     *  (the caller treats the block as unusable → deterministic fallback).
+     *  No semantic checks here — those live in
+     *  com.example.data.performance.TacticSafetyValidator. Never throws. */
+    private fun parseTacticCandidates(
+        json: String,
+    ): List<com.example.data.performance.TacticSafetyValidator.TacticCandidate>? {
+        return try {
+            val arr = org.json.JSONArray(json)
+            val out = mutableListOf<com.example.data.performance.TacticSafetyValidator.TacticCandidate>()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: return null
+                val category = o.optString("category", "")
+                val text = o.optString("text", "")
+                if (category.isEmpty() || text.isEmpty()) return null
+                val target = o.optString("target", "").takeIf { it.isNotBlank() }
+                val windowDays = if (o.has("windowDays")) {
+                    (o.opt("windowDays") as? Number)?.toInt() ?: return null
+                } else {
+                    28
+                }
+                val zone = o.optString("zone", "").takeIf { it.isNotBlank() }
+                out += com.example.data.performance.TacticSafetyValidator.TacticCandidate(
+                    category, text, target, windowDays, zone
+                )
+            }
+            out
+        } catch (e: Exception) {
+            null
+        }
     }
 
     /** Legacy projection: extracts just the weight from [latestBodyComposition]
@@ -382,6 +794,16 @@ class ChatViewModel(
     private val _summaryWasEditedAfterAnalysis = MutableStateFlow(false)
     val summaryWasEditedAfterAnalysis: StateFlow<Boolean> =
         _summaryWasEditedAfterAnalysis.asStateFlow()
+
+    /** Tracks user-edited leftovers text when the persisted leftovers card is
+     *  edited. Consumed by [confirmAndSaveFoodEntry] to decide whether to run
+     *  the leftovers re-subtraction stream. Cleared after save. */
+    private val _editedLeftoversText = MutableStateFlow<String?>(null)
+    val editedLeftoversText: StateFlow<String?> = _editedLeftoversText.asStateFlow()
+
+    fun markLeftoversEdited(text: String) {
+        _editedLeftoversText.value = text
+    }
 
     /** Mirror flag for the activity edit screen — gated by
      *  [confirmAndSaveActivitySession] so the re-analysis stream only fires
@@ -546,6 +968,317 @@ class ChatViewModel(
             },
             onFailure = onFailure
         )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // LEFTOVERS ANALYSIS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private val _isAnalyzingLeftovers = MutableStateFlow(false)
+    val isAnalyzingLeftovers: StateFlow<Boolean> = _isAnalyzingLeftovers.asStateFlow()
+
+    data class LeftoverValidationState(
+        val original: FoodEntry,
+        val leftovers: com.example.data.remote.FoodAnalysisResult,
+        val consumedPreview: FoodEntry,
+        val validation: com.example.data.meal.MealAnalysisOrchestrator.LeftoversValidation,
+        val imagePath: String
+    )
+
+    private val _leftoverValidationPending = MutableStateFlow<LeftoverValidationState?>(null)
+    val leftoverValidationPending: StateFlow<LeftoverValidationState?> =
+        _leftoverValidationPending.asStateFlow()
+
+    /**
+     * Analyze leftovers photo and merge result into the original FoodEntry.
+     * Flow: analyze leftovers → validate → (if plausible) merge → updateFood.
+     * If implausible, emits validation state for UI dialog confirmation.
+     *
+     * @param currentEntry Original FoodEntry (must be persisted, id != 0)
+     * @param base64Image Photo of leftovers (required)
+     * @param imagePath Path where leftover photo was staged (not persisted)
+     * @param mimeType Image mime type
+     * @param onSuccess Called after successful update
+     * @param onFailure Called on error
+     */
+    fun analyzeLeftovers(
+        currentEntry: FoodEntry,
+        base64Image: String,
+        imagePath: String,
+        mimeType: String = "image/jpeg",
+        onSuccess: () -> Unit = {},
+        onFailure: (String) -> Unit = {}
+    ) {
+        if (currentEntry.id == 0L) {
+            viewModelScope.launch {
+                _oneShotSnack.emit("error_original_no_data")
+            }
+            onFailure("Entry not persisted")
+            return
+        }
+
+        viewModelScope.launch {
+            _isAnalyzingLeftovers.value = true
+            _foodAnalysisPhase.value = com.example.data.meal.MealAnalysisOrchestrator.PHASE_ANALYZING_LEFTOVERS
+
+            try {
+                var streamedResult: com.example.data.remote.FoodAnalysisResult? = null
+                var errorKey: String? = null
+
+                // Collect stream from orchestrator
+                mealOrchestrator.analyzeLeftoversStreaming(
+                    currentEntry = currentEntry,
+                    base64Image = base64Image,
+                    language = _userProfile.value.language,
+                    mimeType = mimeType
+                ).collect { event ->
+                    when (event) {
+                        is com.example.data.meal.MealAnalysisEvent.Phase ->
+                            _foodAnalysisPhase.value = event.key
+                        is com.example.data.meal.MealAnalysisEvent.Done ->
+                            streamedResult = event.result
+                        is com.example.data.meal.MealAnalysisEvent.Error -> {
+                            streamedResult = event.salvage
+                            errorKey = event.messageKey
+                        }
+                        else -> { /* Ignore Partial events */ }
+                    }
+                }
+
+                // Check if we got a result
+                val result = streamedResult
+                if (result == null) {
+                    android.util.Log.e("FOOD_DIAG", "analyzeLeftovers: no result from stream")
+                    _oneShotSnack.emit(tr("error_leftovers_analysis_failed", _userProfile.value.language))
+                    onFailure("No result from analysis")
+                    return@launch
+                }
+
+                android.util.Log.i("FOOD_DIAG", "analyzeLeftovers: got result, ${result.calories ?: 0} kcal leftovers")
+
+                // Validate plausibility
+                val validation = mealOrchestrator.validateLeftovers(currentEntry, result)
+                android.util.Log.i("FOOD_DIAG", "analyzeLeftovers: validation isPlausible=${validation.isPlausible}, percent=${validation.leftoverPercent}%, warningKey=${validation.warningKey}")
+
+                // Calculate preview of consumed (for UI display)
+                val consumedPreview = mealOrchestrator.mergeLeftovers(
+                    original = currentEntry,
+                    leftoversResult = result,
+                    language = _userProfile.value.language
+                )
+
+                // ALWAYS show result card for user confirmation (gives clear feedback
+                // of what was detected and what will be saved). Card shows warning
+                // badge if implausible, but user can confirm either way.
+                _leftoverValidationPending.value = LeftoverValidationState(
+                    original = currentEntry,
+                    leftovers = result,
+                    consumedPreview = consumedPreview,
+                    validation = validation,
+                    imagePath = imagePath
+                )
+                android.util.Log.i("FOOD_DIAG", "analyzeLeftovers: showing result card to user (plausible=${validation.isPlausible})")
+
+            } catch (e: Exception) {
+                android.util.Log.e("FOOD_DIAG", "analyzeLeftovers failed", e)
+                _oneShotSnack.emit("error_leftovers_network_failed")
+                onFailure(e.message ?: "Unknown error")
+            } finally {
+                _isAnalyzingLeftovers.value = false
+                _foodAnalysisPhase.value = null
+            }
+        }
+    }
+
+    /**
+     * Private helper to re-analyze and subtract leftovers from a meal entry.
+     * Used by [confirmAndSaveFoodEntry] when the persisted leftovers card was
+     * edited. Collects the streaming analysis and merges if successful.
+     *
+     * @param base The meal entry to subtract from (either the original via snapshot,
+     *             or the just-reanalyzed dish if the summary was also edited)
+     * @param leftoversText User-edited leftover text
+     * @param language User's language setting
+     * @return The merged entry with leftovers subtracted, or null on error
+     */
+    private suspend fun resubtractLeftovers(
+        base: FoodEntry,
+        leftoversText: String,
+        language: String
+    ): FoodEntry? {
+        var streamedResult: com.example.data.remote.FoodAnalysisResult? = null
+        var errorKey: String? = null
+
+        mealOrchestrator.analyzeLeftoversFromTextStreaming(
+            currentEntry = base,
+            leftoversText = leftoversText,
+            language = language
+        ).collect { event ->
+            when (event) {
+                is com.example.data.meal.MealAnalysisEvent.Phase ->
+                    _foodAnalysisPhase.value = event.key
+                is com.example.data.meal.MealAnalysisEvent.Done ->
+                    streamedResult = event.result
+                is com.example.data.meal.MealAnalysisEvent.Error -> {
+                    streamedResult = event.salvage
+                    errorKey = event.messageKey
+                }
+                else -> { /* Ignore Partial events */ }
+            }
+        }
+
+        val result = streamedResult ?: return null
+        android.util.Log.i("FOOD_DIAG", "resubtractLeftovers: got result, ${result.calories ?: 0} kcal leftovers")
+
+        return mealOrchestrator.mergeLeftovers(
+            original = base,
+            leftoversResult = result,
+            language = language
+        )
+    }
+
+    /**
+     * Confirm leftovers anyway (user clicked "Confirm Adjustment" on result card).
+     * Proceeds with merge despite plausibility warning.
+     */
+    fun confirmLeftoversAnyway() {
+        val pending = _leftoverValidationPending.value ?: return
+        viewModelScope.launch {
+            try {
+                // Use the pre-calculated consumedPreview instead of re-merging
+                val withLog = pending.consumedPreview.appendEditLog(
+                    type = com.example.data.local.FoodEditType.LEFTOVER,
+                    model = pending.leftovers.analysisModel
+                )
+
+                // Update in DB
+                repository.updateFood(withLog)
+                android.util.Log.i("FOOD_DIAG", "confirmLeftoversAnyway: DB updated, entry id=${withLog.id}")
+
+                // Update session state
+                _pendingFoodSession.value = _pendingFoodSession.value.map { entry ->
+                    if (entry.id == pending.original.id) withLog else entry
+                }
+                android.util.Log.i("FOOD_DIAG", "confirmLeftoversAnyway: session updated")
+
+                // Clear the "summary edited" flag so a subsequent "Accept & Save"
+                // does NOT trigger a fresh AI re-analysis that would overwrite the
+                // subtracted macros. The leftover merge is authoritative. 2026-10-10.
+                _summaryWasEditedAfterAnalysis.value = false
+                _editedLeftoversText.value = null
+
+                // Feedback to user
+                val kcalDiff = (pending.original.calories ?: 0) - (pending.consumedPreview.calories ?: 0)
+                val message = tr("snack_leftovers_adjusted", _userProfile.value.language)
+                    .replace("{kcal}", kcalDiff.toString())
+                _oneShotSnack.emit(message)
+                android.util.Log.i("FOOD_DIAG", "confirmLeftoversAnyway: snackbar shown, diff=$kcalDiff kcal")
+            } finally {
+                _leftoverValidationPending.value = null
+            }
+        }
+    }
+
+    /**
+     * Cancel leftovers confirmation dialog.
+     */
+    fun cancelLeftovers() {
+        _leftoverValidationPending.value = null
+    }
+
+    // ── Delete leftovers / revert meal to its pre-adjustment state ──────────
+    // The persisted leftovers card has an X. Tapping it asks for confirmation
+    // (dialog driven by _leftoverDeletePending); confirming restores the meal
+    // exactly from the snapshot stored in leftoverOriginalJson. 2026-10-10.
+    private val _leftoverDeletePending = MutableStateFlow(false)
+    val leftoverDeletePending = _leftoverDeletePending.asStateFlow()
+
+    fun requestDeleteLeftovers() {
+        _leftoverDeletePending.value = true
+    }
+
+    fun cancelDeleteLeftovers() {
+        _leftoverDeletePending.value = false
+    }
+
+    fun confirmDeleteLeftovers() {
+        val entry = _pendingFoodSession.value.firstOrNull()
+        if (entry == null) {
+            _leftoverDeletePending.value = false
+            return
+        }
+        val snap = com.example.data.local.decodeLeftoverSnapshot(entry.leftoverOriginalJson)
+        if (snap == null) {
+            android.util.Log.e("FOOD_DIAG", "confirmDeleteLeftovers: no snapshot to revert from")
+            _leftoverDeletePending.value = false
+            return
+        }
+        viewModelScope.launch {
+            try {
+                val restored = entry.restoreFromSnapshot(snap)
+                    .appendEditLog(type = com.example.data.local.FoodEditType.LEFTOVER_REMOVED, model = null)
+                repository.updateFood(restored)
+                _pendingFoodSession.value = _pendingFoodSession.value.map {
+                    if (it.id == entry.id) restored else it
+                }
+                _summaryWasEditedAfterAnalysis.value = false
+                _editedLeftoversText.value = null
+                _oneShotSnack.emit(tr("snack_leftovers_removed", _userProfile.value.language))
+                android.util.Log.i(
+                    "FOOD_DIAG",
+                    "confirmDeleteLeftovers: reverted entry ${entry.id} to ${snap.calories} kcal"
+                )
+            } catch (e: Exception) {
+                android.util.Log.e("FOOD_DIAG", "confirmDeleteLeftovers failed", e)
+            } finally {
+                _leftoverDeletePending.value = false
+            }
+        }
+    }
+
+    /**
+     * Shared merge + update logic for leftovers.
+     */
+    private suspend fun performLeftoverMergeAndUpdate(
+        original: FoodEntry,
+        leftoversResult: com.example.data.remote.FoodAnalysisResult,
+        onSuccess: () -> Unit
+    ) {
+        android.util.Log.i("FOOD_DIAG", "performLeftoverMergeAndUpdate: original=${original.calories} kcal, leftovers=${leftoversResult.calories} kcal")
+
+        // Merge leftovers
+        val consumed = mealOrchestrator.mergeLeftovers(
+            original = original,
+            leftoversResult = leftoversResult,
+            language = _userProfile.value.language
+        )
+
+        android.util.Log.i("FOOD_DIAG", "performLeftoverMergeAndUpdate: consumed=${consumed.calories} kcal after merge")
+
+        // Append edit log
+        val withLog = consumed.appendEditLog(
+            type = com.example.data.local.FoodEditType.LEFTOVER,
+            model = leftoversResult.analysisModel
+        )
+
+        // Update in DB
+        repository.updateFood(withLog)
+        android.util.Log.i("FOOD_DIAG", "performLeftoverMergeAndUpdate: DB updated, entry id=${withLog.id}")
+
+        // Update session state so UI reflects changes immediately
+        _pendingFoodSession.value = _pendingFoodSession.value.map { entry ->
+            if (entry.id == original.id) withLog else entry
+        }
+        android.util.Log.i("FOOD_DIAG", "performLeftoverMergeAndUpdate: session updated")
+
+        // Feedback to user
+        val kcalDiff = (original.calories ?: 0) - (consumed.calories ?: 0)
+        val message = tr("snack_leftovers_adjusted", _userProfile.value.language)
+            .replace("{kcal}", kcalDiff.toString())
+        _oneShotSnack.emit(message)
+        android.util.Log.i("FOOD_DIAG", "performLeftoverMergeAndUpdate: snackbar shown, diff=$kcalDiff kcal")
+
+        onSuccess()
     }
 
     /**
@@ -715,6 +1448,7 @@ class ChatViewModel(
         // re-analysis branch in confirmAndSaveFoodEntry is gated off until
         // markSummaryEdited() is called.
         _summaryWasEditedAfterAnalysis.value = false
+        _editedLeftoversText.value = null
         onSuccess()
     }
 
@@ -1139,6 +1873,17 @@ class ChatViewModel(
     private val _cleanedMessageText = MutableStateFlow<Map<Long, String>>(emptyMap())
     val cleanedMessageText: StateFlow<Map<Long, String>> = _cleanedMessageText.asStateFlow()
 
+    /** TTS mode (2026-10-05): per-message spoken script extracted from
+     *  `[TTS_SUMMARY]` blocks, keyed by ChatMessage.id. Populated by
+     *  [ingestAssistantMessage] (covers both the live collect and the
+     *  session-history load path, since both re-run the parser over the
+     *  persisted RAW text — the script survives app restarts). TTS playback
+     *  prefers this over [cleanedMessageText]; a missing entry simply falls
+     *  back to the pre-existing behaviour. Cleared with the rest of the
+     *  per-message maps on session delete (see the purge site below). */
+    private val _ttsSummaryText = MutableStateFlow<Map<Long, String>>(emptyMap())
+    val ttsSummaryText: StateFlow<Map<Long, String>> = _ttsSummaryText.asStateFlow()
+
     /** Phase 2 of chat-redesign 2026-06-12 (#1b — hallucination warning).
      *  Set to `true` for assistant message ids whose text reads like the model
      *  claimed it persisted a habit but **no** [HABIT_PROPOSAL] block was
@@ -1243,6 +1988,14 @@ class ChatViewModel(
         }
         // Always populate so speakMessage() never falls back to raw msg.text
         _cleanedMessageText.update { it + (messageId to parsed.cleanedText) }
+        // TTS mode: the spoken script (when the model emitted one) is keyed
+        // alongside the cleaned text. Because this runs over the persisted
+        // RAW text on BOTH the live collect and the history-load path, the
+        // script survives app restarts — the 🔊 button and Voice Mode pick it
+        // up from the map, never from the visible (stripped) text.
+        if (!parsed.ttsSummary.isNullOrBlank()) {
+            _ttsSummaryText.update { it + (messageId to parsed.ttsSummary) }
+        }
     }
 
     fun confirmHabitProposal(messageId: Long, proposal: HabitProposal) {
@@ -1781,6 +2534,14 @@ class ChatViewModel(
                     val summaryChanged = withGroup.fullSummary != withGroup.lastAiAnalyzedSummary
                     val notBlank = withGroup.fullSummary.isNotBlank()
                     val flagged = _summaryWasEditedAfterAnalysis.value
+                    // Re-analyse ONLY when the user genuinely edited the text
+                    // (`flagged`). A programmatic session refresh (e.g. after a
+                    // leftover merge) re-inits editSummary without firing
+                    // onValueChange, so `flagged` stays false and the subtracted
+                    // macros survive. But if the user DOES edit the description
+                    // after registering leftovers, that is an explicit request to
+                    // recompute — honour it (the edit supersedes the leftovers
+                    // adjustment). 2026-10-10.
                     val needsReanalysis = summaryChanged && notBlank && flagged
                     val finalEntry = if (needsReanalysis) {
                         // Streaming re-analysis: emits Phase events that the
@@ -1863,35 +2624,92 @@ class ChatViewModel(
                                 // applied it) as the next baseline so the
                                 // re-analysis branch only fires when the
                                 // user truly edits the summary again.
-                                lastAiAnalyzedSummary = merged.fullSummary
+                                lastAiAnalyzedSummary = merged.fullSummary,
+                                // A fresh re-analysis supersedes any prior leftovers
+                                // adjustment — the macros now come straight from the
+                                // model, so drop the snapshot and hide the leftovers
+                                // card. 2026-10-10.
+                                leftoverOriginalJson = null
                             )
                         }
                     } else {
                         withGroup
                     }
-                    val saved = if (finalEntry.id != 0L) {
-                        // AUTO when a fresh re-analysis actually ran and produced a
-                        // model-tagged result; MANUAL when only the user's own edit
-                        // changed. Keying off `needsReanalysis` + a resolved model is
-                        // reliable — the old "did analysisModel change" check marked a
-                        // genuine re-analysis MANUAL whenever it resolved to the same
-                        // engine (and mergeReanalysis used to drop the model entirely).
-                        val reanalysed = needsReanalysis && finalEntry.analysisModel != null
-                        val logType = if (reanalysed)
-                            FoodEditType.AUTO
-                        else
-                            FoodEditType.MANUAL
-                        val withLog = finalEntry.appendEditLog(
+
+                    // ── LEFTOVERS RECOMPUTE ON EDIT ────────────────────────────
+                    // If the persisted leftovers card was edited, re-analyze and
+                    // subtract from the correct base: if the description was just
+                    // reanalyzed (needsReanalysis=true), finalEntry is the fresh
+                    // dish with snapshot cleared → subtract from it. Otherwise,
+                    // rebuild the original from the existing pre-leftovers snapshot
+                    // so we subtract from the true original (idempotent), not from
+                    // already-reduced values. 2026-10-16.
+                    val leftoversText = _editedLeftoversText.value
+                    val leftoversEdited = !leftoversText.isNullOrBlank()
+                    val entryAfterLeftovers = if (leftoversEdited) {
+                        _foodAnalysisPhase.value =
+                            com.example.data.meal.MealAnalysisOrchestrator.PHASE_ANALYZING_LEFTOVERS
+                        val base = if (needsReanalysis) {
+                            // Summary was just reanalyzed → finalEntry is the fresh dish
+                            finalEntry
+                        } else {
+                            // Rebuild original from snapshot so subtraction is idempotent
+                            val snap = com.example.data.local.decodeLeftoverSnapshot(
+                                finalEntry.leftoverOriginalJson
+                            )
+                            if (snap != null) finalEntry.copy(
+                                calories = snap.calories,
+                                protein = snap.protein,
+                                carbs = snap.carbs,
+                                fat = snap.fat,
+                                fullSummary = snap.fullSummary,
+                                lastAiAnalyzedSummary = snap.lastAiAnalyzedSummary,
+                                ingredientsJson = snap.ingredientsJson,
+                                freeSugarsG = snap.freeSugarsG,
+                                saturatedFatG = snap.saturatedFatG,
+                                analysisModel = snap.analysisModel
+                            ) else finalEntry
+                        }
+                        val merged = resubtractLeftovers(base, leftoversText!!, _userProfile.value.language)
+                        if (merged != null) {
+                            merged
+                        } else {
+                            _oneShotSnack.tryEmit("snack_reanalysis_failed_saved_anyway")
+                            finalEntry
+                        }
+                    } else {
+                        finalEntry
+                    }
+
+                    val saved = if (entryAfterLeftovers.id != 0L) {
+                        // Determine edit log type based on what happened:
+                        // - LEFTOVER when leftovers were edited (takes precedence)
+                        // - AUTO when a fresh summary re-analysis ran and produced a model
+                        // - MANUAL when only the user's own edit changed
+                        val logType = if (leftoversEdited) {
+                            FoodEditType.LEFTOVER
+                        } else {
+                            val reanalysed = needsReanalysis && entryAfterLeftovers.analysisModel != null
+                            if (reanalysed) FoodEditType.AUTO else FoodEditType.MANUAL
+                        }
+                        val logModel = if (leftoversEdited) {
+                            // Use the leftovers result's analysis model if available
+                            entryAfterLeftovers.analysisModel
+                        } else {
+                            val reanalysed = needsReanalysis && entryAfterLeftovers.analysisModel != null
+                            if (reanalysed) entryAfterLeftovers.analysisModel else null
+                        }
+                        val withLog = entryAfterLeftovers.appendEditLog(
                             type = logType,
-                            model = if (reanalysed) finalEntry.analysisModel else null
+                            model = logModel
                         )
-                        android.util.Log.i("EditLog", "update id=${finalEntry.id} type=$logType log=${withLog.editLogJson?.take(60)}")
+                        android.util.Log.i("EditLog", "update id=${entryAfterLeftovers.id} type=$logType log=${withLog.editLogJson?.take(60)}")
                         repository.updateFood(withLog)
                         withLog
                     } else {
-                        val withLog = finalEntry.appendEditLog(
+                        val withLog = entryAfterLeftovers.appendEditLog(
                             type = FoodEditType.ADDED,
-                            model = finalEntry.analysisModel
+                            model = entryAfterLeftovers.analysisModel
                         )
                         android.util.Log.i("EditLog", "insert id=0 log=${withLog.editLogJson?.take(60)}")
                         val newId = repository.insertFood(withLog)
@@ -1919,6 +2737,7 @@ class ChatViewModel(
                 _perItemAnalysisErrors.value = emptyMap()
                 _analysisError.value = null
                 _summaryWasEditedAfterAnalysis.value = false
+                _editedLeftoversText.value = null
                 _oneShotSnack.tryEmit("snack_meal_saved")
                 // 2026-07-10 (Hugo) — after a successful save, let the
                 // "Refeição guardada" snackbar breathe for 2s, then close the
@@ -2090,6 +2909,7 @@ class ChatViewModel(
         _foodAnalysisProgress.value = com.example.data.meal.FoodAnalysisProgress()
         _foodAnalysisError.value = null
         _summaryWasEditedAfterAnalysis.value = false
+        _editedLeftoversText.value = null
         lastFoodAnalysisRequest = null
         _pendingClosed.tryEmit(Unit)
     }
@@ -2125,6 +2945,7 @@ class ChatViewModel(
         _foodAnalysisProgress.value = com.example.data.meal.FoodAnalysisProgress()
         _foodAnalysisError.value = null
         _summaryWasEditedAfterAnalysis.value = false
+        _editedLeftoversText.value = null
         _summaryWasEditedAfterActivityAnalysis.value = false
         lastFoodAnalysisRequest = null
     }
@@ -2426,6 +3247,14 @@ class ChatViewModel(
     private val _streamingText = MutableStateFlow<String?>(null)
     val streamingText: StateFlow<String?> = _streamingText.asStateFlow()
 
+    /** 2026-10-06 (Frente Thinking) — cumulative extended-thinking text for
+     *  the in-flight turn (Gemini `thought` parts / Qwen reasoning). Rendered
+     *  in the live "Raciocínio" card above the streaming bubble; cleared in
+     *  [clearSendUiIfCurrent] when the turn ends, so the completed message
+     *  shows ONLY the answer. Never persisted. */
+    private val _thinkingText = MutableStateFlow<String?>(null)
+    val thinkingText: StateFlow<String?> = _thinkingText.asStateFlow()
+
     /** 2026-07-06 (Frente B) — pre-computed `[CONTEXTO LOCAL]` block (GPS
      *  fix + IPMA weather). Populated by [prefetchLocalContext], read at
      *  send time in place of the previous inline `buildLocalContextBlock()`
@@ -2471,6 +3300,7 @@ class ChatViewModel(
             _isTyping.value = false
             _typingPhase.value = null
             _streamingText.value = null
+            _thinkingText.value = null
         }
     }
 
@@ -3823,10 +4653,15 @@ class ChatViewModel(
      *  bubble stops (see TtsController.speak semantics). */
     fun speakMessage(msg: ChatMessage) {
         val tts = ttsController ?: return
-        // Prefer the cleaned text (proposal markers, [CHART], etc. already
-        // stripped) so the TTS engine doesn't spell them out. Falls back to
-        // the raw message text if no cleaned copy exists yet.
-        val readable = _cleanedMessageText.value[msg.id] ?: msg.text
+        // TTS mode (2026-10-05): prefer the spoken script when the model
+        // emitted one — it's written for the ear (radio-briefing register),
+        // not a markdown-stripped copy of the visible reply. Falls back to
+        // the cleaned text (proposal markers, [CHART], etc. already
+        // stripped) so the TTS engine doesn't spell them out, then to the
+        // raw message text if no cleaned copy exists yet.
+        val readable = _ttsSummaryText.value[msg.id]
+            ?: _cleanedMessageText.value[msg.id]
+            ?: msg.text
         tts.speak(readable, _userProfile.value.language, msg.id)
     }
 
@@ -3954,14 +4789,19 @@ class ChatViewModel(
         val id = event.insertedMessageId
         val tts = ttsController
         if (id != null && tts != null && _voiceMode.value == VoiceMode.Thinking) {
-            val readable = _cleanedMessageText.value[id] ?: event.cleanedText
+            // TTS mode: the script extracted at Done (if any) beats the
+            // visible text — Voice Mode is exactly the "hands-free briefing"
+            // path, so it should hear the ear-written version.
+            val readable = event.ttsSummary
+                ?: _cleanedMessageText.value[id]
+                ?: event.cleanedText
             if (readable.isNotBlank()) {
                 lastSpokenAssistantId = id
                 _voiceMode.value = VoiceMode.Speaking
                 tts.speak(readable, _userProfile.value.language, id)
                 android.util.Log.d(
                     "CHAT_VOICE",
-                    "auto-speak id=$id text=${readable.take(40)}"
+                    "auto-speak id=$id chars=${readable.length} script=${event.ttsSummary != null} text=${readable.take(40)}"
                 )
             }
         }
@@ -4098,6 +4938,7 @@ class ChatViewModel(
                 _isTyping.value = true
                 _typingPhase.value = tr("thinking", _userProfile.value.language)
                 _streamingText.value = null
+                _thinkingText.value = null
             }
             finishSendLaunch(sendGeneration)
 
@@ -4108,10 +4949,21 @@ class ChatViewModel(
                 val lang = _userProfile.value.language
                 val started = System.currentTimeMillis()
                 var lastTier = 0
+                var lastThinkingLen = 0
                 while (true) {
                     delay(1_000)
                     if (!isCurrentSend(sendGeneration)) break
                     val elapsedSec = ((System.currentTimeMillis() - started) / 1000).toInt()
+                    // 2026-10-06 (Frente Thinking) — reasoning tokens still
+                    // landing is VISIBLE progress (the user is watching the
+                    // model think), so it resets the escalation tiers: we no
+                    // longer show "O servidor está lento" while the thinking
+                    // card is actively growing.
+                    val thinkingLen = _thinkingText.value?.length ?: 0
+                    if (thinkingLen > lastThinkingLen) {
+                        lastThinkingLen = thinkingLen
+                        if (lastTier > 0) lastTier = 0
+                    }
                     val tier = when {
                         elapsedSec >= 30 -> 3
                         elapsedSec >= 15 -> 2
@@ -4148,6 +5000,31 @@ class ChatViewModel(
                 // `orchestrator.handle` was invoked.
                 val freshInstruction = createDefaultSystemInstruction(activeType) + _localContextBlock.value
                 val liveName = _userProfile.value.name
+                // 2026-10-05 (chat TTS mode) — one-shot prompt repair: sessions
+                // created before the TTS-mode persona carry the OLD prompt in
+                // `systemInstruction` (and often a server-side cachedContent
+                // with the old prompt baked in). Refresh the row and drop the
+                // stale cache so this turn's cache re-creation uses the new
+                // prompt. No-op on already-refreshed sessions.
+                // NB: persist only the STABLE base (no _localContextBlock —
+                // that ephemeral weather/GPS block is appended per send and
+                // must not be baked into the stored prompt).
+                activeSession.value?.let { ses ->
+                    val staleCache = repository.refreshStaleSystemInstruction(
+                        ses,
+                        createDefaultSystemInstruction(activeType)
+                    )
+                    if (staleCache != null) {
+                        viewModelScope.launch {
+                            runCatching {
+                                com.example.data.remote.GeminiCacheClient
+                                    .deleteCache(staleCache, BuildConfig.GEMINI_API_KEY)
+                            }.onFailure { t ->
+                                android.util.Log.w("CHAT_PROMPT_REFRESH", "deleteCache failed (cache expires on its own): ${t.message?.take(120)}")
+                            }
+                        }
+                    }
+                }
                 orchestrator.handle(
                     sessionId = targetSessionId,
                     text = textToSend,
@@ -4182,6 +5059,12 @@ class ChatViewModel(
                         is com.example.data.chat.HandleEvent.Partial -> {
                             _streamingText.value = event.accumulatedText
                         }
+                        is com.example.data.chat.HandleEvent.Thinking -> {
+                            // 2026-10-06 (Frente Thinking) — cumulative
+                            // reasoning; feeds the live card. Side-channel:
+                            // never touches _streamingText (the answer).
+                            _thinkingText.value = event.text
+                        }
                         is com.example.data.chat.HandleEvent.Reset -> {
                             // 2026-09-08 (Phase 6, §13) — router failed over
                             // mid-stream. Discard the abandoned partial so the
@@ -4192,6 +5075,9 @@ class ChatViewModel(
                                 "VM Reset: ${event.from} -> ${event.to} (clearing partial)"
                             )
                             _streamingText.value = ""
+                            // The dying provider's reasoning is abandoned with
+                            // its partial — the fallback re-thinks from scratch.
+                            _thinkingText.value = ""
                         }
                         is com.example.data.chat.HandleEvent.Done -> {
                             // 2026-07-07 (Fix #1) — clear typing indicator the
@@ -4400,6 +5286,7 @@ class ChatViewModel(
                 _isTyping.value = true
                 _typingPhase.value = tr("thinking", _userProfile.value.language)
                 _streamingText.value = null
+                _thinkingText.value = null
             }
             finishSendLaunch(sendGeneration)
 
@@ -4468,6 +5355,11 @@ class ChatViewModel(
                         is com.example.data.chat.HandleEvent.Partial -> {
                             _streamingText.value = event.accumulatedText
                         }
+                        is com.example.data.chat.HandleEvent.Thinking -> {
+                            // 2026-10-06 (Frente Thinking) — edit-resubmits
+                            // share the primary path's live reasoning card.
+                            _thinkingText.value = event.text
+                        }
                         is com.example.data.chat.HandleEvent.Reset -> {
                             // 2026-09-08 (Phase 6, §13) — same as the primary
                             // send path: discard the abandoned partial on a
@@ -4478,6 +5370,8 @@ class ChatViewModel(
                                 "VM Reset (edit): ${event.from} -> ${event.to} (clearing partial)"
                             )
                             _streamingText.value = ""
+                            // Abandon the dying provider's reasoning too.
+                            _thinkingText.value = ""
                         }
                         is com.example.data.chat.HandleEvent.Done -> {
                             // 2026-07-07 (Fix #1) — same reasoning as the
@@ -4565,6 +5459,7 @@ class ChatViewModel(
         _pendingHabitWarnings.update { it - s }
         _proposalReceipts.update { it - s }
         _cleanedMessageText.update { it - s }
+        _ttsSummaryText.update { it - s }
     }
 
     private companion object {

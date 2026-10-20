@@ -293,4 +293,55 @@ class ChatProviderRouterTest {
         val done = router.stream(textRequest()).toList().last() as ChatEvent.Completed
         assertEquals("runinfra:q", done.providerModel.value)
     }
+
+    // --- 2026-10-06 (Frente Thinking) --------------------------------------
+
+    @Test
+    fun thinking_events_are_forwarded_transparently() = runTest {
+        val thinkingId = ProviderModelId.of("groq", "q")
+        val thinking = FakeProvider("groq", "q") {
+            flow {
+                emit(ChatEvent.Thinking("a pensar…", "a pensar…"))
+                emit(ChatEvent.Delta("resposta", "resposta"))
+                emit(ChatEvent.Completed("resposta", thinkingId))
+            }
+        }
+        val events = ChatProviderRouter(listOf(thinking), breaker()).stream(textRequest()).toList()
+
+        assertTrue("thinking must be forwarded", events.any { it is ChatEvent.Thinking })
+        assertTrue(events.any { it is ChatEvent.Delta })
+        assertTrue((events.last() as ChatEvent.Completed).fullText == "resposta")
+    }
+
+    @Test
+    fun death_after_thinking_but_before_answer_is_still_pre_token_failover() = runTest {
+        // §13: thinking is NOT answer output. A provider that thinks and then
+        // dies (no Delta) must fail over silently to the next candidate.
+        val thinkerId = ProviderModelId.of("groq", "q")
+        val fallbackId = ProviderModelId.of("runinfra", "q")
+        val thinker = FakeProvider("groq", "q") {
+            flow {
+                emit(ChatEvent.Thinking("a pensar…", "a pensar…"))
+                emit(ChatEvent.Failed(ChatError(ChatErrorKind.UNKNOWN, "boom", thinkerId, null)))
+            }
+        }
+        val fallback = FakeProvider("runinfra", "q") {
+            flow {
+                emit(ChatEvent.Delta("ok", "ok"))
+                emit(ChatEvent.Completed("ok", fallbackId))
+            }
+        }
+        val events = ChatProviderRouter(listOf(thinker, fallback), breaker())
+            .stream(textRequest()).toList()
+
+        val completed = events.filterIsInstance<ChatEvent.Completed>()
+        assertEquals(1, completed.size)
+        assertEquals("runinfra:q", completed[0].providerModel.value)
+        // No Reset: the abandoned attempt produced no answer deltas.
+        assertTrue("thinking-only death must not emit Reset",
+            events.none { it is ChatEvent.Reset })
+        assertTrue("the thinking we saw is still surfaced",
+            events.any { it is ChatEvent.Thinking })
+    }
+
 }

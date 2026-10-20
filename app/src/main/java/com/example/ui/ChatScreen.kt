@@ -761,6 +761,7 @@ fun ChatScreen(
                 oneShotSnack = viewModel.oneShotSnack,
                 resolveMessage = { key -> tr(key, userProfile.language) }
             )
+
         }
     }
 }
@@ -2780,13 +2781,16 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
     // subsequent tap starts clean. See plan
     // see-last-snap-looks-wobbly-quasar.md (2026-07-01).
     var replaceModeRequested by remember { mutableStateOf(false) }
+    var leftoverModeRequested by remember { mutableStateOf(false) }
     val addMoreGalleryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
         // Snapshot the flag on the main thread before hopping to IO so a
         // parallel tap can't race the branch.
         val wasReplace = replaceModeRequested
+        val wasLeftover = leftoverModeRequested
         replaceModeRequested = false
+        leftoverModeRequested = false
         if (uri != null) {
             // Phase 5: lossless byte-copy + verbatim Gemini upload.
             coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
@@ -2796,20 +2800,36 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                     if (pair != null) {
                         val (b64, mime) = pair
                         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                            if (wasReplace) {
-                                viewModel.analyzeAndReplaceFoodImage(
-                                    base64Image = b64,
-                                    imagePath = persistedPath,
-                                    promptHint = "User-uploaded gallery image (replace head item)",
-                                    mimeType = mime
-                                )
-                            } else {
-                                viewModel.analyzeAndAppendFoodImage(
-                                    base64Image = b64,
-                                    imagePath = persistedPath,
-                                    promptHint = "User-uploaded gallery image (extra item in session)",
-                                    mimeType = mime
-                                )
+                            when {
+                                wasLeftover -> {
+                                    val entry = viewModel.pendingFoodSession.value.firstOrNull()
+                                    if (entry != null && entry.id != 0L) {
+                                        viewModel.analyzeLeftovers(
+                                            currentEntry = entry,
+                                            base64Image = b64,
+                                            imagePath = persistedPath,
+                                            mimeType = mime,
+                                            onSuccess = { /* Success handled by ViewModel snackbar */ },
+                                            onFailure = { /* Error handled by ViewModel snackbar */ }
+                                        )
+                                    }
+                                }
+                                wasReplace -> {
+                                    viewModel.analyzeAndReplaceFoodImage(
+                                        base64Image = b64,
+                                        imagePath = persistedPath,
+                                        promptHint = "User-uploaded gallery image (replace head item)",
+                                        mimeType = mime
+                                    )
+                                }
+                                else -> {
+                                    viewModel.analyzeAndAppendFoodImage(
+                                        base64Image = b64,
+                                        imagePath = persistedPath,
+                                        promptHint = "User-uploaded gallery image (extra item in session)",
+                                        mimeType = mime
+                                    )
+                                }
                             }
                         }
                     }
@@ -2830,7 +2850,9 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
         pendingAddMoreCameraFile = null
         pendingAddMoreCameraUri = null
         val wasReplace = replaceModeRequested
+        val wasLeftover = leftoverModeRequested
         replaceModeRequested = false
+        leftoverModeRequested = false
         if (success && file != null && uri != null) {
             val finalUriString = uri.toString()
             coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
@@ -2839,20 +2861,36 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                 if (pair != null) {
                     val (b64, mime) = pair
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                        if (wasReplace) {
-                            viewModel.analyzeAndReplaceFoodImage(
-                                base64Image = b64,
-                                imagePath = finalUriString,
-                                promptHint = "User-captured camera image (replace head item)",
-                                mimeType = mime
-                            )
-                        } else {
-                            viewModel.analyzeAndAppendFoodImage(
-                                base64Image = b64,
-                                imagePath = finalUriString,
-                                promptHint = "User-captured camera image (extra item in session)",
-                                mimeType = mime
-                            )
+                        when {
+                            wasLeftover -> {
+                                val entry = viewModel.pendingFoodSession.value.firstOrNull()
+                                if (entry != null && entry.id != 0L) {
+                                    viewModel.analyzeLeftovers(
+                                        currentEntry = entry,
+                                        base64Image = b64,
+                                        imagePath = finalUriString,
+                                        mimeType = mime,
+                                        onSuccess = { /* Success handled by ViewModel snackbar */ },
+                                        onFailure = { /* Error handled by ViewModel snackbar */ }
+                                    )
+                                }
+                            }
+                            wasReplace -> {
+                                viewModel.analyzeAndReplaceFoodImage(
+                                    base64Image = b64,
+                                    imagePath = finalUriString,
+                                    promptHint = "User-captured camera image (replace head item)",
+                                    mimeType = mime
+                                )
+                            }
+                            else -> {
+                                viewModel.analyzeAndAppendFoodImage(
+                                    base64Image = b64,
+                                    imagePath = finalUriString,
+                                    promptHint = "User-captured camera image (extra item in session)",
+                                    mimeType = mime
+                                )
+                            }
                         }
                     }
                 }
@@ -2874,6 +2912,7 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
             // round, so the read-and-reset there won't fire; do it here so
             // the next gallery tap doesn't inherit stale replace mode.
             replaceModeRequested = false
+            leftoverModeRequested = false
         }
     }
 
@@ -2912,9 +2951,9 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
             )
         }
         var editCalories by remember(entry.id, entry.timestamp, entry.calories) { mutableStateOf(entry.calories.toString()) }
-        var editProtein by remember(entry.id, entry.timestamp) { mutableStateOf(roundedGramsValue(entry.protein)) }
-        var editCarbs by remember(entry.id, entry.timestamp) { mutableStateOf(roundedGramsValue(entry.carbs)) }
-        var editFat by remember(entry.id, entry.timestamp) { mutableStateOf(roundedGramsValue(entry.fat)) }
+        var editProtein by remember(entry.id, entry.timestamp, entry.protein) { mutableStateOf(roundedGramsValue(entry.protein)) }
+        var editCarbs by remember(entry.id, entry.timestamp, entry.carbs) { mutableStateOf(roundedGramsValue(entry.carbs)) }
+        var editFat by remember(entry.id, entry.timestamp, entry.fat) { mutableStateOf(roundedGramsValue(entry.fat)) }
         var selectedCategory by remember(entry.id, entry.timestamp, entry.mealCategory) { mutableStateOf(entry.mealCategory) }
 
         val parsedCals = editCalories.toIntOrNull() ?: entry.calories
@@ -3232,6 +3271,72 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                         modifier = Modifier.padding(start = 2.dp)
                     )
 
+                    // 2026-10-10 — Persisted leftovers card. When this meal was
+                    // adjusted via leftovers (leftoverOriginalJson snapshot present),
+                    // show a read-only summary of what was subtracted — directly
+                    // below the "Resumo Detalhado" box — with an X to revert.
+                    val leftoverSnapshot = remember(pendingFoodEntry?.leftoverOriginalJson) {
+                        com.example.data.local.decodeLeftoverSnapshot(pendingFoodEntry?.leftoverOriginalJson)
+                    }
+                    val parsedLeftovers = remember(leftoverSnapshot) {
+                        com.example.ui.components.parseLeftoversFromBlock(leftoverSnapshot?.leftoverBlockText)
+                    }
+                    parsedLeftovers?.let { parsed ->
+                        com.example.ui.components.PersistedLeftoverCard(
+                            parsed = parsed,
+                            onDelete = { viewModel.requestDeleteLeftovers() },
+                            onLeftoversEdited = { txt -> viewModel.markLeftoversEdited(txt) },
+                            tr = { key, lang -> tr(key, lang) },
+                            language = userProfile.language
+                        )
+                    }
+
+                    // Confirmation dialog for deleting leftovers (reverts the meal
+                    // to its pre-adjustment state). 2026-10-10.
+                    val deletePending by viewModel.leftoverDeletePending.collectAsState()
+                    if (deletePending) {
+                        AlertDialog(
+                            onDismissRequest = { viewModel.cancelDeleteLeftovers() },
+                            title = {
+                                Text(
+                                    tr("dialog_delete_leftovers_title", userProfile.language),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            },
+                            text = { Text(tr("dialog_delete_leftovers_body", userProfile.language)) },
+                            confirmButton = {
+                                TextButton(onClick = { viewModel.confirmDeleteLeftovers() }) {
+                                    Text(
+                                        tr("button_delete", userProfile.language),
+                                        color = Color(0xFFEF4444),
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { viewModel.cancelDeleteLeftovers() }) {
+                                    Text(
+                                        tr("Cancel", userProfile.language),
+                                        color = Color(0xFF64748B)
+                                    )
+                                }
+                            },
+                            containerColor = Color(0xFF1E293B),
+                            titleContentColor = Color.White,
+                            textContentColor = Color(0xFFCBD5E1)
+                        )
+                    }
+                }
+            }
+
+            // Card 2 — Category + Energy + macros (grouped per 2026-10-10 layout)
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                border = BorderStroke(1.dp, Color(0xFF334155))
+            ) {
+                Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     // Meal Category Selector
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text(
@@ -3314,7 +3419,7 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                         OutlinedTextField(
                             value = editCarbs,
                             onValueChange = { editCarbs = it },
-                            label = { Text(tr("Carbs (g)", userProfile.language)) },
+                            label = { Text(tr("Carbs (g)", userProfile.language), maxLines = 1) },
                             modifier = Modifier.weight(1f).testTag("edit_meal_carbs_input"),
                             singleLine = true,
                             keyboardOptions = KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal),
@@ -3336,7 +3441,17 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                             )
                         )
                     }
+                }
+            }
 
+            // Card 4 — Macro breakdown, applied habits, date picker
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                border = BorderStroke(1.dp, Color(0xFF334155))
+            ) {
+                Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     // Progress indicators — macro bars first (with optional
                     // per-ingredient hints from the LLM breakdown), then the
                     // applied-habits chip, then the date picker row right
@@ -3602,12 +3717,152 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                     if (isSaving) {
                         CircularProgressIndicator(color = Color(0xFF0F172A), modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text(tr("Analyzing changes...", userProfile.language), fontWeight = FontWeight.Bold)
+                        Text(tr("Analyzing changes...", userProfile.language), fontWeight = FontWeight.Bold, maxLines = 1)
                     } else {
                         Icon(Icons.Rounded.Check, contentDescription = null)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text(tr("Accept & Save Meal", userProfile.language), fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        Text(tr("Accept & Save Meal", userProfile.language), fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1)
                     }
+                }
+
+                // Close button — moved directly below "Accept & Save" so the
+                // primary close action sits with the primary save action, above
+                // the leftovers group. 2026-10-10.
+                Button(
+                    onClick = { viewModel.rejectPendingFoodEntry() },
+                    enabled = !isSaving,
+                    modifier = Modifier.fillMaxWidth().height(50.dp).testTag("reject_analysis_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent, contentColor = Color(0xFFEF4444)),
+                    border = BorderStroke(1.dp, Color(0xFF7F1D1D))
+                ) {
+                    Icon(Icons.Rounded.Close, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    val nothingToDiscard = pendingFoodEntry?.let { it.id != 0L && !summaryEdited } == true
+                    Text(
+                        tr(if (nothingToDiscard) "Close" else "Close & Discard", userProfile.language),
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                // 2026-10-09 — "Registar Sobras" group. Only shown when:
+                // - Single persisted entry (id != 0)
+                // - Entry has a photo (imagePath != null)
+                // - Not currently saving/analyzing
+                val currentEntry = sessionItems.firstOrNull()
+                val canLogLeftovers = currentEntry != null
+                    && currentEntry.id != 0L
+                    && currentEntry.imagePath != null
+                    && !isSaving
+                    && !isAnalyzing
+
+                if (canLogLeftovers) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    // Bordered group so the capture buttons read as belonging to
+                    // the leftovers action, not floating free. 2026-10-10.
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B).copy(alpha = 0.4f)),
+                        border = BorderStroke(1.5.dp, AccentPrimary.copy(alpha = 0.6f))
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            // Header label for the leftovers capture pair.
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Rounded.RemoveCircle,
+                                    contentDescription = null,
+                                    tint = AccentPrimary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    tr("button_log_leftovers", userProfile.language),
+                                    color = AccentPrimary,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 15.sp
+                                )
+                            }
+                            // Two capture options — gallery OR camera.
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                        OutlinedButton(
+                            onClick = {
+                                leftoverModeRequested = true
+                                addMoreGalleryLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            },
+                            modifier = Modifier.weight(1f).height(46.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentPrimary),
+                            border = BorderStroke(1.5.dp, AccentPrimary)
+                        ) {
+                            Icon(Icons.Rounded.FileUpload, contentDescription = null)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(tr("Pick Photo", userProfile.language), fontSize = 13.sp, maxLines = 1)
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                leftoverModeRequested = true
+                                val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                                    context, android.Manifest.permission.CAMERA
+                                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                                if (granted) {
+                                    launchCamera(context, addMoreCameraLauncher, dirName = "food_images") { f, u ->
+                                        pendingAddMoreCameraFile = f
+                                        pendingAddMoreCameraUri = u
+                                    }
+                                } else {
+                                    addMoreCameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
+                                }
+                            },
+                            modifier = Modifier.weight(1f).height(46.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentPrimary),
+                            border = BorderStroke(1.5.dp, AccentPrimary)
+                        ) {
+                            Icon(Icons.Rounded.PhotoCamera, contentDescription = null)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(tr("Take Photo", userProfile.language), fontSize = 13.sp, maxLines = 1)
+                        }
+                    }
+                        }
+                    }
+                }
+
+                // 2026-10-10 — Leftovers result card. Shown after analysis completes,
+                // displaying detected leftovers breakdown and consumed calculation.
+                val leftoverValidation by viewModel.leftoverValidationPending.collectAsState()
+                leftoverValidation?.let { state ->
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    val warningText = state.validation.warningKey?.let { key ->
+                        tr(key, userProfile.language).replace(
+                            "{percent}",
+                            state.validation.leftoverPercent.toInt().toString()
+                        )
+                    }
+
+                    com.example.ui.components.LeftoverResultCard(
+                        original = state.original,
+                        leftovers = state.leftovers,
+                        consumedPreview = state.consumedPreview,
+                        hasWarning = !state.validation.isPlausible,
+                        warningText = warningText,
+                        onConfirm = { viewModel.confirmLeftoversAnyway() },
+                        onCancel = { viewModel.cancelLeftovers() },
+                        tr = { key, lang -> tr(key, lang) },
+                        language = userProfile.language
+                    )
                 }
 
                 // 2026-06-18 — re-analysis feedback bubble. Visible when the
@@ -3621,9 +3876,11 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                 // the user thought "nada aconteceu". The bubble now covers
                 // both the save-reanalysis and the photo-replace windows,
                 // including the seconds spent retrying a 429.
+                // 2026-10-10 — ALSO covers leftovers analysis (isAnalyzingLeftovers).
                 run {
                     val phaseKey by viewModel.foodAnalysisPhase.collectAsState()
-                    val isReanalyzing = (isSaving || isAnalyzing) && phaseKey != null
+                    val isAnalyzingLeftovers by viewModel.isAnalyzingLeftovers.collectAsState()
+                    val isReanalyzing = (isSaving || isAnalyzing || isAnalyzingLeftovers) && phaseKey != null
                     androidx.compose.animation.AnimatedVisibility(visible = isReanalyzing) {
                         TypingIndicatorBubble(
                             phaseText = tr(
@@ -3633,26 +3890,6 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                             onCancel = { viewModel.cancelFoodAnalysis() }
                         )
                     }
-                }
-
-                Button(
-                    onClick = { viewModel.rejectPendingFoodEntry() },
-                    enabled = !isSaving,
-                    modifier = Modifier.fillMaxWidth().height(50.dp).testTag("reject_analysis_button"),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent, contentColor = Color(0xFFEF4444)),
-                    border = BorderStroke(1.dp, Color(0xFF7F1D1D))
-                ) {
-                    Icon(Icons.Rounded.Close, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    // Persisted row + no fresh edits → plain "Fechar" (nothing
-                    // to discard). Otherwise the destructive "Fechar e Descartar"
-                    // keeps its warning weight.
-                    val nothingToDiscard = pendingFoodEntry?.let { it.id != 0L && !summaryEdited } == true
-                    Text(
-                        tr(if (nothingToDiscard) "Close" else "Close & Discard", userProfile.language),
-                        fontWeight = FontWeight.Bold
-                    )
                 }
 
                 // Edit log — most-recent first, shown below Fechar
@@ -3671,9 +3908,11 @@ private fun FoodCaptureSection(viewModel: ChatViewModel) {
                         editLog.forEach { entry ->
                             val d = java.util.Date(entry.epochMs)
                             val typeLabel = when (entry.type) {
-                                com.example.data.local.FoodEditType.ADDED  -> "Adicionado"
-                                com.example.data.local.FoodEditType.AUTO   -> "Atualiz. Auto"
-                                com.example.data.local.FoodEditType.MANUAL -> "Atualiz. Manual"
+                                com.example.data.local.FoodEditType.ADDED            -> "Adicionado"
+                                com.example.data.local.FoodEditType.AUTO             -> "Atualiz. Auto"
+                                com.example.data.local.FoodEditType.MANUAL           -> "Atualiz. Manual"
+                                com.example.data.local.FoodEditType.LEFTOVER         -> "Sobras registadas"
+                                com.example.data.local.FoodEditType.LEFTOVER_REMOVED -> "Sobras eliminadas"
                             }
                             // Append the LLM behind the write (e.g. "· gemini-3.5-flash").
                             // Null for purely manual edits and pre-field entries — those
@@ -4503,6 +4742,10 @@ fun ChatTab(
     // them in an in-list bubble pinned at index 0 with the top-anchor
     // pattern below.
     val streamingText by viewModel.streamingText.collectAsState()
+    // 2026-10-06 (Frente Thinking) — live model reasoning for the in-flight
+    // turn; rendered in the collapsible ThinkingCard above the streaming
+    // bubble, gone when the answer lands.
+    val thinkingText by viewModel.thinkingText.collectAsState()
     val attachedChatImageBase64 by viewModel.attachedChatImageBase64.collectAsState()
     val attachedChatImagePaths by viewModel.attachedChatImagePaths.collectAsState()
     // Phase 3 (#4): observed in [ChatTab] so the input bar at both call
@@ -5496,6 +5739,24 @@ fun ChatTab(
                                     // pins the view to the start of the
                                     // assistant's reply when it begins.
                                     if (isTyping) {
+                                        // 2026-10-06 (Frente Thinking) — live
+                                        // reasoning card. Expanded while the
+                                        // model is still thinking (no answer
+                                        // bytes yet); auto-minimises to one
+                                        // line the moment the answer starts
+                                        // streaming; gone when the turn
+                                        // completes (thinkingText is cleared
+                                        // in clearSendUiIfCurrent).
+                                        val thinking = thinkingText
+                                        if (!thinking.isNullOrBlank()) {
+                                            item(key = "thinking_card") {
+                                                ThinkingCard(
+                                                    text = thinking,
+                                                    language = userProfile.language,
+                                                    active = streamingText.isNullOrBlank(),
+                                                )
+                                            }
+                                        }
                                         val live = streamingText
                                         if (!live.isNullOrBlank()) {
                                             item(key = "streaming_bubble") {
@@ -10780,6 +11041,115 @@ fun TypingIndicatorBubble(
                             contentDescription = "Cancel",
                             tint = Color(0xFF94A3B8),
                             modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ThinkingCard(
+    text: String,
+    language: String,
+    /** true while the model is still thinking (no answer bytes yet).
+     *  Flips to false the moment the answer starts streaming → the card
+     *  auto-minimises to a one-line "reasoning complete" row. */
+    active: Boolean,
+) {
+    // 2026-10-06 (Frente Thinking) — the live reasoning card.
+    //
+    // UX contract (Hugo, 2026-10-06): while the reply is being elaborated
+    // the user must SEE the reasoning being thought (streaming, tail-pinned);
+    // when the message completes, the thinking MINIMISES and only the
+    // answer bubble remains. Implementation: expanded while [active];
+    // a LaunchedEffect on [active] auto-collapses on false and
+    // re-expands when the NEXT turn starts thinking (active flips back
+    // to true) — so the same list item key works across turns without
+    // stale state. Tapping the header toggles manually at any time.
+    var userExpanded by rememberSaveable { mutableStateOf(true) }
+    LaunchedEffect(active) {
+        userExpanded = active
+    }
+    val expanded = userExpanded
+    val scrollState = rememberScrollState()
+    // Tail-pin: as new reasoning fragments land, keep the newest visible.
+    LaunchedEffect(text.length) {
+        if (expanded) {
+            scrollState.scrollTo(scrollState.maxValue)
+        }
+    }
+    val title = tr("reasoning", language)
+    val doneLabel = tr("reasoning_done", language)
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.Start
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth(0.85f)
+                .padding(vertical = 4.dp)
+                .animateContentSize(),
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF16202F)),
+            border = BorderStroke(1.dp, Color(0xFF2B3A50))
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { userExpanded = !userExpanded }
+                ) {
+                    Icon(
+                        imageVector = if (active) Icons.Rounded.Edit else Icons.Rounded.Done,
+                        contentDescription = null,
+                        tint = if (active) Color(0xFF7DD3FC) else Color(0xFF64748B),
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = if (active) title else doneLabel,
+                        color = if (active) Color(0xFF93C5FD) else Color(0xFF64748B),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    if (active) {
+                        // pulsing-dot hint: the model is actively thinking
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "…",
+                            color = Color(0xFF7DD3FC),
+                            fontSize = 13.sp
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Icon(
+                        imageVector = if (expanded) Icons.Rounded.KeyboardArrowUp
+                        else Icons.Rounded.KeyboardArrowDown,
+                        contentDescription = "Toggle",
+                        tint = Color(0xFF64748B),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+                if (expanded) {
+                    Spacer(Modifier.height(8.dp))
+                    // Plain Text (not Markdown): raw model reasoning is
+                    // intentionally unpolished — markdown-parsing half-finished
+                    // thinking would flicker broken syntax.
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 140.dp)
+                            .verticalScroll(scrollState)
+                    ) {
+                        Text(
+                            text = text,
+                            color = Color(0xFF94A3B8),
+                            fontSize = 12.sp,
+                            lineHeight = 16.sp
                         )
                     }
                 }

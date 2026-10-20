@@ -34,6 +34,9 @@ interface PerformanceSnapshotDao {
     """)
     suspend fun getBetween(startMs: Long, endMs: Long): List<PerformanceSnapshotEntity>
 
+    @Query("SELECT * FROM performance_snapshots WHERE id=:id")
+    suspend fun getById(id: Long): PerformanceSnapshotEntity?
+
     /** True if an assessment was already captured within 60 s of [timestampMs].
      *  Used to prevent double-saves when the user quickly confirms/retakes. */
     @Query("""
