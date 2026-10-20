@@ -72,6 +72,348 @@ private enum class MobilityKpi(
 
 private val DATE_FMT = SimpleDateFormat("dd/MM/yy", Locale.getDefault())
 
+// ─── Body plan UI (v39) ──────────────────────────────────────────────────────
+
+/** Internal segmented navigation of the Performance tab. */
+private enum class PerfTab { OVERVIEW, PLAN, PROGRESS }
+
+private data class ParsedPriority(
+    val zone: String,
+    val direction: String, // REDUCE | GROW | HOLD
+    val gapPp: Float,
+    val tissue: String,
+)
+
+private data class ParsedTactic(
+    val category: String,
+    val text: String,
+    val target: String?,
+    val windowDays: Int,
+)
+
+/** Fail-soft parsers for the persisted JSON payloads (never throw). */
+private fun parsePriorities(json: String?): List<ParsedPriority> = try {
+    val arr = org.json.JSONArray(json ?: return emptyList())
+    (0 until arr.length()).mapNotNull { i ->
+        val o = arr.optJSONObject(i) ?: return@mapNotNull null
+        val zone = o.optString("zone", "").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        ParsedPriority(
+            zone = zone,
+            direction = o.optString("direction", "HOLD"),
+            gapPp = o.optDouble("gapPp", 0.0).toFloat(),
+            tissue = o.optString("tissue", "UNKNOWN"),
+        )
+    }
+} catch (e: Exception) {
+    emptyList()
+}
+
+private fun parseTactics(json: String?): List<ParsedTactic> = try {
+    val arr = org.json.JSONArray(json ?: return emptyList())
+    (0 until arr.length()).mapNotNull { i ->
+        val o = arr.optJSONObject(i) ?: return@mapNotNull null
+        val text = o.optString("text", "").trim().takeIf { it.isNotBlank() }
+            ?: return@mapNotNull null
+        ParsedTactic(
+            category = o.optString("category", ""),
+            text = text,
+            target = o.optString("target", "").trim().takeIf { it.isNotBlank() },
+            windowDays = o.optInt("windowDays", 28),
+        )
+    }
+} catch (e: Exception) {
+    emptyList()
+}
+
+@Composable
+private fun PerfSegmentedControl(
+    selected: PerfTab,
+    onSelect: (PerfTab) -> Unit,
+    lang: String,
+) {
+    val labels = listOf(
+        PerfTab.OVERVIEW to tr("perf_tab_overview", lang),
+        PerfTab.PLAN to tr("perf_tab_plan", lang),
+        PerfTab.PROGRESS to tr("perf_tab_progress", lang),
+    )
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        labels.forEach { (tab, label) ->
+            val isSelected = tab == selected
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = if (isSelected) AccentPrimary else Color(0xFF1A1F2E),
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable { onSelect(tab) },
+            ) {
+                Text(
+                    label,
+                    color = if (isSelected) Color.White else Color.White.copy(alpha = 0.6f),
+                    fontSize = 12.sp,
+                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 9.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PhaseBadge(phase: String?, lang: String) {
+    if (phase.isNullOrBlank()) {
+        Surface(
+            shape = RoundedCornerShape(8.dp),
+            color = Color(0xFF2A3350),
+            modifier = Modifier.padding(end = 4.dp),
+        ) {
+            Text(
+                tr("phase_unknown", lang),
+                color = Color.White.copy(alpha = 0.7f),
+                fontSize = 12.sp,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            )
+        }
+        return
+    }
+    val (label, color) = when (phase) {
+        "CUT" -> tr("phase_cut", lang) to Color(0xFF38BDF8)
+        "BULK" -> tr("phase_bulk", lang) to Color(0xFF4ADE80)
+        "RECOMP" -> tr("phase_recomp", lang) to Color(0xFFA78BFA)
+        else -> tr("phase_maintain", lang) to Color(0xFF94A3B8)
+    }
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = color.copy(alpha = 0.16f),
+        modifier = Modifier.padding(end = 4.dp),
+    ) {
+        Text(
+            label,
+            color = color,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+        )
+    }
+}
+
+/**
+ * Plano (v39): latest body-plan checkpoint — phase badge, top-3 priority
+ * zones (safety-gated directions), tactics list with source label, and a
+ * retry that re-runs the LLM enrichment. Deterministic core is always
+ * present; only the LLM parts can be pending/missing.
+ */
+@Composable
+private fun BodyPlanView(
+    checkpoints: List<com.example.data.local.BodyPlanCheckpointEntity>,
+    hasGoalTargets: Boolean,
+    lang: String,
+    onRetry: (Long) -> Unit,
+) {
+    val cp = checkpoints.firstOrNull()
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF1A1F2E), RoundedCornerShape(16.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        if (cp == null) {
+            Text(
+                tr("plan_no_checkpoint", lang),
+                color = Color.White.copy(alpha = 0.55f),
+                fontSize = 13.sp,
+            )
+            return
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(tr("plan_phase", lang), color = Color.White, fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.weight(1f))
+            PhaseBadge(cp.phase, lang)
+            Text(
+                DATE_FMT.format(Date(cp.checkpointAtMs)),
+                color = Color.White.copy(alpha = 0.45f), fontSize = 11.sp,
+            )
+        }
+
+        // ── Priorities ────────────────────────────────────────────────────────
+        val priorities = parsePriorities(cp.prioritiesJson)
+        if (priorities.isEmpty() && !hasGoalTargets) {
+            Text(
+                tr("plan_no_targets", lang),
+                color = Color.White.copy(alpha = 0.5f), fontSize = 12.sp,
+            )
+        } else if (priorities.isNotEmpty()) {
+            Text(tr("plan_priorities", lang),
+                color = Color.White.copy(alpha = 0.6f),
+                fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+            priorities.forEach { p ->
+                val (dirLabel, dirColor) = when (p.direction) {
+                    "REDUCE" -> tr("plan_direction_reduce", lang) to Color(0xFFF87171)
+                    "GROW" -> tr("plan_direction_grow", lang) to Color(0xFF4ADE80)
+                    else -> tr("plan_direction_hold", lang) to Color(0xFF94A3B8)
+                }
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF12172A), RoundedCornerShape(10.dp))
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        tr("zone_${p.zone}", lang),
+                        color = Color.White, fontSize = 13.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        "${if (p.gapPp >= 0) "+" else ""}${p.gapPp.roundTo1Ui()}pp",
+                        color = Color.White.copy(alpha = 0.5f), fontSize = 12.sp,
+                    )
+                    Text(
+                        dirLabel,
+                        color = dirColor, fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+        }
+
+        // ── Tactics ───────────────────────────────────────────────────────────
+        val tactics = parseTactics(cp.tacticsJson)
+        Text(tr("plan_tactics", lang),
+            color = Color.White.copy(alpha = 0.6f),
+            fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+        if (tactics.isEmpty()) {
+            Text(
+                tr("plan_tactics_pending", lang),
+                color = Color.White.copy(alpha = 0.5f), fontSize = 12.sp,
+            )
+        } else {
+            tactics.forEach { t ->
+                Column(Modifier.padding(vertical = 3.dp)) {
+                    Text(t.text, color = Color.White, fontSize = 13.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        t.target?.let {
+                            Text(it, color = AccentSoft, fontSize = 11.sp)
+                        }
+                        Text(
+                            tr("plan_window_days", lang).replace("{days}", "${t.windowDays}"),
+                            color = Color.White.copy(alpha = 0.35f), fontSize = 10.sp,
+                        )
+                    }
+                }
+            }
+            val sourceLabel = if (cp.tacticSource == "llm")
+                tr("plan_tactics_source_llm", lang)
+            else tr("plan_tactics_source_fallback", lang)
+            Text(
+                sourceLabel,
+                color = Color.White.copy(alpha = 0.35f), fontSize = 10.sp,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+
+        // ── Retry (only when an LLM part is missing / fallback) ───────────────
+        val needsEnrichment = cp.tacticSource != "llm" || cp.coachReport == null
+        if (needsEnrichment) {
+            OutlinedButton(
+                onClick = { onRetry(cp.id) },
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentSoft),
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Text(tr("plan_retry", lang), fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+/**
+ * Progresso (v39): checkpoint timeline — date, phase, delta summary,
+ * per-checkpoint report with its own retry.
+ */
+@Composable
+private fun BodyProgressView(
+    checkpoints: List<com.example.data.local.BodyPlanCheckpointEntity>,
+    lang: String,
+    onRetry: (Long) -> Unit,
+) {
+    if (checkpoints.isEmpty()) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = Color(0xFF1A1F2E),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                tr("progress_empty", lang),
+                color = Color.White.copy(alpha = 0.55f), fontSize = 13.sp,
+                modifier = Modifier.padding(16.dp),
+            )
+        }
+        return
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        checkpoints.forEach { cp ->
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF1A1F2E), RoundedCornerShape(16.dp))
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        DATE_FMT.format(Date(cp.checkpointAtMs)),
+                        color = Color.White, fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
+                    )
+                    PhaseBadge(cp.phase, lang)
+                }
+                cp.deltaSummary?.let {
+                    Text(
+                        tr("plan_delta_label", lang) + ": " + it,
+                        color = Color.White.copy(alpha = 0.55f), fontSize = 12.sp,
+                    )
+                }
+                if (cp.coachReport != null) {
+                    Text(
+                        cp.coachReport,
+                        color = Color.White.copy(alpha = 0.85f), fontSize = 12.sp,
+                        lineHeight = 18.sp,
+                    )
+                } else {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            tr("progress_report_pending", lang),
+                            color = Color.White.copy(alpha = 0.45f), fontSize = 12.sp,
+                        )
+                        TextButton(onClick = { onRetry(cp.id) }) {
+                            Text(tr("plan_retry", lang), fontSize = 12.sp, color = AccentSoft)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun Float.roundTo1Ui(): String {
+    val r = kotlin.math.round(this * 10f) / 10f
+    return if (r == kotlin.math.floor(r)) r.toInt().toString() else r.toString()
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 private fun PerformanceSnapshotEntity.hasSilhouetteData(): Boolean =
@@ -157,7 +499,12 @@ fun PerformanceTab(viewModel: ChatViewModel) {
     val snapshots by viewModel.performanceSnapshots.collectAsStateWithLifecycle()
     val latestGoal by viewModel.latestPerformanceGoal.collectAsStateWithLifecycle()
     val userProfile by viewModel.userProfile.collectAsStateWithLifecycle()
+    val bodyPlanCheckpoints by viewModel.bodyPlanCheckpoints.collectAsStateWithLifecycle()
     var showAssessment by remember { mutableStateOf(false) }
+    val lang = userProfile.language
+
+    // Internal segmented navigation (v39): Visão geral | Plano | Progresso.
+    var perfTab by rememberSaveable { mutableStateOf(PerfTab.OVERVIEW) }
 
     // Collapse state for the secondary cards (silhouette + history stay fixed).
     // Coach report starts expanded; the rest collapsed to keep the view compact.
@@ -177,6 +524,8 @@ fun PerformanceTab(viewModel: ChatViewModel) {
         )
         return
     }
+
+    val hasGoalTargets = latestGoal?.coachTargetJson != null
 
     LazyColumn(
         modifier = Modifier
@@ -210,6 +559,37 @@ fun PerformanceTab(viewModel: ChatViewModel) {
             }
         }
 
+        // ── Segmented navigation (v39) ────────────────────────────────────────
+        item {
+            PerfSegmentedControl(selected = perfTab, onSelect = { perfTab = it }, lang = lang)
+        }
+
+        // ── Plano (v39): latest body-plan checkpoint ──────────────────────────
+        if (perfTab == PerfTab.PLAN) {
+            item {
+                BodyPlanView(
+                    checkpoints = bodyPlanCheckpoints,
+                    hasGoalTargets = hasGoalTargets,
+                    lang = lang,
+                    onRetry = { viewModel.requestCheckpointEnrichment(it) },
+                )
+            }
+            return@LazyColumn
+        }
+
+        // ── Progresso (v39): checkpoint timeline ─────────────────────────────
+        if (perfTab == PerfTab.PROGRESS) {
+            item {
+                BodyProgressView(
+                    checkpoints = bodyPlanCheckpoints,
+                    lang = lang,
+                    onRetry = { viewModel.requestCheckpointEnrichment(it) },
+                )
+            }
+            return@LazyColumn
+        }
+
+        // ── Overview (original content) ───────────────────────────────────────
         // ── Empty state ───────────────────────────────────────────────────────
         if (snapshots.isEmpty()) {
             item { EmptyPerformanceState(onStart = { showAssessment = true }) }
@@ -361,12 +741,23 @@ private fun CoachReportContent(
                 }
             }
             snap.hasSilhouetteData() -> {
+                // Pending report: generation runs async; if it failed (or the
+                // app restarted), the spinner below would spin forever — so a
+                // 'Gerar novamente' retry is always offered (v39 fix).
                 Text("A gerar relatório...",
                     color = Color.White.copy(alpha = 0.55f), fontSize = 13.sp)
                 LinearProgressIndicator(
                     color = AccentSoft,
                     modifier = Modifier.fillMaxWidth().height(2.dp),
                 )
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onGenerateReport,
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentSoft),
+                    shape = RoundedCornerShape(10.dp),
+                ) {
+                    Text("Gerar novamente", fontSize = 12.sp)
+                }
             }
             else -> {
                 Text(
