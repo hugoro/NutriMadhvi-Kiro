@@ -184,10 +184,17 @@ fun SilhouetteAssessmentScreen(
                         lateralChestRatio    = lateralRatios?.chestRatio,
                         lateralBellyRatio    = lateralRatios?.bellyRatio,
                         lateralThighRatio    = lateralRatios?.lateralThighRatio,
-                        // Which zone convention produced the ratios (frontal
-                        // capture is primary; lateral as fallback).
+                        // v39 legacy marker (kept for compatibility): the primary
+                        // side's convention. v40 replaced it with the per-side
+                        // markers below, because frontal and lateral can
+                        // legitimately use DIFFERENT conventions in one capture
+                        // (e.g. full-body pose detected on one shot only) — one
+                        // marker lying about both sides would let the trend
+                        // chart compare not-same-unit values.
                         silhouetteNormalization = frontalAnalysis?.normalization
                             ?: lateralAnalysis?.normalization,
+                        frontalNormalization = frontalAnalysis?.normalization,
+                        lateralNormalization = lateralAnalysis?.normalization,
                     )
                     withContext(Dispatchers.Main) { onConfirm(entity) }
                 }

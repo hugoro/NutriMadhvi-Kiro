@@ -38,15 +38,16 @@ import java.util.Locale
 
 private enum class SilhouetteKpi(
     val label: String,
+    val isFrontal: Boolean,
     val pick: (PerformanceSnapshotEntity) -> Float?
 ) {
-    FRONTAL_SHOULDER("Ombros", { it.frontalShoulderRatio }),
-    FRONTAL_WAIST("Cintura", { it.frontalWaistRatio }),
-    FRONTAL_HIP("Ancas", { it.frontalHipRatio }),
-    FRONTAL_THIGH("Coxas", { it.frontalThighRatio }),
-    LATERAL_CHEST("Peito (lat)", { it.lateralChestRatio }),
-    LATERAL_BELLY("Barriga (lat)", { it.lateralBellyRatio }),
-    LATERAL_THIGH("Coxa (lat)", { it.lateralThighRatio }),
+    FRONTAL_SHOULDER("Ombros", true, { it.frontalShoulderRatio }),
+    FRONTAL_WAIST("Cintura", true, { it.frontalWaistRatio }),
+    FRONTAL_HIP("Ancas", true, { it.frontalHipRatio }),
+    FRONTAL_THIGH("Coxas", true, { it.frontalThighRatio }),
+    LATERAL_CHEST("Peito (lat)", false, { it.lateralChestRatio }),
+    LATERAL_BELLY("Barriga (lat)", false, { it.lateralBellyRatio }),
+    LATERAL_THIGH("Coxa (lat)", false, { it.lateralThighRatio }),
 }
 
 // ─── Legacy joint KPIs (kept for backward compat with v35 angle-only snapshots)
@@ -72,7 +73,7 @@ private enum class MobilityKpi(
 
 private val DATE_FMT = SimpleDateFormat("dd/MM/yy", Locale.getDefault())
 
-// ─── Body plan UI (v39) ──────────────────────────────────────────────────────
+// ─── Body plan UI (v39, hardened v40) ───────────────────────────────────────
 
 /** Internal segmented navigation of the Performance tab. */
 private enum class PerfTab { OVERVIEW, PLAN, PROGRESS }
@@ -91,16 +92,24 @@ private data class ParsedTactic(
     val windowDays: Int,
 )
 
-/** Fail-soft parsers for the persisted JSON payloads (never throw). */
+/**
+ * Fail-soft + defensive parsers for the persisted JSON payloads (never
+ * throw). v40 hardening: non-finite or implausible numbers are REJECTED at
+ * the parse boundary (gapPp must be finite and ≤ 30pp; windowDays must be
+ * finite and 1..365 before being clamped into 7..120) so a corrupted or
+ * hostile row can never drive the UI.
+ */
 private fun parsePriorities(json: String?): List<ParsedPriority> = try {
     val arr = org.json.JSONArray(json ?: return emptyList())
     (0 until arr.length()).mapNotNull { i ->
         val o = arr.optJSONObject(i) ?: return@mapNotNull null
         val zone = o.optString("zone", "").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val gapRaw = o.optDouble("gapPp", Double.NaN)
+        if (!gapRaw.isFinite() || kotlin.math.abs(gapRaw) > 30.0) return@mapNotNull null
         ParsedPriority(
             zone = zone,
             direction = o.optString("direction", "HOLD"),
-            gapPp = o.optDouble("gapPp", 0.0).toFloat(),
+            gapPp = gapRaw.toFloat(),
             tissue = o.optString("tissue", "UNKNOWN"),
         )
     }
@@ -114,11 +123,15 @@ private fun parseTactics(json: String?): List<ParsedTactic> = try {
         val o = arr.optJSONObject(i) ?: return@mapNotNull null
         val text = o.optString("text", "").trim().takeIf { it.isNotBlank() }
             ?: return@mapNotNull null
+        val wRaw = o.opt("windowDays") as? Number
+        if (wRaw == null || !wRaw.toDouble().isFinite() ||
+            wRaw.toInt() !in 1..365
+        ) return@mapNotNull null
         ParsedTactic(
             category = o.optString("category", ""),
             text = text,
             target = o.optString("target", "").trim().takeIf { it.isNotBlank() },
-            windowDays = o.optInt("windowDays", 28),
+            windowDays = wRaw.toInt().coerceIn(7, 120),
         )
     }
 } catch (e: Exception) {
@@ -164,6 +177,29 @@ private fun PerfSegmentedControl(
     }
 }
 
+/** Persistent medical disclaimer (v40): estimates only — not medical
+ *  advice, diagnosis, or a medical device. Shown on Plan and Progress. */
+@Composable
+private fun MedicalDisclaimer(lang: String) {
+    Text(
+        tr("medical_disclaimer", lang),
+        color = Color.White.copy(alpha = 0.38f),
+        fontSize = 10.sp,
+        lineHeight = 14.sp,
+        modifier = Modifier.padding(bottom = 2.dp),
+    )
+}
+
+/** Localizes a per-checkpoint enrichment error key (v40 — retries must be
+ *  visible, never silent). */
+private fun checkpointErrorLabel(key: String?, lang: String): String? = when (key) {
+    "checkpoint_gone" -> tr("plan_error_checkpoint_gone", lang)
+    "snapshot_missing" -> tr("plan_error_snapshot_missing", lang)
+    "llm_failed" -> tr("plan_error_llm_failed", lang)
+    "tactics_rejected" -> tr("plan_error_tactics_rejected", lang)
+    else -> null
+}
+
 @Composable
 private fun PhaseBadge(phase: String?, lang: String) {
     if (phase.isNullOrBlank()) {
@@ -202,17 +238,25 @@ private fun PhaseBadge(phase: String?, lang: String) {
     }
 }
 
+/** tacticSource "llm:<model>" → the model name for the source label;
+ *  "deterministic_fallback" → null (fallback label). */
+private fun tacticSourceModel(source: String?): String? =
+    source?.takeIf { it.startsWith("llm:") }?.removePrefix("llm:")?.takeIf { it.isNotBlank() }
+
 /**
- * Plano (v39): latest body-plan checkpoint — phase badge, top-3 priority
- * zones (safety-gated directions), tactics list with source label, and a
- * retry that re-runs the LLM enrichment. Deterministic core is always
- * present; only the LLM parts can be pending/missing.
+ * Plano (v39/v40): latest body-plan checkpoint — phase badge, top-3 priority
+ * zones (safety-gated directions), tactics list with source label (real
+ * "llm:<model>" traceability), persistent medical disclaimer, visible
+ * enrichment errors, and a retry that re-runs the LLM enrichment from the
+ * checkpoint's own anchored inputs.
  */
 @Composable
 private fun BodyPlanView(
     checkpoints: List<com.example.data.local.BodyPlanCheckpointEntity>,
     hasGoalTargets: Boolean,
     lang: String,
+    enriching: Set<Long>,
+    errors: Map<Long, String>,
     onRetry: (Long) -> Unit,
 ) {
     val cp = checkpoints.firstOrNull()
@@ -223,6 +267,7 @@ private fun BodyPlanView(
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        MedicalDisclaimer(lang)
         if (cp == null) {
             Text(
                 tr("plan_no_checkpoint", lang),
@@ -231,6 +276,8 @@ private fun BodyPlanView(
             )
             return
         }
+        val isEnriching = cp.id in enriching
+        val errorLabel = checkpointErrorLabel(errors[cp.id], lang)
 
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(tr("plan_phase", lang), color = Color.White, fontSize = 14.sp,
@@ -291,7 +338,12 @@ private fun BodyPlanView(
         Text(tr("plan_tactics", lang),
             color = Color.White.copy(alpha = 0.6f),
             fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-        if (tactics.isEmpty()) {
+        if (isEnriching) {
+            Text(
+                tr("plan_enriching", lang),
+                color = Color.White.copy(alpha = 0.5f), fontSize = 12.sp,
+            )
+        } else if (tactics.isEmpty()) {
             Text(
                 tr("plan_tactics_pending", lang),
                 color = Color.White.copy(alpha = 0.5f), fontSize = 12.sp,
@@ -311,8 +363,9 @@ private fun BodyPlanView(
                     }
                 }
             }
-            val sourceLabel = if (cp.tacticSource == "llm")
-                tr("plan_tactics_source_llm", lang)
+            val model = tacticSourceModel(cp.tacticSource)
+            val sourceLabel = if (model != null)
+                tr("plan_tactics_source_llm_model", lang).replace("{model}", model)
             else tr("plan_tactics_source_fallback", lang)
             Text(
                 sourceLabel,
@@ -321,9 +374,18 @@ private fun BodyPlanView(
             )
         }
 
-        // ── Retry (only when an LLM part is missing / fallback) ───────────────
-        val needsEnrichment = cp.tacticSource != "llm" || cp.coachReport == null
-        if (needsEnrichment) {
+        // ── Visible error (v40: retries must never be silent) ─────────────────
+        if (errorLabel != null) {
+            Text(
+                errorLabel,
+                color = Color(0xFFF87171).copy(alpha = 0.9f), fontSize = 12.sp,
+            )
+        }
+
+        // ── Retry (only when an LLM part is missing / fallback / error) ───────
+        val needsEnrichment = cp.tacticSource?.startsWith("llm:") != true ||
+            cp.coachReport == null || errorLabel != null
+        if (needsEnrichment && !isEnriching) {
             OutlinedButton(
                 onClick = { onRetry(cp.id) },
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentSoft),
@@ -336,31 +398,45 @@ private fun BodyPlanView(
 }
 
 /**
- * Progresso (v39): checkpoint timeline — date, phase, delta summary,
- * per-checkpoint report with its own retry.
+ * Progresso (v39/v40): checkpoint timeline — date, phase, delta summary,
+ * per-checkpoint report with its own retry, visible errors, and the
+ * persistent medical disclaimer.
  */
 @Composable
 private fun BodyProgressView(
     checkpoints: List<com.example.data.local.BodyPlanCheckpointEntity>,
     lang: String,
+    enriching: Set<Long>,
+    errors: Map<Long, String>,
     onRetry: (Long) -> Unit,
 ) {
-    if (checkpoints.isEmpty()) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Surface(
             shape = RoundedCornerShape(16.dp),
             color = Color(0xFF1A1F2E),
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text(
-                tr("progress_empty", lang),
-                color = Color.White.copy(alpha = 0.55f), fontSize = 13.sp,
-                modifier = Modifier.padding(16.dp),
-            )
+            Box(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                MedicalDisclaimer(lang)
+            }
         }
-        return
-    }
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        if (checkpoints.isEmpty()) {
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = Color(0xFF1A1F2E),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    tr("progress_empty", lang),
+                    color = Color.White.copy(alpha = 0.55f), fontSize = 13.sp,
+                    modifier = Modifier.padding(16.dp),
+                )
+            }
+            return
+        }
         checkpoints.forEach { cp ->
+            val isEnriching = cp.id in enriching
+            val errorLabel = checkpointErrorLabel(errors[cp.id], lang)
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -396,11 +472,32 @@ private fun BodyProgressView(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            tr("progress_report_pending", lang),
+                            if (isEnriching) tr("plan_enriching", lang)
+                            else tr("progress_report_pending", lang),
                             color = Color.White.copy(alpha = 0.45f), fontSize = 12.sp,
                         )
-                        TextButton(onClick = { onRetry(cp.id) }) {
-                            Text(tr("plan_retry", lang), fontSize = 12.sp, color = AccentSoft)
+                        if (!isEnriching) {
+                            TextButton(onClick = { onRetry(cp.id) }) {
+                                Text(tr("plan_retry", lang), fontSize = 12.sp, color = AccentSoft)
+                            }
+                        }
+                    }
+                }
+                if (errorLabel != null) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            errorLabel,
+                            color = Color(0xFFF87171).copy(alpha = 0.9f), fontSize = 12.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (!isEnriching) {
+                            TextButton(onClick = { onRetry(cp.id) }) {
+                                Text(tr("plan_retry", lang), fontSize = 12.sp, color = AccentSoft)
+                            }
                         }
                     }
                 }
@@ -423,8 +520,22 @@ private fun PerformanceSnapshotEntity.hasSilhouetteData(): Boolean =
 private fun PerformanceSnapshotEntity.hasAngleData(): Boolean =
     leftShoulderSagittalDeg != null || leftHipSagittalDeg != null
 
-private fun toRatioChartLine(kpi: SilhouetteKpi, snaps: List<PerformanceSnapshotEntity>): ChartLine {
-    val values = snaps.map { kpi.pick(it)?.toDouble() }
+private fun toRatioChartLine(
+    kpi: SilhouetteKpi,
+    snaps: List<PerformanceSnapshotEntity>,
+    latestFrontalConv: String?,
+    latestLateralConv: String?,
+): ChartLine {
+    // v40: a value is only comparable when its side used the SAME
+    // normalization convention as the latest capture — a legacy
+    // (image-height) ratio and a pose-person-height ratio of the "same"
+    // zone are different units, so not-same-convention values are
+    // excluded from the line (null gap) instead of being charted.
+    val latestConv = if (kpi.isFrontal) latestFrontalConv else latestLateralConv
+    val values = snaps.map { snap ->
+        val conv = if (kpi.isFrontal) snap.frontalNormalization else snap.lateralNormalization
+        if (SilhouetteZoneMath.sameConvention(conv, latestConv)) kpi.pick(snap)?.toDouble() else null
+    }
     val nonNull = values.filterNotNull()
     val chartKpi = if (nonNull.size >= 2) {
         val delta = nonNull.last() - nonNull.first()
@@ -571,6 +682,8 @@ fun PerformanceTab(viewModel: ChatViewModel) {
                     checkpoints = bodyPlanCheckpoints,
                     hasGoalTargets = hasGoalTargets,
                     lang = lang,
+                    enriching = viewModel.enrichingCheckpointIds.value,
+                    errors = viewModel.checkpointEnrichmentErrors.value,
                     onRetry = { viewModel.requestCheckpointEnrichment(it) },
                 )
             }
@@ -583,6 +696,8 @@ fun PerformanceTab(viewModel: ChatViewModel) {
                 BodyProgressView(
                     checkpoints = bodyPlanCheckpoints,
                     lang = lang,
+                    enriching = viewModel.enrichingCheckpointIds.value,
+                    errors = viewModel.checkpointEnrichmentErrors.value,
                     onRetry = { viewModel.requestCheckpointEnrichment(it) },
                 )
             }
@@ -641,7 +756,7 @@ fun PerformanceTab(viewModel: ChatViewModel) {
                     expanded = evolutionExpanded,
                     onToggle = { evolutionExpanded = !evolutionExpanded },
                 ) {
-                    SilhouetteEvolutionContent(silhouetteSnaps)
+                    SilhouetteEvolutionContent(silhouetteSnaps, lang)
                 }
             }
         } else if (snapshots.size >= 2 && latest?.hasAngleData() == true) {
@@ -823,10 +938,20 @@ private fun RatioBar(label: String, value: Float, maxValue: Float) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SilhouetteEvolutionContent(snaps: List<PerformanceSnapshotEntity>) {
+private fun SilhouetteEvolutionContent(snaps: List<PerformanceSnapshotEntity>, lang: String) {
     var selectedKpis by remember {
         mutableStateOf(setOf(SilhouetteKpi.FRONTAL_WAIST, SilhouetteKpi.FRONTAL_HIP))
     }
+    val latestConv = snaps.lastOrNull()
+    // v40: how many captures carry a different normalization convention on
+    // at least one side than the latest — those values are not same-unit
+    // data and are excluded from the lines below.
+    val mixedCount = latestConv?.let { lt ->
+        snaps.count { s ->
+            !SilhouetteZoneMath.sameConvention(s.frontalNormalization, lt.frontalNormalization) ||
+                !SilhouetteZoneMath.sameConvention(s.lateralNormalization, lt.lateralNormalization)
+        }
+    } ?: 0
     Column {
         // KPI chips — FlowRow so chips wrap instead of overflowing
         FlowRow(
@@ -857,8 +982,17 @@ private fun SilhouetteEvolutionContent(snaps: List<PerformanceSnapshotEntity>) {
             }
         }
         Spacer(Modifier.height(10.dp))
+        if (mixedCount > 0) {
+            Text(
+                tr("perf_convention_mixed", lang).replace("{n}", "$mixedCount"),
+                color = Color.White.copy(alpha = 0.4f), fontSize = 11.sp,
+            )
+            Spacer(Modifier.height(6.dp))
+        }
         val xLabels = snaps.map { DATE_FMT.format(Date(it.capturedAtMs)) }
-        val lines = selectedKpis.map { toRatioChartLine(it, snaps) }
+        val lines = selectedKpis.map {
+            toRatioChartLine(it, snaps, latestConv?.frontalNormalization, latestConv?.lateralNormalization)
+        }
         if (lines.isNotEmpty()) {
             MultilineChart(lines = lines, xLabels = xLabels, showLatestValue = true)
         }
