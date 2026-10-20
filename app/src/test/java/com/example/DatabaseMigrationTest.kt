@@ -2165,6 +2165,185 @@ class DatabaseMigrationTest {
         }
     }
 
+    /**
+     * v40 additive migration (review item 3/6): per-side normalization
+     * markers + checkpoint-anchored goal fields + the UNIQUE one-checkpoint-
+     * per-snapshot index. Existing v39 rows must survive byte-identical and
+     * the new columns must default to NULL.
+     */
+    @Test
+    fun testMigration39To40AddsNormalizationAndGoalFieldsPreservesData() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val dbFile = context.getDatabasePath("test_migration_v39_v40")
+        if (dbFile.exists()) dbFile.delete()
+
+        val db39 = SQLiteDatabase.openOrCreateDatabase(dbFile.absolutePath, null)
+        db39.version = 39
+        // performance_snapshots at v39 — v36 columns + silhouetteNormalization.
+        db39.execSQL("""
+            CREATE TABLE IF NOT EXISTS `performance_snapshots` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `capturedAtMs` INTEGER NOT NULL,
+                `source` TEXT NOT NULL DEFAULT 'manual',
+                `notes` TEXT,
+                `frontalShoulderRatio` REAL,
+                `frontalWaistRatio` REAL,
+                `frontalHipRatio` REAL,
+                `frontalThighRatio` REAL,
+                `lateralChestRatio` REAL,
+                `lateralBellyRatio` REAL,
+                `lateralThighRatio` REAL,
+                `frontalImagePath` TEXT,
+                `lateralImagePath` TEXT,
+                `coachReport` TEXT,
+                `reportGeneratedAtMs` INTEGER,
+                `silhouetteNormalization` TEXT DEFAULT NULL
+            )
+        """.trimIndent())
+        // body_plan_checkpoints at v39 — no goalText/goalTargetsJson, no
+        // unique snapshotId index (v40 adds both).
+        db39.execSQL("""
+            CREATE TABLE IF NOT EXISTS `body_plan_checkpoints` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `checkpointAtMs` INTEGER NOT NULL,
+                `snapshotId` INTEGER,
+                `bodyCompRowId` INTEGER,
+                `phase` TEXT,
+                `prioritiesJson` TEXT,
+                `tacticsJson` TEXT,
+                `tacticSource` TEXT,
+                `deltaSummary` TEXT,
+                `coachReport` TEXT,
+                `reportGeneratedAtMs` INTEGER
+            )
+        """.trimIndent())
+        db39.execSQL(
+            "CREATE INDEX IF NOT EXISTS `index_body_plan_checkpoints_checkpointAtMs` " +
+                "ON `body_plan_checkpoints` (`checkpointAtMs`)"
+        )
+
+        // v39 rows that must survive: one capture whose marker is a single
+        // shared value (the v39 "lie" being fixed), and one checkpoint
+        // WITHOUT a snapshot (NULL snapshotId must stay valid after the
+        // unique index lands).
+        db39.execSQL(
+            """INSERT INTO performance_snapshots
+                (id, capturedAtMs, source, frontalWaistRatio, lateralBellyRatio,
+                 silhouetteNormalization, coachReport)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                21L, 1_700_500_000_000L, "manual",
+                0.24f, 0.19f, "image_height",
+                "relatório v39",
+            )
+        )
+        db39.execSQL(
+            """INSERT INTO body_plan_checkpoints
+                (id, checkpointAtMs, snapshotId, phase, prioritiesJson,
+                 tacticSource, deltaSummary)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                31L, 1_700_500_100_000L, 21L, "CUT",
+                """[{"zone":"waist","direction":"REDUCE","gapPp":1.8,"tissue":"FAT_DOMINANT"}]""",
+                "deterministic_fallback", "cintura −0.3pp",
+            )
+        )
+        db39.execSQL(
+            """INSERT INTO body_plan_checkpoints
+                (id, checkpointAtMs, snapshotId, phase, prioritiesJson)
+                VALUES (?, ?, NULL, 'RECOMP', ?)""",
+            arrayOf<Any?>(1_700_500_200_000L, """[{"zone":"chest","direction":"GROW","gapPp":-1.1,"tissue":"MUSCLE_DOMINANT"}]""")
+        )
+        db39.close()
+
+        val db40 = openWithMigration("test_migration_v39_v40", 40) { db, oldV, newV ->
+            if (oldV == 39 && newV == 40) ChatDatabase.MIGRATION_39_40.migrate(db)
+        }
+        db40.query("PRAGMA user_version").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("DB must end at user_version 40", 40, it.getInt(0))
+        }
+
+        // 1. Snapshot row survives; legacy marker intact; new per-side
+        //    columns default to NULL (no rewrite of existing rows).
+        db40.query(
+            "SELECT silhouetteNormalization, frontalNormalization, lateralNormalization, frontalWaistRatio " +
+                "FROM performance_snapshots WHERE id = 21"
+        ).use {
+            assertTrue("snapshot row vanished after v39→v40", it.moveToFirst())
+            assertEquals("image_height", it.getString(0))
+            assertNull("frontalNormalization must default NULL on v39 rows", it.getString(1))
+            assertNull("lateralNormalization must default NULL on v39 rows", it.getString(2))
+            assertEquals(0.24f, it.getFloat(3), 0.0f)
+        }
+
+        // 2. Both v39 checkpoints survive, including the snapshot-less one.
+        db40.query(
+            "SELECT id, snapshotId, phase, deltaSummary, goalText, goalTargetsJson " +
+                "FROM body_plan_checkpoints WHERE id = 31"
+        ).use {
+            assertTrue("anchored checkpoint vanished after v39→v40", it.moveToFirst())
+            assertEquals(31L, it.getLong(0))
+            assertEquals(21L, it.getLong(1))
+            assertEquals("CUT", it.getString(2))
+            assertEquals("cintura −0.3pp", it.getString(3))
+            assertNull("goalText must default NULL on v39 checkpoints", it.getString(4))
+            assertNull("goalTargetsJson must default NULL on v39 checkpoints", it.getString(5))
+        }
+        db40.query("SELECT id, snapshotId, phase FROM body_plan_checkpoints WHERE phase='RECOMP'").use {
+            assertTrue("snapshot-less checkpoint vanished", it.moveToFirst())
+            assertTrue("snapshot-less checkpoint must keep NULL snapshotId", it.isNull(1))
+        }
+
+        // 3. The unique index exists and actually rejects a duplicate
+        //    snapshotId while still allowing NULLs (SQLite: NULLs distinct).
+        db40.query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='index_body_plan_checkpoints_snapshotId'"
+        ).use {
+            assertTrue("unique snapshotId index missing", it.moveToFirst())
+        }
+        var duplicateRejected = false
+        try {
+            db40.execSQL(
+                "INSERT INTO body_plan_checkpoints (checkpointAtMs, snapshotId, phase) VALUES (?, ?, 'CUT')",
+                arrayOf<Any?>(1_700_501_000_000L, 21L),
+            )
+        } catch (e: android.database.sqlite.SQLiteConstraintException) {
+            duplicateRejected = true
+        }
+        assertTrue("a second checkpoint for the same snapshot must be rejected", duplicateRejected)
+        // A second NULL-snapshotId row must still be allowed.
+        db40.execSQL(
+            "INSERT INTO body_plan_checkpoints (checkpointAtMs, phase) VALUES (?, 'MAINTAIN')",
+            arrayOf<Any?>(1_700_502_000_000L),
+        )
+        db40.query("SELECT COUNT(*) FROM body_plan_checkpoints WHERE snapshotId IS NULL").use {
+            assertTrue(it.moveToFirst())
+            assertEquals(2, it.getInt(0))
+        }
+
+        // 4. New columns are writable (the app path from v40 onwards).
+        db40.execSQL(
+            "UPDATE performance_snapshots SET frontalNormalization=?, lateralNormalization=? WHERE id=21",
+            arrayOf<Any?>("pose_person_height", "image_height"),
+        )
+        db40.query("SELECT frontalNormalization, lateralNormalization FROM performance_snapshots WHERE id=21").use {
+            assertTrue(it.moveToFirst())
+            // Per-side conventions may legitimately DIFFER in one row.
+            assertEquals("pose_person_height", it.getString(0))
+            assertEquals("image_height", it.getString(1))
+        }
+        db40.execSQL(
+            "UPDATE body_plan_checkpoints SET goalText=?, goalTargetsJson=? WHERE id=31",
+            arrayOf<Any?>("reduzir cintura", """{"waist":0.23}"""),
+        )
+        db40.query("SELECT goalText, goalTargetsJson FROM body_plan_checkpoints WHERE id=31").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("reduzir cintura", it.getString(0))
+            assertTrue(it.getString(1).contains("""{"waist":0.23}"""))
+        }
+    }
+
     /** Open [name] with a SupportSQLiteOpenHelper whose onUpgrade runs [onUpgrade]. */
     private fun openWithMigration(
         name: String,

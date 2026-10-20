@@ -263,4 +263,80 @@ class BodyPlanEngineTest {
         assertTrue(BodyPlanEngine.targetsFromJson("""{"waist":1.5}""").isEmpty()) // out of 0..1
         assertTrue(BodyPlanEngine.targetsFromJson(null).isEmpty())
     }
+
+    // ── v40: persisted-priority parser (defense at the parse boundary) ──────
+
+    @Test
+    fun `parsePrioritiesJson - valid rows round-trip`() {
+        val json = """[{"zone":"waist","direction":"REDUCE","gapPp":1.8,"tissue":"FAT_DOMINANT"},{"zone":"shoulder","direction":"GROW","gapPp":-1.2,"tissue":"MUSCLE_DOMINANT"}]"""
+        val list = BodyPlanEngine.parsePrioritiesJson(json)
+        assertEquals(2, list.size)
+        assertEquals("waist", list[0].zone)
+        assertEquals(BodyPlanEngine.Direction.REDUCE, list[0].direction)
+        assertEquals(1.8f, list[0].gapPp, 0.0001f)
+        assertEquals(BodyPlanEngine.Tissue.FAT_DOMINANT, list[0].tissue)
+        assertEquals(-1.2f, list[1].gapPp, 0.0001f)
+    }
+
+    @Test
+    fun `parsePrioritiesJson - rejects implausible gapPp at the parse boundary`() {
+        // 42pp is not a plausible zone-vs-target gap — a corrupted or
+        // hostile row must not drive the plan: the entry is dropped.
+        assertTrue(BodyPlanEngine.parsePrioritiesJson(
+            """[{"zone":"waist","direction":"REDUCE","gapPp":42.0,"tissue":"FAT_DOMINANT"}]"""
+        ).isEmpty())
+        // A 29pp gap is still inside the auditable bound and survives.
+        val list = BodyPlanEngine.parsePrioritiesJson(
+            """[{"zone":"waist","direction":"REDUCE","gapPp":29.0,"tissue":"FAT_DOMINANT"}]"""
+        )
+        assertEquals(1, list.size)
+        assertEquals(29.0f, list[0].gapPp, 0.0001f)
+    }
+
+    @Test
+    fun `parsePrioritiesJson - drops non-finite and out-of-range gapPp`() {
+        // NaN/Inf cannot come from real JSON numbers, but a corrupted/hand-
+        // edited row or hostile input must never drive the plan.
+        assertTrue(BodyPlanEngine.parsePrioritiesJson(
+            """[{"zone":"waist","direction":"REDUCE","gapPp":NaN,"tissue":"FAT_DOMINANT"}]"""
+        ).isEmpty())
+        assertTrue(BodyPlanEngine.parsePrioritiesJson(
+            """[{"zone":"waist","direction":"REDUCE","gapPp":99.0,"tissue":"FAT_DOMINANT"}]"""
+        ).isEmpty())
+        // Structural garbage aborts parsing at that entry (fail-soft: only
+        // valid rows before it survive); unknown zone / unknown direction are
+        // parsed and dropped individually.
+        val mixed = BodyPlanEngine.parsePrioritiesJson(
+            """[{"zone":"waist","direction":"REDUCE","gapPp":1.5,"tissue":"FAT_DOMINANT"},{"zone":"neck","direction":"REDUCE","gapPp":1.0,"tissue":"FAT_DOMINANT"},{"zone":"belly","direction":"SHRINK","gapPp":1.0,"tissue":"FAT_DOMINANT"},"not an object"]"""
+        )
+        assertEquals(1, mixed.size)
+        assertEquals("waist", mixed[0].zone)
+        assertTrue(BodyPlanEngine.parsePrioritiesJson(null).isEmpty())
+        assertTrue(BodyPlanEngine.parsePrioritiesJson("").isEmpty())
+        assertTrue(BodyPlanEngine.parsePrioritiesJson("garbage").isEmpty())
+    }
+
+    // ── v40: zone extraction for validation ─────────────────────────────────
+
+    @Test
+    fun `zonesOf - maps all seven silhouette zones`() {
+        val snap = PerformanceSnapshotEntity(
+            frontalShoulderRatio = 0.38f,
+            frontalWaistRatio = 0.24f,
+            frontalHipRatio = 0.31f,
+            frontalThighRatio = 0.21f,
+            lateralChestRatio = 0.20f,
+            lateralBellyRatio = 0.19f,
+            lateralThighRatio = 0.18f,
+        )
+        val zones = BodyPlanEngine.zonesOf(snap)
+        assertEquals(7, zones.size)
+        assertEquals(0.24f, zones["waist"]!!, 0.0001f)
+        assertEquals(0.20f, zones["chest"]!!, 0.0001f)
+        assertEquals(0.18f, zones["lateralThigh"]!!, 0.0001f)
+
+        val empty = BodyPlanEngine.zonesOf(PerformanceSnapshotEntity())
+        assertEquals(7, empty.size)
+        assertTrue(empty.values.all { it == null })
+    }
 }
