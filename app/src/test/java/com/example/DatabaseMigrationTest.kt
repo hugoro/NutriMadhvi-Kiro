@@ -1919,6 +1919,215 @@ class DatabaseMigrationTest {
         db34.close()
     }
 
+    /**
+     * v38 → v39: adds the append-only `body_plan_checkpoints` table + index
+     * and the nullable `silhouetteNormalization` column on
+     * `performance_snapshots`. Strictly additive — no existing table is
+     * rewritten. The test pre-loads v38-shaped performance data (a silhouette
+     * snapshot with ratios, photo paths and a persisted coach report; a goal
+     * with coach targets; a food row with the leftovers snapshot column) and
+     * asserts:
+     *  1. Every pre-existing row survives byte-identical.
+     *  2. `body_plan_checkpoints` exists, starts empty, is indexed, and
+     *     accepts INSERTs (schema reachable from outside).
+     *  3. `silhouetteNormalization` defaults to NULL on legacy snapshots.
+     *  4. The DB lands at user_version = 39.
+     */
+    @Test
+    fun testMigration38To39AddsBodyPlanCheckpointsAndPreservesData() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val dbFile = context.getDatabasePath("test_migration_v38_v39")
+        if (dbFile.exists()) dbFile.delete()
+
+        val db38 = SQLiteDatabase.openOrCreateDatabase(dbFile.absolutePath, null)
+        db38.version = 38
+        // performance_snapshots at v38 — v35 angles + v36 silhouette columns.
+        // silhouetteNormalization (v39) is intentionally absent so the
+        // migration is the only path that can add it.
+        db38.execSQL("""
+            CREATE TABLE IF NOT EXISTS `performance_snapshots` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `capturedAtMs` INTEGER NOT NULL,
+                `source` TEXT NOT NULL DEFAULT 'manual',
+                `notes` TEXT,
+                `leftShoulderSagittalDeg` REAL,
+                `leftShoulderFrontalDeg` REAL,
+                `rightShoulderSagittalDeg` REAL,
+                `rightShoulderFrontalDeg` REAL,
+                `leftHipSagittalDeg` REAL,
+                `leftHipFrontalDeg` REAL,
+                `rightHipSagittalDeg` REAL,
+                `rightHipFrontalDeg` REAL,
+                `leftElbowSagittalDeg` REAL,
+                `rightElbowSagittalDeg` REAL,
+                `leftKneeSagittalDeg` REAL,
+                `rightKneeSagittalDeg` REAL,
+                `frontalImagePath` TEXT,
+                `lateralImagePath` TEXT,
+                `frontalShoulderRatio` REAL,
+                `frontalWaistRatio` REAL,
+                `frontalHipRatio` REAL,
+                `frontalThighRatio` REAL,
+                `lateralChestRatio` REAL,
+                `lateralBellyRatio` REAL,
+                `lateralThighRatio` REAL,
+                `coachReport` TEXT,
+                `reportGeneratedAtMs` INTEGER
+            )
+        """.trimIndent())
+        db38.execSQL(
+            "CREATE INDEX IF NOT EXISTS `index_performance_snapshots_capturedAtMs` " +
+                "ON `performance_snapshots` (`capturedAtMs`)"
+        )
+        // performance_goals at v37.
+        db38.execSQL("""
+            CREATE TABLE IF NOT EXISTS `performance_goals` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `createdAtMs` INTEGER NOT NULL,
+                `goalText` TEXT NOT NULL,
+                `coachTargetJson` TEXT,
+                `targetsGeneratedAtMs` INTEGER
+            )
+        """.trimIndent())
+        // food_entries at v38 (leftoverOriginalJson present, v39 untouched).
+        db38.execSQL("""
+            CREATE TABLE IF NOT EXISTS `food_entries` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `name` TEXT NOT NULL,
+                `calories` INTEGER NOT NULL,
+                `protein` REAL NOT NULL,
+                `carbs` REAL NOT NULL,
+                `fat` REAL NOT NULL,
+                `timestamp` INTEGER NOT NULL,
+                `imagePath` TEXT,
+                `analysisSummary` TEXT,
+                `fullSummary` TEXT NOT NULL,
+                `lastAiAnalyzedSummary` TEXT,
+                `mealCategory` TEXT NOT NULL,
+                `appliedHabitIds` TEXT,
+                `groupId` TEXT,
+                `ingredientsJson` TEXT,
+                `freeSugarsG` REAL,
+                `saturatedFatG` REAL,
+                `editLogJson` TEXT,
+                `analysisModel` TEXT,
+                `leftoverOriginalJson` TEXT
+            )
+        """.trimIndent())
+
+        // Representative performance rows that must NOT disappear on update.
+        db38.execSQL(
+            """INSERT INTO performance_snapshots
+                (id, capturedAtMs, source, frontalImagePath, lateralImagePath,
+                 frontalShoulderRatio, frontalWaistRatio, frontalHipRatio,
+                 frontalThighRatio, lateralChestRatio, lateralBellyRatio,
+                 lateralThighRatio, coachReport, reportGeneratedAtMs)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                11L, 1_700_030_000_000L, "manual",
+                "/data/user/0/com.aistudio.geminichat.rvqzmx/files/performance_photos/abc.jpg",
+                "/data/user/0/com.aistudio.geminichat.rvqzmx/files/performance_photos/def.jpg",
+                0.38f, 0.24f, 0.31f, 0.21f, 0.20f, 0.19f, 0.18f,
+                "Distribuição equilibrada; cintura ligeiramente acima do alvo.",
+                1_700_030_010_000L
+            )
+        )
+        db38.execSQL(
+            """INSERT INTO performance_goals
+                (id, createdAtMs, goalText, coachTargetJson, targetsGeneratedAtMs)
+                VALUES (?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                5L, 1_700_029_000_000L, "reduzir barriga e ganhar ombros",
+                """{"shoulder":0.40,"waist":0.23,"hip":0.31,"thigh":0.20,"chest":0.22,"belly":0.18,"lateralThigh":0.19}""",
+                1_700_029_010_000L
+            )
+        )
+        db38.execSQL(
+            """INSERT INTO food_entries
+                (id, name, calories, protein, carbs, fat, timestamp,
+                 fullSummary, mealCategory, leftoverOriginalJson)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                601L, "almôndegas com massa", 610, 38.0, 55.0, 22.0,
+                1_700_031_000_000L, "almôndegas (~120 g), massa (~150 g)",
+                "LUNCH", """{"calories":720,"protein":42.0,"carbs":60.0,"fat":26.0}"""
+            )
+        )
+        db38.close()
+
+        val db39 = openWithMigration("test_migration_v38_v39", 39) { db, oldV, newV ->
+            if (oldV == 38 && newV == 39) ChatDatabase.MIGRATION_38_39.migrate(db)
+        }
+
+        // 1. Performance snapshot survives byte-identical (ratios + photo
+        //    paths + persisted coach report), and the new column is NULL.
+        db39.query(
+            "SELECT source, frontalWaistRatio, frontalImagePath, coachReport, silhouetteNormalization " +
+                "FROM performance_snapshots WHERE id = 11"
+        ).use {
+            assertTrue("snapshot row vanished after migration", it.moveToFirst())
+            assertEquals("manual", it.getString(0))
+            assertEquals(0.24f, it.getFloat(1), 0.0f)
+            assertTrue(it.getString(2).endsWith("/performance_photos/abc.jpg"))
+            assertEquals("Distribuição equilibrada; cintura ligeiramente acima do alvo.", it.getString(3))
+            assertNull("silhouetteNormalization must default to NULL on legacy rows", it.getString(4))
+        }
+        // 2. Goal + coach targets survive.
+        db39.query(
+            "SELECT goalText, coachTargetJson FROM performance_goals WHERE id = 5"
+        ).use {
+            assertTrue("goal row vanished after migration", it.moveToFirst())
+            assertEquals("reduzir barriga e ganhar ombros", it.getString(0))
+            assertTrue(it.getString(1).contains("\"waist\":0.23"))
+        }
+        // 3. Food row (with the v38 leftovers column) survives.
+        db39.query("SELECT name, calories, leftoverOriginalJson FROM food_entries WHERE id = 601").use {
+            assertTrue("food row vanished after migration", it.moveToFirst())
+            assertEquals("almôndegas com massa", it.getString(0))
+            assertEquals(610, it.getInt(1))
+            assertTrue(it.getString(2).contains("\"protein\":42.0"))
+        }
+        // 4. body_plan_checkpoints exists, is empty, is indexed, and is writable.
+        db39.query("SELECT COUNT(*) FROM body_plan_checkpoints").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("body_plan_checkpoints must start empty", 0, it.getInt(0))
+        }
+        db39.query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='index_body_plan_checkpoints_checkpointAtMs'"
+        ).use {
+            assertTrue("checkpointAtMs index missing", it.moveToFirst())
+        }
+        db39.execSQL(
+            """INSERT INTO body_plan_checkpoints
+                (checkpointAtMs, snapshotId, phase, prioritiesJson, tacticSource, deltaSummary)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                1_700_040_000_000L, 11L, "CUT",
+                """[{"zone":"belly","direction":"REDUCE","gapPp":1.5,"tissue":"FAT_DOMINANT"}]""",
+                "deterministic_fallback", "cintura −0.3pp"
+            )
+        )
+        db39.query("SELECT phase, tacticSource FROM body_plan_checkpoints").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("CUT", it.getString(0))
+            assertEquals("deterministic_fallback", it.getString(1))
+        }
+        // 5. Legacy snapshots can carry the new normalization marker.
+        db39.execSQL(
+            "UPDATE performance_snapshots SET silhouetteNormalization = 'pose_person_height' WHERE id = 11"
+        )
+        db39.query("SELECT silhouetteNormalization FROM performance_snapshots WHERE id = 11").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("pose_person_height", it.getString(0))
+        }
+        // 6. DB lands at user_version 39.
+        db39.query("PRAGMA user_version").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("DB must end at user_version 39", 39, it.getInt(0))
+        }
+        db39.close()
+    }
+
     /** Shared assertions for the v33 end state: table + unique index exist,
      *  the reconcile columns exist, and user_version == 33. */
     private fun assertIngredientCacheAndColumns(db: androidx.sqlite.db.SupportSQLiteDatabase) {

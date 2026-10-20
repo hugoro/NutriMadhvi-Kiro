@@ -80,5 +80,12 @@ data class PerformanceSnapshotEntity(
 
     // ── LLM coach report (v36) — generated async after save ──────────────────
     val coachReport: String? = null,
-    val reportGeneratedAtMs: Long? = null
+    val reportGeneratedAtMs: Long? = null,
+
+    // ── v39 — which convention produced the silhouette ratios ───────────────
+    // "image_height" (legacy: zones at fixed fractions of the frame, ratios
+    // normalised by image height) or "pose_person_height" (pose-anchored zones,
+    // ratios normalised by the person's on-screen height). Null = captured
+    // before v39. Never null on new captures.
+    val silhouetteNormalization: String? = null
 )

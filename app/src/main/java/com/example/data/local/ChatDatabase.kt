@@ -24,9 +24,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         IngredientNutritionEntity::class,
         MealCorrectionEntity::class,
         PerformanceSnapshotEntity::class,
-        PerformanceGoalEntity::class
+        PerformanceGoalEntity::class,
+        BodyPlanCheckpointEntity::class
     ],
-    version = 38,
+    version = 39,
     exportSchema = true
 )
 @androidx.room.TypeConverters(Converters::class)
@@ -45,6 +46,7 @@ abstract class ChatDatabase : RoomDatabase() {
     abstract val mealCorrectionDao: MealCorrectionDao
     abstract val performanceSnapshotDao: PerformanceSnapshotDao
     abstract val performanceGoalDao: PerformanceGoalDao
+    abstract val bodyPlanCheckpointDao: BodyPlanCheckpointDao
 
     companion object {
         @Volatile
@@ -795,6 +797,40 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        // v39: body-plan checkpoints (deterministic phase/priorities + async LLM
+        // tactics/report) and a per-snapshot normalization marker. Strictly
+        // additive: CREATE TABLE IF NOT EXISTS + one nullable column via
+        // addColumnIfMissing (replay-safe for installs that already carry it).
+        val MIGRATION_38_39 = object : Migration(38, 39) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `body_plan_checkpoints` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `checkpointAtMs` INTEGER NOT NULL,
+                        `snapshotId` INTEGER,
+                        `bodyCompRowId` INTEGER,
+                        `phase` TEXT,
+                        `prioritiesJson` TEXT,
+                        `tacticsJson` TEXT,
+                        `tacticSource` TEXT,
+                        `deltaSummary` TEXT,
+                        `coachReport` TEXT,
+                        `reportGeneratedAtMs` INTEGER
+                    )
+                """.trimIndent())
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_body_plan_checkpoints_checkpointAtMs` " +
+                        "ON `body_plan_checkpoints` (`checkpointAtMs`)"
+                )
+                // Which convention produced a snapshot's silhouette ratios:
+                // "image_height" (legacy fixed-fraction zones) vs
+                // "pose_person_height" (pose-anchored zones, body-height normalizer).
+                db.addColumnIfMissing(
+                    "performance_snapshots", "silhouetteNormalization", "TEXT DEFAULT NULL"
+                )
+            }
+        }
+
         val MIGRATION_35_36 = object : Migration(35, 36) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // Silhouette photo paths
@@ -882,7 +918,8 @@ abstract class ChatDatabase : RoomDatabase() {
                     MIGRATION_34_35,
                     MIGRATION_35_36,
                     MIGRATION_36_37,
-                    MIGRATION_37_38
+                    MIGRATION_37_38,
+                    MIGRATION_38_39
                 )
                 // Hard guarantee that v9→v10 (and later) NEVER nukes user data:
                 // if a defined migration throws, the app crashes loudly instead of
