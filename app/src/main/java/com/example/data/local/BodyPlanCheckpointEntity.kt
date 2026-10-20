@@ -22,13 +22,18 @@ import androidx.room.PrimaryKey
  */
 @Entity(
     tableName = "body_plan_checkpoints",
-    indices = [Index(value = ["checkpointAtMs"])]
+    indices = [
+        Index(value = ["checkpointAtMs"]),
+        // v40 — one checkpoint per snapshot (SQLite treats NULLs as distinct,
+        // so checkpoints without a snapshot stay allowed).
+        Index(value = ["snapshotId"], unique = true),
+    ]
 )
 data class BodyPlanCheckpointEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     /** Wall-clock ms when the checkpoint was created. */
     val checkpointAtMs: Long = System.currentTimeMillis(),
-    /** performance_snapshots.id this checkpoint was computed from. */
+    /** performance_snapshots.id this checkpoint was computed from. UNIQUE (v40). */
     val snapshotId: Long? = null,
     /** body_composition_snapshots.id of the latest scale reading at checkpoint time. */
     val bodyCompRowId: Long? = null,
@@ -43,14 +48,22 @@ data class BodyPlanCheckpointEntity(
     /**
      * Coaching tactics, JSON array:
      * [{"category":"nutrition","text":"...","target":"...","windowDays":28}, ...]
-     * LLM-generated (flash-lite) or the deterministic fallback list.
+     * LLM-generated (routine cheap models via ModelRoles) or the
+     * deterministic fallback list. LLM tactics pass a semantic safety
+     * validator (TacticSafetyValidator) before persistence.
      */
     val tacticsJson: String? = null,
-    /** "llm:<model>" or "deterministic_fallback" — which source produced [tacticsJson]. */
+    /** "llm:<model>" (which model of the routine chain produced it) or
+     *  "deterministic_fallback" — which source produced [tacticsJson]. */
     val tacticSource: String? = null,
     /** Deterministic delta summary vs the previous checkpoint (e.g. "cintura −0.3pp, peso +0.4kg"). */
     val deltaSummary: String? = null,
     /** LLM checkpoint report (compares this checkpoint with the previous one). */
     val coachReport: String? = null,
-    val reportGeneratedAtMs: Long? = null
+    val reportGeneratedAtMs: Long? = null,
+    /** v40 — goal text anchored at checkpoint time (retry re-enrichment must
+     *  not use today's possibly-changed goal). */
+    val goalText: String? = null,
+    /** v40 — goal coach-target JSON anchored at checkpoint time. */
+    val goalTargetsJson: String? = null,
 )

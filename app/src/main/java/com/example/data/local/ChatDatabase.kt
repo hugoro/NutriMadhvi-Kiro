@@ -27,7 +27,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         PerformanceGoalEntity::class,
         BodyPlanCheckpointEntity::class
     ],
-    version = 39,
+    version = 40,
     exportSchema = true
 )
 @androidx.room.TypeConverters(Converters::class)
@@ -831,6 +831,33 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        // v40: per-side silhouette normalization (frontal and lateral can use
+        // different conventions in one capture), checkpoint-anchored goal
+        // fields for retry re-enrichment, and a UNIQUE index enforcing one
+        // checkpoint per snapshot. Strictly additive — three nullable columns
+        // via addColumnIfMissing + one unique index (SQLite treats NULLs as
+        // distinct, so existing rows and snapshot-less checkpoints stay valid).
+        val MIGRATION_39_40 = object : Migration(39, 40) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.addColumnIfMissing(
+                    "performance_snapshots", "frontalNormalization", "TEXT DEFAULT NULL"
+                )
+                db.addColumnIfMissing(
+                    "performance_snapshots", "lateralNormalization", "TEXT DEFAULT NULL"
+                )
+                db.addColumnIfMissing(
+                    "body_plan_checkpoints", "goalText", "TEXT DEFAULT NULL"
+                )
+                db.addColumnIfMissing(
+                    "body_plan_checkpoints", "goalTargetsJson", "TEXT DEFAULT NULL"
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_body_plan_checkpoints_snapshotId` " +
+                        "ON `body_plan_checkpoints` (`snapshotId`)"
+                )
+            }
+        }
+
         val MIGRATION_35_36 = object : Migration(35, 36) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // Silhouette photo paths
@@ -919,7 +946,8 @@ abstract class ChatDatabase : RoomDatabase() {
                     MIGRATION_35_36,
                     MIGRATION_36_37,
                     MIGRATION_37_38,
-                    MIGRATION_38_39
+                    MIGRATION_38_39,
+                    MIGRATION_39_40
                 )
                 // Hard guarantee that v9→v10 (and later) NEVER nukes user data:
                 // if a defined migration throws, the app crashes loudly instead of
