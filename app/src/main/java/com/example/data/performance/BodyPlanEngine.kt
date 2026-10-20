@@ -68,6 +68,9 @@ object BodyPlanEngine {
     const val BELLY = "belly"
     const val LATERAL_THIGH = "lateralThigh"
 
+    /** The 7 measurable zones — validation boundary for any zone key. */
+    val ZONES = setOf(SHOULDER, WAIST, HIP, THIGH, CHEST, BELLY, LATERAL_THIGH)
+
     // ── Tunables ────────────────────────────────────────────────────────────
 
     /** |Δfat| (pp) over the window that counts as a real fat trend. */
@@ -182,6 +185,73 @@ object BodyPlanEngine {
         BELLY    to snapshot.lateralBellyRatio,
         LATERAL_THIGH to snapshot.lateralThighRatio,
     )
+
+    /**
+     * Strict pure-JVM parser for the persisted priorities JSON
+     * ([prioritiesToJson]'s inverse) — re-reads the deterministic core on
+     * retry so re-enrichment is checkpoint-anchored (v40). Hand-rolled (not
+     * org.json) so the engine stays pure-JVM testable. Fail-soft: entries
+     * with an unknown zone, malformed direction/tissue, or a non-finite /
+     * implausible gapPp are DROPPED, never thrown. gapPp is clamped to
+     * ±30pp at this boundary.
+     */
+    fun parsePrioritiesJson(json: String?): List<ZonePriority> {
+        if (json.isNullOrBlank()) return emptyList()
+        val s = json.trim()
+        if (!s.startsWith("[") || !s.endsWith("]")) return emptyList()
+        val out = mutableListOf<ZonePriority>()
+        var i = 1
+        val end = s.length - 1
+        while (i < end) {
+            while (i < end && (s[i].isWhitespace() || s[i] == ',')) i++
+            if (i >= end) break
+            if (s[i] != '{') break
+            val fields = LinkedHashMap<String, String>()
+            i++
+            var broken = false
+            while (i < end) {
+                while (i < end && (s[i].isWhitespace() || s[i] == ',')) i++
+                if (i >= end) break
+                if (s[i] == '}') { i++; break }
+                if (s[i] != '"') { broken = true; break }
+                val keyStart = i + 1
+                val keyEnd = s.indexOf('"', keyStart)
+                if (keyEnd < 0) { broken = true; break }
+                val key = s.substring(keyStart, keyEnd)
+                i = keyEnd + 1
+                while (i < end && s[i].isWhitespace()) i++
+                if (i >= end || s[i] != ':') { broken = true; break }
+                i++
+                while (i < end && s[i].isWhitespace()) i++
+                if (i < end && s[i] == '"') {
+                    val vEnd = s.indexOf('"', i + 1)
+                    if (vEnd < 0) { broken = true; break }
+                    fields[key] = s.substring(i + 1, vEnd)
+                    i = vEnd + 1
+                } else {
+                    val numStart = i
+                    while (i < end && (s[i].isDigit() || s[i] == '.' || s[i] == '-' || s[i] == 'e' || s[i] == 'E' || s[i] == '+')) i++
+                    if (i == numStart) { broken = true; break }
+                    fields[key] = s.substring(numStart, i)
+                }
+            }
+            if (broken) break
+            val zone = fields["zone"]
+            val direction = fields["direction"]?.let {
+                runCatching { Direction.valueOf(it) }.getOrNull()
+            }
+            val gapPp = fields["gapPp"]?.toFloatOrNull()
+            val tissue = fields["tissue"]?.let {
+                runCatching { Tissue.valueOf(it) }.getOrNull()
+            } ?: Tissue.UNKNOWN
+            if (zone != null && zone in ZONES && direction != null && gapPp != null &&
+                gapPp.isFinite() && abs(gapPp) <= 30f
+            ) {
+                out += ZonePriority(zone, direction, gapPp.coerceIn(-30f, 30f), tissue)
+            }
+        }
+        return out
+    }
 
     // ── Deterministic tactics (LLM fallback) ────────────────────────────────
 

@@ -152,7 +152,7 @@ Rules specific to multiline (in addition to the general rules above):
 - The top KPI tiles ARE the "headline number" — DO NOT also state them verbatim in the surrounding prose. Instead, spend those sentences on interpretation ("the trajectory is consistent — 6 readings, monotonic loss") rather than repeating the KPIs.
 """
 
-class GeminiRepository(
+open class GeminiRepository(
     private val chatDao: ChatDao,
     private val foodDao: FoodDao,
     private val activityDao: ActivityDao,
@@ -488,8 +488,9 @@ class GeminiRepository(
     }
 
     /** Calls Gemini (text-only, ~180-word output) to produce the silhouette coach report.
-     *  Returns null on API key misconfiguration or hard failure. */
-    suspend fun generateCoachReport(prompt: String): String? {
+     *  Returns null on API key misconfiguration or hard failure.
+     *  [open] so headless ViewModel tests can stub the network call. */
+    suspend open fun generateCoachReport(prompt: String): String? {
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") return null
         val request = GeminiRequest(
@@ -505,18 +506,28 @@ class GeminiRepository(
      * extraction/reporting routed through [com.example.data.ai.ModelRoles.ROUTINE_CHAIN]
      * (flash-lite primary → flash compatibility fallback). NOT the vision
      * cascade — this is a text-only, short-output call, so the cheapest
-     * capable model first. Returns null on API key misconfiguration or
-     * hard failure (the caller then falls back to deterministic tactics).
+     * capable model first. On hard failure [BodyPlanLlmResult.text] is null
+     * (the caller then falls back to deterministic tactics). [BodyPlanLlmResult.modelUsed]
+     * names the model that actually produced the text so the caller can
+     * persist real "llm:<model>" traceability.
      */
-    suspend fun generateBodyPlanContent(prompt: String, language: String): String? {
+    suspend open fun generateBodyPlanContent(
+        prompt: String,
+        language: String
+    ): BodyPlanLlmResult {
         val apiKey = BuildConfig.GEMINI_API_KEY
-        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") return null
+        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
+            return BodyPlanLlmResult(text = null, modelUsed = null)
+        }
         val request = GeminiRequest(
             contents = listOf(Content(parts = listOf(Part(text = prompt)))),
             generationConfig = GenerationConfig(temperature = 0.3f),
         )
         return generateWithModelChain(apiKey, com.example.data.ai.ModelRoles.ROUTINE_CHAIN, request, language)
-            .getOrNull()
+            .fold(
+                onSuccess = { BodyPlanLlmResult(text = it.text, modelUsed = it.modelUsed) },
+                onFailure = { BodyPlanLlmResult(text = null, modelUsed = null) },
+            )
     }
 
     // ── Body-plan checkpoints (schema v39) ──────────────────────────────────
@@ -542,6 +553,27 @@ class GeminiRepository(
     suspend fun updateBodyPlanCheckpointReport(id: Long, report: String, ts: Long) {
         bodyPlanCheckpointDao?.updateReport(id, report, ts)
     }
+
+    suspend fun bodyPlanCheckpointById(id: Long): com.example.data.local.BodyPlanCheckpointEntity? =
+        bodyPlanCheckpointDao?.getById(id)
+
+    suspend fun bodyPlanCheckpointBySnapshotId(snapshotId: Long): com.example.data.local.BodyPlanCheckpointEntity? =
+        bodyPlanCheckpointDao?.getBySnapshotId(snapshotId)
+
+    suspend fun latestBodyPlanCheckpointBefore(checkpointAtMs: Long): com.example.data.local.BodyPlanCheckpointEntity? =
+        bodyPlanCheckpointDao?.latestBefore(checkpointAtMs)
+
+    /** Idempotent one-checkpoint-per-snapshot insert (v40). Returns the
+     *  existing checkpoint's id when the snapshot already has one. */
+    suspend fun insertBodyPlanCheckpointIfAbsent(
+        checkpoint: com.example.data.local.BodyPlanCheckpointEntity
+    ): Long = bodyPlanCheckpointDao?.insertIfAbsentBySnapshotId(checkpoint) ?: -1L
+
+    suspend fun performanceSnapshotById(id: Long): com.example.data.local.PerformanceSnapshotEntity? =
+        performanceSnapshotDao?.getById(id)
+
+    suspend fun bodyCompositionSnapshotById(id: Long): com.example.data.local.BodyCompositionSnapshotEntity? =
+        bodyCompositionSnapshotDao.getById(id)
 
     // Phase E: persistent user-insight API. The data-card builder reads from
     // topConfirmedInsights() each turn; the chat parser writes pending or
@@ -913,8 +945,17 @@ class GeminiRepository(
             "gemini-3.5-flash",
             "gemini-3.5-flash-lite",
         ).distinct()
-        return generateWithModelChain(apiKey, models, request, language)
+        return generateWithModelChain(apiKey, models, request, language).map { it.text }
     }
+
+    /** Result of a model-chain call: the text AND which model actually
+     *  produced it (traceability — persisted as "llm:<model>" in
+     *  body_plan_checkpoints.tacticSource). */
+    data class LlmChainOutcome(val text: String, val modelUsed: String)
+
+    /** Result of the body-plan routine call. [text] null = hard failure
+     *  (no key / network / all models failed); [modelUsed] null with it. */
+    data class BodyPlanLlmResult(val text: String?, val modelUsed: String?)
 
     /**
      * Non-streaming text call against an explicit, ordered model chain with
@@ -928,7 +969,7 @@ class GeminiRepository(
         modelChain: List<String>,
         request: GeminiRequest,
         language: String
-    ): Result<String> {
+    ): Result<LlmChainOutcome> {
         var lastError: Exception? = null
 
         for ((index, modelName) in modelChain.withIndex()) {
@@ -964,7 +1005,7 @@ class GeminiRepository(
                         break
                     }
                     
-                    return Result.success(rawText)
+                    return Result.success(LlmChainOutcome(text = rawText, modelUsed = modelName))
                 } catch (e: Exception) {
                     lastError = e
                     val isRateLimit = e is retrofit2.HttpException && isTransientCode(e.code())

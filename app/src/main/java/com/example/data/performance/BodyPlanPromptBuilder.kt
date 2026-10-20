@@ -89,7 +89,9 @@ object BodyPlanPromptBuilder {
             - "text": 1 frase imperativa, concreta e acionável (máx. 140 caracteres)
             - "target": o número/valores de referência (ex. "120 g/dia", "2–3 sessões/semana")
             - "windowDays": inteiro 7–120
-            - Táticas de zona: uma por prioridade com direção REDUZIR/AUMENTAR (usa o nome da zona)
+            - Táticas de zona: uma por prioridade, com direção REDUZIR/AUMENTAR e
+              OBRIGATORIAMENTE o campo "zone" com a chave da zona
+              (shoulder, waist, hip, thigh, chest, belly, lateralThigh)
             - NUNCA recomendar reduzir uma zona muscular (ombro, peito, quadril, coxa)
             - Faixas conservadoras; isto NÃO é um aconselhamento médico
             - Sem links, sem vídeos, sem listas de exercícios específicas de YouTube

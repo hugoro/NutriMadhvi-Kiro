@@ -87,7 +87,7 @@ enum class CaptureMode { FOOD, ACTIVITY }
  */
 enum class VoiceMode { Idle, Listening, Thinking, Speaking }
 
-class ChatViewModel(
+open class ChatViewModel(
     private val repository: GeminiRepository,
     private val shRepository: SamsungHealthRepository,
     /** Optional — set by [ChatViewModelFactory] for the foreground UI
@@ -217,19 +217,39 @@ class ChatViewModel(
         }
     }
 
-    /** Saves a silhouette snapshot then generates the coach report async.
-     *  The entity is persisted immediately (UI can show a spinner); once the
-     *  LLM responds the report is written back via [updateCoachReport].
-     *  Also creates the deterministic body-plan checkpoint (v39) — the
-     *  checkpoint core is local and its LLM enrichment is independent of
-     *  the coach report, so a failure of either never blocks the other. */
+    /** Saves a silhouette snapshot, then:
+     *  1) persists the deterministic body-plan checkpoint FIRST — local-only
+     *     DB work, guaranteed to complete before ANY network call, so a
+     *     network hang or process interruption can never leave the Plan
+     *     view without its checkpoint (v40 hardening);
+     *  2) runs the legacy coach report and the checkpoint LLM enrichment as
+     *     INDEPENDENT jobs with isolated failures — a failure of either
+     *     never blocks the other. */
     fun savePerformanceSnapshotAndRequestReport(entity: com.example.data.local.PerformanceSnapshotEntity) {
         viewModelScope.launch {
             val id = repository.insertPerformanceSnapshot(entity)
-            if (id > 0) {
-                val saved = entity.copy(id = id)
-                generateCoachReport(saved)
-                createBodyPlanCheckpoint(saved)
+            if (id <= 0) return@launch
+            val saved = entity.copy(id = id)
+            // 1) Deterministic checkpoint — local-only, awaited here, so the
+            //    row is persisted before the network jobs below even start.
+            val checkpointId = createBodyPlanCheckpointLocal(saved)
+            // 2) Legacy coach report — independent network job, isolated failure.
+            viewModelScope.launch {
+                runCatching { generateCoachReport(saved) }
+                    .onFailure { android.util.Log.w("SHD", "[coach-report] generation failed", it) }
+            }
+            // 3) Checkpoint LLM enrichment — independent network job,
+            //    independently retryable via [requestCheckpointEnrichment].
+            if (checkpointId != null) {
+                if (acquireEnrichmentSlot(checkpointId)) {
+                    viewModelScope.launch {
+                        try {
+                            enrichCheckpoint(checkpointId)
+                        } finally {
+                            releaseEnrichmentSlot(checkpointId)
+                        }
+                    }
+                }
             }
         }
     }
@@ -300,166 +320,271 @@ class ChatViewModel(
         repository.updatePerformanceCoachReport(entity.id, cleanReport, System.currentTimeMillis())
     }
 
-    // ── Body plan checkpoints (v39) ─────────────────────────────────────────
+    // ── Body plan checkpoints (v39, hardened in v40) ───────────────────────
     //
     // The deterministic core (phase, priorities, deltas) is computed LOCALLY
-    // by com.example.data.performance.BodyPlanEngine and persisted immediately
-    // — the Plan view works offline. The LLM (routin cheap models via
-    // ModelRoles) only enriches: tactics text + checkpoint report. On any LLM
-    // failure the deterministic fallback tactics are stored (source
-    // "deterministic_fallback") and the report stays null → the UI shows a
-    // retry button instead of an infinite spinner.
+    // by com.example.data.performance.BodyPlanEngine and persisted
+    // IMMEDIATELY after the snapshot insert — BEFORE any network call — so
+    // the Plan view works offline and a network hang / process interruption
+    // never leaves the checkpoint missing. The LLM (routine cheap models via
+    // ModelRoles) only enriches: tactics text + checkpoint report, in an
+    // independent job with isolated failure. On any LLM failure the
+    // deterministic fallback tactics are stored (source
+    // "deterministic_fallback") and a VISIBLE per-checkpoint error is
+    // exposed to the UI → retry button, never a silent return or an
+    // infinite spinner.
+    //
+    // Re-enrichment ("Gerar novamente") runs from the CHECKPOINT-ANCHORED
+    // inputs — persisted phase/priorities, the snapshot and the goal fixed
+    // at checkpoint time — never from today's possibly-changed composition
+    // or goal (v40). One checkpoint per snapshot (unique index +
+    // transactional idempotent insert). In-flight retries are debounced.
 
     /** Live flow of body-plan checkpoints, newest first (Progresso view). */
     val bodyPlanCheckpoints: StateFlow<List<com.example.data.local.BodyPlanCheckpointEntity>> =
         repository.observeAllBodyPlanCheckpoints()
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    private val _enrichingCheckpointIds = MutableStateFlow<Set<Long>>(emptySet())
+    private val _checkpointEnrichmentErrors = MutableStateFlow<Map<Long, String>>(emptyMap())
+
+    /** Checkpoint ids whose LLM enrichment is currently in flight. A retry
+     *  for an id already in flight is ignored (debounce) so repeated taps
+     *  cannot race the same row's writes (v40). */
+    val enrichingCheckpointIds: StateFlow<Set<Long>> =
+        _enrichingCheckpointIds.asStateFlow()
+
+    /** Visible per-checkpoint enrichment errors as i18n key names:
+     *  "checkpoint_gone" | "snapshot_missing" | "llm_failed" |
+     *  "tactics_rejected". The UI localizes and renders a retry next to the
+     *  affected checkpoint. Empty = healthy. */
+    val checkpointEnrichmentErrors: StateFlow<Map<Long, String>> =
+        _checkpointEnrichmentErrors.asStateFlow()
+
+    private fun acquireEnrichmentSlot(checkpointId: Long): Boolean {
+        var acquired = false
+        _enrichingCheckpointIds.update { cur ->
+            if (checkpointId in cur) cur else { acquired = true; cur + checkpointId }
+        }
+        return acquired
+    }
+
+    private fun releaseEnrichmentSlot(checkpointId: Long) {
+        _enrichingCheckpointIds.update { it - checkpointId }
+    }
+
+    private fun setCheckpointError(checkpointId: Long, key: String) {
+        _checkpointEnrichmentErrors.update { it + (checkpointId to key) }
+    }
+
+    private fun clearCheckpointError(checkpointId: Long) {
+        _checkpointEnrichmentErrors.update { it - checkpointId }
+    }
+
     /** Creates a checkpoint for a just-saved silhouette snapshot.
-     *  Deterministic part is synchronous + persisted; LLM enrichment is
-     *  async and independently retryable via [requestCheckpointEnrichment]. */
+     *  Deterministic part is local-only + persisted first; LLM enrichment
+     *  is async and independently retryable via [requestCheckpointEnrichment]. */
     fun createBodyPlanCheckpoint(snapshot: com.example.data.local.PerformanceSnapshotEntity) {
         viewModelScope.launch {
-            val goal = latestPerformanceGoal.value
-            // recent() is newest-first — reverse to oldest→newest for trend math.
-            val bodyComp = repository.recentBodyCompositionSnapshots(10).reversed()
-            val prev = repository.latestBodyPlanCheckpoint()
-            val prevSnapshot = prev?.snapshotId?.let { sid ->
-                repository.recentPerformanceSnapshots(20).firstOrNull { it.id == sid }
+            val id = createBodyPlanCheckpointLocal(snapshot)
+            if (id != null && acquireEnrichmentSlot(id)) {
+                viewModelScope.launch {
+                    try {
+                        enrichCheckpoint(id)
+                    } finally {
+                        releaseEnrichmentSlot(id)
+                    }
+                }
             }
-            val hasComp = bodyComp.any { it.bodyFatPct != null || it.muscleMassKg != null }
-
-            val phase = com.example.data.performance.BodyPlanEngine.classifyPhase(bodyComp, goal?.goalText)
-            val targets = goal?.coachTargetJson?.let {
-                com.example.data.performance.BodyPlanEngine.targetsFromJson(it)
-            } ?: emptyMap()
-            val priorities = com.example.data.performance.BodyPlanEngine.rankPriorities(
-                snapshot, targets, hasComp
-            )
-            val deltas = com.example.data.performance.BodyPlanEngine.deltasBetween(
-                snapshot, prevSnapshot,
-                bodyComp.lastOrNull(),
-                bodyComp.dropLast(1).lastOrNull(),
-            )
-            val deltaSummary = formatDeltaSummary(deltas)
-
-            val id = repository.insertBodyPlanCheckpoint(
-                com.example.data.local.BodyPlanCheckpointEntity(
-                    checkpointAtMs = System.currentTimeMillis(),
-                    snapshotId = snapshot.id,
-                    bodyCompRowId = bodyComp.lastOrNull()?.id,
-                    phase = phase?.name,
-                    prioritiesJson = prioritiesToJson(priorities),
-                    deltaSummary = deltaSummary,
-                )
-            )
-            if (id <= 0) {
-                android.util.Log.w("SHD", "[body-plan] checkpoint insert failed")
-                return@launch
-            }
-            android.util.Log.i(
-                "SHD", "[body-plan] checkpoint#$id phase=$phase priorities=${priorities.size} " +
-                    "prev=${prev?.id ?: "none"} delta=\"$deltaSummary\""
-            )
-            enrichCheckpoint(id, snapshot, prev, prevSnapshot, bodyComp, goal, phase, priorities)
         }
+    }
+
+    /** Local-only, idempotent checkpoint creation (one per snapshot, v40).
+     *  Runs the deterministic engine + the transactional insert and returns
+     *  the persisted checkpoint id — or null when the insert failed. NO
+     *  network work here: the caller decides afterwards which independent
+     *  jobs to launch (coach report, LLM enrichment). */
+    private suspend fun createBodyPlanCheckpointLocal(
+        snapshot: com.example.data.local.PerformanceSnapshotEntity,
+    ): Long? {
+        val goal = latestPerformanceGoal.value
+        // recent() is newest-first — reverse to oldest→newest for trend math.
+        val bodyComp = repository.recentBodyCompositionSnapshots(10).reversed()
+        val prev = repository.latestBodyPlanCheckpoint()
+        val prevSnapshot = prev?.snapshotId?.let { sid ->
+            repository.performanceSnapshotById(sid)
+        }
+        val hasComp = bodyComp.any { it.bodyFatPct != null || it.muscleMassKg != null }
+
+        val phase = com.example.data.performance.BodyPlanEngine.classifyPhase(bodyComp, goal?.goalText)
+        val targets = goal?.coachTargetJson?.let {
+            com.example.data.performance.BodyPlanEngine.targetsFromJson(it)
+        } ?: emptyMap()
+        val priorities = com.example.data.performance.BodyPlanEngine.rankPriorities(
+            snapshot, targets, hasComp
+        )
+        val deltas = com.example.data.performance.BodyPlanEngine.deltasBetween(
+            snapshot, prevSnapshot,
+            bodyComp.lastOrNull(),
+            bodyComp.dropLast(1).lastOrNull(),
+        )
+        val deltaSummary = formatDeltaSummary(deltas)
+
+        val id = repository.insertBodyPlanCheckpointIfAbsent(
+            com.example.data.local.BodyPlanCheckpointEntity(
+                checkpointAtMs = System.currentTimeMillis(),
+                snapshotId = snapshot.id,
+                bodyCompRowId = bodyComp.lastOrNull()?.id,
+                phase = phase?.name,
+                prioritiesJson = prioritiesToJson(priorities),
+                deltaSummary = deltaSummary,
+                goalText = goal?.goalText,
+                goalTargetsJson = goal?.coachTargetJson,
+            )
+        )
+        if (id <= 0) {
+            android.util.Log.w("SHD", "[body-plan] checkpoint insert failed snapshot=${snapshot.id}")
+            return null
+        }
+        android.util.Log.i(
+            "SHD", "[body-plan] checkpoint#$id phase=$phase priorities=${priorities.size} " +
+                "prev=${prev?.id ?: "none"} delta=\"$deltaSummary\""
+        )
+        // The goal's ratio targets were derived from the PREVIOUS capture's
+        // ratios. If the normalization convention changed between captures
+        // (e.g. this time the camera got a full-body pose), the old targets
+        // are not same-unit data — re-derive them (v40).
+        if (goal != null && goal.coachTargetJson != null && prevSnapshot != null) {
+            val prevConv = prevSnapshot.frontalNormalization to prevSnapshot.lateralNormalization
+            val newConv = snapshot.frontalNormalization to snapshot.lateralNormalization
+            if (prevConv != newConv) {
+                android.util.Log.i(
+                    "SHD", "[body-plan] normalization convention changed $prevConv → $newConv — regenerating goal targets"
+                )
+                viewModelScope.launch { generateCoachTargets(goal) }
+            }
+        }
+        return id
     }
 
     /** Explicit retry for the LLM enrichment of an existing checkpoint
-     *  (tactics + report) — the "Gerar novamente" button. No-op for a
-     *  checkpoint that already has both an LLM-sourced tactics list and a
-     *  report. */
+     *  (tactics + report) — the "Gerar novamente" button. The enrichment
+     *  re-runs from the CHECKPOINT-ANCHORED inputs (persisted phase,
+     *  priorities, snapshot and goal fixed at checkpoint time) — never from
+     *  today's recomputed composition/goal (v40). In-flight retries for the
+     *  same checkpoint are debounced; every outcome is visible via
+     *  [checkpointEnrichmentErrors] — no silent returns. */
     fun requestCheckpointEnrichment(checkpointId: Long) {
+        if (!acquireEnrichmentSlot(checkpointId)) {
+            android.util.Log.i("SHD", "[body-plan] retry#$checkpointId ignored — already in flight")
+            return
+        }
         viewModelScope.launch {
-            val all = repository.recentBodyPlanCheckpoints(50)
-            val cp = all.firstOrNull { it.id == checkpointId } ?: return@launch
-            val snapshot = cp.snapshotId?.let { sid ->
-                repository.recentPerformanceSnapshots(20).firstOrNull { it.id == sid }
-            } ?: return@launch
-            val goal = latestPerformanceGoal.value
-            // recent() is newest-first — reverse to oldest→newest for trend math.
-            val bodyComp = repository.recentBodyCompositionSnapshots(10).reversed()
-            val prev = all.firstOrNull { it.checkpointAtMs < cp.checkpointAtMs }
-            val prevSnapshot = prev?.snapshotId?.let { sid ->
-                repository.recentPerformanceSnapshots(20).firstOrNull { it.id == sid }
+            try {
+                enrichCheckpoint(checkpointId)
+            } catch (t: Throwable) {
+                android.util.Log.w("SHD", "[body-plan] retry#$checkpointId crashed", t)
+                setCheckpointError(checkpointId, "llm_failed")
+            } finally {
+                releaseEnrichmentSlot(checkpointId)
             }
-            val hasComp = bodyComp.any { it.bodyFatPct != null || it.muscleMassKg != null }
-            val phase = com.example.data.performance.BodyPlanEngine.classifyPhase(bodyComp, goal?.goalText)
-            val priorities = com.example.data.performance.BodyPlanEngine.rankPriorities(
-                snapshot,
-                goal?.coachTargetJson?.let { com.example.data.performance.BodyPlanEngine.targetsFromJson(it) } ?: emptyMap(),
-                hasComp,
-            )
-            enrichCheckpoint(checkpointId, snapshot, prev, prevSnapshot, bodyComp, goal, phase, priorities)
         }
     }
 
-    private suspend fun enrichCheckpoint(
-        checkpointId: Long,
-        snapshot: com.example.data.local.PerformanceSnapshotEntity,
-        previous: com.example.data.local.BodyPlanCheckpointEntity?,
-        previousSnapshot: com.example.data.local.PerformanceSnapshotEntity?,
-        bodyComp: List<com.example.data.local.BodyCompositionSnapshotEntity>,
-        goal: com.example.data.local.PerformanceGoalEntity?,
-        phase: com.example.data.performance.BodyPlanEngine.BodyPhase?,
-        priorities: List<com.example.data.performance.BodyPlanEngine.ZonePriority>,
-    ) {
+    /** Enriches one checkpoint with a single routine LLM call (report +
+     *  [TACTICS] block), loading every input from the checkpoint's own
+     *  persisted anchors (v40). LLM tactics pass the semantic safety
+     *  validator against the persisted priorities/tissues; any violation or
+     *  hard failure stores the deterministic fallback and surfaces a
+     *  visible error for the UI's retry. */
+    private suspend fun enrichCheckpoint(checkpointId: Long) {
+        val cp = repository.bodyPlanCheckpointById(checkpointId)
+        if (cp == null) {
+            setCheckpointError(checkpointId, "checkpoint_gone")
+            return
+        }
+        val snapshot = cp.snapshotId?.let { repository.performanceSnapshotById(it) }
+        if (snapshot == null) {
+            setCheckpointError(checkpointId, "snapshot_missing")
+            return
+        }
         val name = _userProfile.value.name.ifBlank { "Utilizador" }
         val lang = _userProfile.value.language.ifBlank { "pt-PT" }
-        val latestComp = bodyComp.lastOrNull()
+
+        // Checkpoint-anchored inputs: the persisted (safety-gated) phase and
+        // priorities, plus the snapshot and goal fixed at checkpoint time.
+        val phase = cp.phase?.let { p ->
+            runCatching { com.example.data.performance.BodyPlanEngine.BodyPhase.valueOf(p) }.getOrNull()
+        }
+        val priorities = com.example.data.performance.BodyPlanEngine.parsePrioritiesJson(cp.prioritiesJson)
+        val anchoredComp = cp.bodyCompRowId?.let { repository.bodyCompositionSnapshotById(it) }
+        val prev = repository.latestBodyPlanCheckpointBefore(cp.checkpointAtMs)
+        val prevSnapshot = prev?.snapshotId?.let { repository.performanceSnapshotById(it) }
 
         val tacticsPrompt = com.example.data.performance.BodyPlanPromptBuilder.buildTacticsPrompt(
             phase = phase,
             priorities = priorities,
-            goalText = goal?.goalText,
-            latestComp = latestComp,
+            goalText = cp.goalText,
+            latestComp = anchoredComp,
             name = name,
             lang = lang,
-            previousPhase = previous?.phase,
-            previousRatios = previous?.let {
-                com.example.data.performance.BodyPlanPromptBuilder.ratiosLine(previousSnapshot)
+            previousPhase = prev?.phase,
+            previousRatios = prev?.let {
+                com.example.data.performance.BodyPlanPromptBuilder.ratiosLine(prevSnapshot)
             },
-            deltaSummary = previous?.let {
-                com.example.data.performance.BodyPlanEngine.deltasBetween(
-                    snapshot, previousSnapshot,
-                    bodyComp.lastOrNull(), bodyComp.dropLast(1).lastOrNull(),
-                ).let { d -> formatDeltaSummary(d) }
-            },
+            deltaSummary = cp.deltaSummary,
         )
-        val raw = repository.generateBodyPlanContent(tacticsPrompt, lang)
+        val result = repository.generateBodyPlanContent(tacticsPrompt, lang)
 
-        if (raw == null) {
-            // Hard failure (no key / network / quota): deterministic fallback.
+        if (result.text == null) {
+            // Hard failure (no key / network / quota): deterministic fallback
+            // tactics so the Plan keeps working, plus a VISIBLE error (the UI
+            // shows "Gerar novamente" instead of a silent state).
             repository.updateBodyPlanCheckpointTactics(
                 checkpointId,
-                fallbackTacticsJson(phase, priorities, latestComp?.weightKg, lang),
+                fallbackTacticsJson(phase, priorities, anchoredComp?.weightKg, lang),
                 "deterministic_fallback",
             )
-            android.util.Log.w("SHD", "[body-plan] checkpoint#$checkpointId LLM null → fallback tactics")
+            setCheckpointError(checkpointId, "llm_failed")
+            android.util.Log.w("SHD", "[body-plan] checkpoint#$checkpointId LLM null → fallback tactics + visible error")
             return
         }
-        // Parse the [TACTICS] block; the remaining text is the checkpoint report.
+        val raw = result.text
         val tacticsJson = extractTacticsJson(raw)
         val reportText = stripTacticsBlock(raw).trim()
-        val validTactics = tacticsJson?.let { normalizeTacticsJson(it) }
-        if (validTactics != null) {
-            repository.updateBodyPlanCheckpointTactics(checkpointId, validTactics, "llm")
+        // SEMANTIC safety validation (v40): the LLM tactics must agree with
+        // the persisted, safety-gated priorities and tissue classification.
+        // Any violation (unknown zone, conflicting direction, reduce-advice
+        // for a muscle-dominant zone, out-of-bounds calorie/protein numbers)
+        // rejects the whole block → deterministic fallback.
+        val candidates = tacticsJson?.let { parseTacticCandidates(it) }
+        val hasAnchoredComp = anchoredComp?.let {
+            it.bodyFatPct != null || it.muscleMassKg != null
+        } ?: false
+        val verdict = com.example.data.performance.TacticSafetyValidator.validate(
+            candidates, priorities, anchoredComp?.weightKg, hasAnchoredComp
+        )
+        if (candidates != null && verdict.safeJson != null) {
+            repository.updateBodyPlanCheckpointTactics(checkpointId, verdict.safeJson, "llm:${result.modelUsed}")
+            clearCheckpointError(checkpointId)
         } else {
             repository.updateBodyPlanCheckpointTactics(
                 checkpointId,
-                fallbackTacticsJson(phase, priorities, latestComp?.weightKg, lang),
+                fallbackTacticsJson(phase, priorities, anchoredComp?.weightKg, lang),
                 "deterministic_fallback",
             )
-            android.util.Log.w("SHD", "[body-plan] checkpoint#$checkpointId invalid tactics JSON → fallback")
+            setCheckpointError(checkpointId, if (candidates == null) "llm_failed" else "tactics_rejected")
+            android.util.Log.w(
+                "SHD", "[body-plan] checkpoint#$checkpointId tactics rejected " +
+                    "(${verdict.reasons.joinToString("; ")}) → deterministic fallback"
+            )
         }
         if (reportText.isNotBlank()) {
-            repository.updateBodyPlanCheckpointReport(
-                checkpointId, reportText, System.currentTimeMillis()
-            )
+            repository.updateBodyPlanCheckpointReport(checkpointId, reportText, System.currentTimeMillis())
         }
         android.util.Log.i(
             "SHD", "[body-plan] checkpoint#$checkpointId enriched " +
-                "(tactics=${if (validTactics != null) "llm" else "fallback"}, report=${reportText.isNotEmpty()})"
+                "(tactics=${if (candidates != null && verdict.safeJson != null) "llm:${result.modelUsed}" else "fallback"}, report=${reportText.isNotEmpty()})"
         )
     }
 
@@ -546,35 +671,34 @@ class ChatViewModel(
         return (text.substring(0, start) + text.substring(end + close.length)).trim()
     }
 
-    /** Validates + normalizes the LLM tactics JSON. Returns the cleaned JSON
-     *  string, or null when the payload is unusable (→ deterministic
-     *  fallback). Rules: array of 1–6 objects; category in the allowed set;
-     *  non-empty text ≤ 200 chars; windowDays clamped to 7–120 (default 28);
-     *  target optional string ≤ 80 chars. Never throws. */
-    private fun normalizeTacticsJson(json: String): String? {
-        val allowedCategories = setOf("protein", "strength", "steps", "sleep", "calories", "zone")
+    /** Parses the [TACTICS] block JSON into semantic candidates for the
+     *  safety validator. Malformed JSON / non-integer windowDays → null
+     *  (the caller treats the block as unusable → deterministic fallback).
+     *  No semantic checks here — those live in
+     *  com.example.data.performance.TacticSafetyValidator. Never throws. */
+    private fun parseTacticCandidates(
+        json: String,
+    ): List<com.example.data.performance.TacticSafetyValidator.TacticCandidate>? {
         return try {
             val arr = org.json.JSONArray(json)
-            if (arr.length() < 1 || arr.length() > 6) return null
-            val out = org.json.JSONArray()
+            val out = mutableListOf<com.example.data.performance.TacticSafetyValidator.TacticCandidate>()
             for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                val category = o.optString("category", "").lowercase().trim()
-                if (category !in allowedCategories) return null
-                val text = o.optString("text", "").trim()
-                if (text.isEmpty() || text.length > 200) return null
-                val clean = org.json.JSONObject()
-                clean.put("category", category)
-                clean.put("text", text)
-                if (o.has("target")) {
-                    val target = o.optString("target", "").trim()
-                    if (target.isNotEmpty()) clean.put("target", target.take(80))
+                val o = arr.optJSONObject(i) ?: return null
+                val category = o.optString("category", "")
+                val text = o.optString("text", "")
+                if (category.isEmpty() || text.isEmpty()) return null
+                val target = o.optString("target", "").takeIf { it.isNotBlank() }
+                val windowDays = if (o.has("windowDays")) {
+                    (o.opt("windowDays") as? Number)?.toInt() ?: return null
+                } else {
+                    28
                 }
-                val windowDays = (o.optInt("windowDays", 28)).coerceIn(7, 120)
-                clean.put("windowDays", windowDays)
-                out.put(clean)
+                val zone = o.optString("zone", "").takeIf { it.isNotBlank() }
+                out += com.example.data.performance.TacticSafetyValidator.TacticCandidate(
+                    category, text, target, windowDays, zone
+                )
             }
-            out.toString()
+            out
         } catch (e: Exception) {
             null
         }
