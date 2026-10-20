@@ -22,7 +22,7 @@ class SilhouetteZoneMathTest {
     private fun rectRowSpan(imgW: Int, imgH: Int, top: Int, bottom: Int, width: Int): IntArray =
         IntArray(imgH) { row -> if (row in top..bottom) width else 0 }
 
-    private fun pts(vararg lm: Triple<Int, Float, Float>): Map<Int, SilhouetteZoneMath.LandmarkPt> =
+    private fun pts(vararg lm: Triple<SilhouetteZoneMath.LandmarkKey, Float, Float>): Map<SilhouetteZoneMath.LandmarkKey, SilhouetteZoneMath.LandmarkPt> =
         lm.associate { (t, x, y) -> t to SilhouetteZoneMath.LandmarkPt(x, y, 0.9f) }
 
     /** A full-body pose: person from [top] (nose) to [bottom] (ankles),
@@ -33,21 +33,21 @@ class SilhouetteZoneMathTest {
         centerX: Float,
         w: Float,
         halfShoulder: Float,
-    ): Map<Int, SilhouetteZoneMath.LandmarkPt> {
+    ): Map<SilhouetteZoneMath.LandmarkKey, SilhouetteZoneMath.LandmarkPt> {
         val span = bottom - top
         val shoulderY = top + 0.25f * span
         val hipY = top + 0.65f * span
         val kneeY = top + 0.80f * span
         return pts(
-            Triple(com.google.mlkit.vision.pose.PoseLandmark.NOSE, centerX, top),
-            Triple(com.google.mlkit.vision.pose.PoseLandmark.LEFT_SHOULDER, centerX - halfShoulder, shoulderY),
-            Triple(com.google.mlkit.vision.pose.PoseLandmark.RIGHT_SHOULDER, centerX + halfShoulder, shoulderY),
-            Triple(com.google.mlkit.vision.pose.PoseLandmark.LEFT_HIP, centerX - halfShoulder, hipY),
-            Triple(com.google.mlkit.vision.pose.PoseLandmark.RIGHT_HIP, centerX + halfShoulder, hipY),
-            Triple(com.google.mlkit.vision.pose.PoseLandmark.LEFT_KNEE, centerX - halfShoulder, kneeY),
-            Triple(com.google.mlkit.vision.pose.PoseLandmark.RIGHT_KNEE, centerX + halfShoulder, kneeY),
-            Triple(com.google.mlkit.vision.pose.PoseLandmark.LEFT_ANKLE, centerX - halfShoulder, bottom),
-            Triple(com.google.mlkit.vision.pose.PoseLandmark.RIGHT_ANKLE, centerX + halfShoulder, bottom),
+            Triple(SilhouetteZoneMath.LandmarkKey.NOSE, centerX, top),
+            Triple(SilhouetteZoneMath.LandmarkKey.LEFT_SHOULDER, centerX - halfShoulder, shoulderY),
+            Triple(SilhouetteZoneMath.LandmarkKey.RIGHT_SHOULDER, centerX + halfShoulder, shoulderY),
+            Triple(SilhouetteZoneMath.LandmarkKey.LEFT_HIP, centerX - halfShoulder, hipY),
+            Triple(SilhouetteZoneMath.LandmarkKey.RIGHT_HIP, centerX + halfShoulder, hipY),
+            Triple(SilhouetteZoneMath.LandmarkKey.LEFT_KNEE, centerX - halfShoulder, kneeY),
+            Triple(SilhouetteZoneMath.LandmarkKey.RIGHT_KNEE, centerX + halfShoulder, kneeY),
+            Triple(SilhouetteZoneMath.LandmarkKey.LEFT_ANKLE, centerX - halfShoulder, bottom),
+            Triple(SilhouetteZoneMath.LandmarkKey.RIGHT_ANKLE, centerX + halfShoulder, bottom),
         )
     }
 
@@ -145,7 +145,7 @@ class SilhouetteZoneMathTest {
         val full = fullPose(60f, 420f, 320f, 100f, 50f)
 
         // Missing right ankle.
-        val missingAnkle = full.filterKeys { it != com.google.mlkit.vision.pose.PoseLandmark.RIGHT_ANKLE }
+        val missingAnkle = full.filterKeys { it != SilhouetteZoneMath.LandmarkKey.RIGHT_ANKLE }
         assertEquals(
             SilhouetteZoneMath.NORMALIZATION_IMAGE_HEIGHT,
             SilhouetteZoneMath.plan(true, 480, missingAnkle).normalization
@@ -153,7 +153,7 @@ class SilhouetteZoneMathTest {
 
         // One ankle below the confidence threshold.
         val lowConf = full.toMutableMap().apply {
-            this[com.google.mlkit.vision.pose.PoseLandmark.LEFT_ANKLE] =
+            this[SilhouetteZoneMath.LandmarkKey.LEFT_ANKLE] =
                 SilhouetteZoneMath.LandmarkPt(270f, 420f, 0.2f)
         }
         assertEquals(
@@ -170,9 +170,9 @@ class SilhouetteZoneMathTest {
 
         // Degenerate: shoulders at/below hips.
         val degenerate = full.toMutableMap().apply {
-            this[com.google.mlkit.vision.pose.PoseLandmark.LEFT_SHOULDER] =
+            this[SilhouetteZoneMath.LandmarkKey.LEFT_SHOULDER] =
                 SilhouetteZoneMath.LandmarkPt(270f, 400f, 0.9f)
-            this[com.google.mlkit.vision.pose.PoseLandmark.RIGHT_SHOULDER] =
+            this[SilhouetteZoneMath.LandmarkKey.RIGHT_SHOULDER] =
                 SilhouetteZoneMath.LandmarkPt(370f, 400f, 0.9f)
         }
         assertEquals(
@@ -209,5 +209,27 @@ class SilhouetteZoneMathTest {
         val span = IntArray(10) { 20 }
         assertNull(SilhouetteZoneMath.zoneRatio(span, SilhouetteZoneMath.ZoneBand(0, 9), 0))
         assertNull(SilhouetteZoneMath.zoneRatio(IntArray(0), SilhouetteZoneMath.ZoneBand(0, 9), 100))
+    }
+
+    // ── Convention comparison (v40) ────────────────────────────────────────
+
+    @Test
+    fun `null marker means legacy image_height convention`() {
+        assertEquals(SilhouetteZoneMath.NORMALIZATION_IMAGE_HEIGHT, SilhouetteZoneMath.conventionOf(null))
+        assertEquals(SilhouetteZoneMath.NORMALIZATION_IMAGE_HEIGHT, SilhouetteZoneMath.conventionOf(""))
+        assertEquals(SilhouetteZoneMath.NORMALIZATION_IMAGE_HEIGHT, SilhouetteZoneMath.conventionOf("image_height"))
+        assertEquals(SilhouetteZoneMath.NORMALIZATION_POSE_PERSON_HEIGHT, SilhouetteZoneMath.conventionOf("pose_person_height"))
+    }
+
+    @Test
+    fun `same convention is required to compare metrics`() {
+        assertTrue(SilhouetteZoneMath.sameConvention(null, null))
+        assertTrue(SilhouetteZoneMath.sameConvention(null, "image_height"))
+        assertTrue(SilhouetteZoneMath.sameConvention("image_height", "image_height"))
+        assertTrue(SilhouetteZoneMath.sameConvention("pose_person_height", "pose_person_height"))
+        // Legacy vs pose are DIFFERENT units even for the same zone.
+        assertTrue(!SilhouetteZoneMath.sameConvention(null, "pose_person_height"))
+        assertTrue(!SilhouetteZoneMath.sameConvention("image_height", "pose_person_height"))
+        assertTrue(!SilhouetteZoneMath.sameConvention("pose_person_height", null))
     }
 }

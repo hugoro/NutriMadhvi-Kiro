@@ -1,10 +1,12 @@
 package com.example.ui
 
-import com.google.mlkit.vision.pose.PoseLandmark
-
 /**
- * Pure geometry for silhouette zone extraction — no ML Kit inference, no
- * Android types, unit-testable on the JVM.
+ * Pure geometry for silhouette zone extraction — NO ML Kit, no Android
+ * types, no I/O: unit-testable on the plain JVM. The ML Kit coupling lives
+ * in com.example.ui.SilhouettePoseBridge (Android side), which maps
+ * PoseLandmark indices to [LandmarkKey] — the single point where the
+ * landmark numbering of the ML Kit SDK is referenced, so this file can
+ * never drift or accidentally import the SDK.
  *
  * Two conventions:
  *  - **legacy** (pre-v39): zone bands at fixed fractions of the frame height;
@@ -20,6 +22,11 @@ import com.google.mlkit.vision.pose.PoseLandmark
  * Falls back to the legacy plan whenever the pose is not full-body, so a
  * failed landmark detection can never degrade a capture below the old
  * behavior.
+ *
+ * Mixed-convention rule (v40): a snapshot's metrics are comparable to
+ * another snapshot's ONLY when both used the same convention on that side
+ * (see [conventionOf] / [sameConvention]) — a legacy value and a
+ * pose-normalised value of the "same" zone are different units.
  */
 object SilhouetteZoneMath {
 
@@ -40,8 +47,19 @@ object SilhouetteZoneMath {
     private const val MIN_PERSON_SPAN_FRAC = 0.3f
     private const val MAX_PERSON_SPAN_FRAC = 1.0f
 
+    /** The landmarks the zone math needs, as an app-owned enum (pure JVM).
+     *  The ML Kit → [LandmarkKey] mapping is done once in
+     *  SilhouettePoseBridge, so the SDK's int numbering never leaks here. */
+    enum class LandmarkKey {
+        NOSE,
+        LEFT_SHOULDER, RIGHT_SHOULDER,
+        LEFT_HIP, RIGHT_HIP,
+        LEFT_KNEE, RIGHT_KNEE,
+        LEFT_ANKLE, RIGHT_ANKLE,
+    }
+
     /** One detected landmark: pixel coordinates + in-frame likelihood.
-     *  Android-free mirror of ML Kit's [PoseLandmark] so the math is
+     *  Android-free mirror of ML Kit's PoseLandmark so the math is
      *  unit-testable on the JVM. */
     data class LandmarkPt(val x: Float, val y: Float, val inFrameLikelihood: Float)
 
@@ -64,7 +82,7 @@ object SilhouetteZoneMath {
     fun plan(
         isFrontal: Boolean,
         imgH: Int,
-        landmarks: Map<Int, LandmarkPt>?,
+        landmarks: Map<LandmarkKey, LandmarkPt>?,
         minConfidence: Float = 0.4f,
     ): ZonePlan {
         val anchors = fullBodyAnchors(landmarks, minConfidence, imgH)
@@ -88,6 +106,21 @@ object SilhouetteZoneMath {
         normalization = NORMALIZATION_IMAGE_HEIGHT,
     )
 
+    // ── Convention comparison (v40) ─────────────────────────────────────────
+
+    /** The effective convention of a persisted normalization marker.
+     *  Null markers (pre-v39/v40 rows) are the legacy convention — they
+     *  were always produced by the fixed-fraction plan. */
+    fun conventionOf(marker: String?): String =
+        marker?.takeIf { it.isNotBlank() } ?: NORMALIZATION_IMAGE_HEIGHT
+
+    /** True when two persisted markers denote the SAME unit of measurement
+     *  — i.e. the metrics behind them can be compared in one trend chart.
+     *  A legacy value and a pose-normalised value are NOT comparable even
+     *  for the same anatomical zone. */
+    fun sameConvention(a: String?, b: String?): Boolean =
+        conventionOf(a) == conventionOf(b)
+
     // ── Pose-anchored path ────────────────────────────────────────────────────
 
     private data class Anchors(
@@ -100,23 +133,23 @@ object SilhouetteZoneMath {
     /** Returns null unless every required landmark is confidently in frame
      *  and the nose→ankle span is physically plausible for a full-body shot. */
     private fun fullBodyAnchors(
-        landmarks: Map<Int, LandmarkPt>?,
+        landmarks: Map<LandmarkKey, LandmarkPt>?,
         minConfidence: Float,
         imgH: Int,
     ): Anchors? {
         if (landmarks == null || imgH <= 0) return null
-        fun y(t: Int): Float? {
+        fun y(t: LandmarkKey): Float? {
             val lm = landmarks[t] ?: return null
             if (lm.inFrameLikelihood < minConfidence) return null
             return lm.y
         }
-        val nose = y(PoseLandmark.NOSE) ?: return null
-        val ls = y(PoseLandmark.LEFT_SHOULDER) ?: return null
-        val rs = y(PoseLandmark.RIGHT_SHOULDER) ?: return null
-        val lh = y(PoseLandmark.LEFT_HIP) ?: return null
-        val rh = y(PoseLandmark.RIGHT_HIP) ?: return null
-        val la = y(PoseLandmark.LEFT_ANKLE) ?: return null
-        val ra = y(PoseLandmark.RIGHT_ANKLE) ?: return null
+        val nose = y(LandmarkKey.NOSE) ?: return null
+        val ls = y(LandmarkKey.LEFT_SHOULDER) ?: return null
+        val rs = y(LandmarkKey.RIGHT_SHOULDER) ?: return null
+        val lh = y(LandmarkKey.LEFT_HIP) ?: return null
+        val rh = y(LandmarkKey.RIGHT_HIP) ?: return null
+        val la = y(LandmarkKey.LEFT_ANKLE) ?: return null
+        val ra = y(LandmarkKey.RIGHT_ANKLE) ?: return null
 
         val ankleMid = (la + ra) / 2f
         val spanPx = ankleMid - nose
@@ -127,8 +160,8 @@ object SilhouetteZoneMath {
         val hipY = (lh + rh) / 2f
         if (hipY - shoulderY < 0.1f * spanPx) return null // degenerate (shoulders at/below hips)
 
-        val kneeL = y(PoseLandmark.LEFT_KNEE)
-        val kneeR = y(PoseLandmark.RIGHT_KNEE)
+        val kneeL = y(LandmarkKey.LEFT_KNEE)
+        val kneeR = y(LandmarkKey.RIGHT_KNEE)
         val kneeMid = if (kneeL != null && kneeR != null) (kneeL + kneeR) / 2f else null
 
         return Anchors(
@@ -200,9 +233,3 @@ object SilhouetteZoneMath {
         return (sum.toFloat() / rows) / normalizer
     }
 }
-
-/** Android bridge: ML Kit landmarks → pure [SilhouetteZoneMath.LandmarkPt]. */
-fun Map<Int, PoseLandmark>?.toLandmarkPts(): Map<Int, SilhouetteZoneMath.LandmarkPt>? =
-    this?.mapValues { (_, lm) ->
-        SilhouetteZoneMath.LandmarkPt(lm.position.x, lm.position.y, lm.inFrameLikelihood)
-    }

@@ -84,7 +84,7 @@ object SilhouetteAnalyzer {
         }
         mask.recycle()
 
-        val plan = SilhouetteZoneMath.plan(isFrontal, h, landmarks?.toLandmarkPts())
+        val plan = SilhouetteZoneMath.plan(isFrontal, h, landmarks?.toLandmarkKeys())
         fun ratio(zone: String): Float? {
             val band = plan.bands[zone] ?: return null
             return SilhouetteZoneMath.zoneRatio(rowSpan, band, plan.normalizer, MIN_ZONE_COVERAGE)
