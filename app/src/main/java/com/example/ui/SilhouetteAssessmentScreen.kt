@@ -100,6 +100,10 @@ fun SilhouetteAssessmentScreen(
     // Captured bitmaps — kept until entity is built
     var frontalBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var lateralBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    // Pose landmarks at the moment of each capture (used to normalise the
+    // silhouette zones by the person's on-screen height when full-body).
+    var frontalLandmarks by remember { mutableStateOf<Map<Int, PoseLandmark>?>(null) }
+    var lateralLandmarks by remember { mutableStateOf<Map<Int, PoseLandmark>?>(null) }
 
     var useFrontCamera by remember { mutableStateOf(false) }
 
@@ -140,11 +144,13 @@ fun SilhouetteAssessmentScreen(
         if (step == CaptureStep.FRONTAL) {
             startCountdown { bmp ->
                 frontalBitmap = bmp
+                frontalLandmarks = if (hasFullBodyPose(landmarks)) landmarks else null
                 step = CaptureStep.LATERAL
             }
         } else if (step == CaptureStep.LATERAL) {
             startCountdown { bmp ->
                 lateralBitmap = bmp
+                lateralLandmarks = if (hasFullBodyPose(landmarks)) landmarks else null
                 step = CaptureStep.PROCESSING
                 // Run segmentation off-main-thread
                 scope.launch(Dispatchers.Default) {
@@ -156,12 +162,14 @@ fun SilhouetteAssessmentScreen(
                     val lateralPath = lateral?.let {
                         withContext(Dispatchers.IO) { saveBitmapToFilesDir(context, it) }
                     }
-                    val frontalRatios = runCatching {
-                        frontal?.let { SilhouetteAnalyzer.analyze(it, isFrontal = true) }
+                    val frontalAnalysis = runCatching {
+                        frontal?.let { SilhouetteAnalyzer.analysis(it, isFrontal = true, landmarks = frontalLandmarks) }
                     }.getOrNull()
-                    val lateralRatios = runCatching {
-                        lateral?.let { SilhouetteAnalyzer.analyze(it, isFrontal = false) }
+                    val lateralAnalysis = runCatching {
+                        lateral?.let { SilhouetteAnalyzer.analysis(it, isFrontal = false, landmarks = lateralLandmarks) }
                     }.getOrNull()
+                    val frontalRatios = frontalAnalysis?.ratios
+                    val lateralRatios = lateralAnalysis?.ratios
                     frontal?.recycle()
                     lateral?.recycle()
 
@@ -176,6 +184,10 @@ fun SilhouetteAssessmentScreen(
                         lateralChestRatio    = lateralRatios?.chestRatio,
                         lateralBellyRatio    = lateralRatios?.bellyRatio,
                         lateralThighRatio    = lateralRatios?.lateralThighRatio,
+                        // Which zone convention produced the ratios (frontal
+                        // capture is primary; lateral as fallback).
+                        silhouetteNormalization = frontalAnalysis?.normalization
+                            ?: lateralAnalysis?.normalization,
                     )
                     withContext(Dispatchers.Main) { onConfirm(entity) }
                 }
