@@ -21,6 +21,13 @@ interface PerformanceGoalDao {
     @Query("SELECT * FROM performance_goals ORDER BY createdAtMs DESC")
     suspend fun listAll(): List<PerformanceGoalEntity>
 
-    @Query("UPDATE performance_goals SET coachTargetJson = :json, targetsGeneratedAtMs = :ts WHERE id = :id")
-    suspend fun updateCoachTargets(id: Long, json: String, ts: Long)
+    @Query("UPDATE performance_goals SET coachTargetJson = :json, targetsGeneratedAtMs = :ts, " +
+        "targetsConventionFrontal = :convFrontal, targetsConventionLateral = :convLateral WHERE id = :id")
+    suspend fun updateCoachTargets(
+        id: Long,
+        json: String,
+        ts: Long,
+        convFrontal: String?,
+        convLateral: String?,
+    )
 }

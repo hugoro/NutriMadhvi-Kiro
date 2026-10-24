@@ -26,9 +26,12 @@ object PerformanceCoachBuilder {
         goal: PerformanceGoalEntity? = null,
     ): String {
         val langName = when {
-            language.startsWith("pt", ignoreCase = true) || language.isBlank() -> "português"
-            language.startsWith("gu", ignoreCase = true) -> " gujarati"
-            else -> "português"
+            language.isBlank() || language.startsWith("pt", ignoreCase = true) -> "português (Portugal)"
+            language.startsWith("en", ignoreCase = true) -> "English"
+            language.startsWith("gu", ignoreCase = true) -> "Gujarati"
+            // QA 2026-10 (second pass): never silently force Portuguese on a
+            // non-PT user — pass the declared language code through.
+            else -> language
         }
         val date = DATE_FMT.format(Date(snapshot.capturedAtMs))
         val sb = StringBuilder()

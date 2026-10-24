@@ -1062,7 +1062,10 @@ fun DashboardTab(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp),
+            // QA 2026-10 (second pass): 32dp bottom (was 16dp) — the last card
+            // sat flush against the bottom nav and read as overlapping; matches
+            // the Performance tab's LazyColumn bottom padding.
+            .padding(PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 32.dp)),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         // App header title
@@ -1223,7 +1226,12 @@ fun DashboardTab(
                         // "Burned" is the user-facing total: TMB + activity. The
                         // standalone activity-only number is shown in the activity
                         // goal card further down.
-                        Text("-$totalBurnedCalories", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = Color(0xFF60A5FA))
+                        // QA 2026-10: "-$n" rendered "-0" when nothing was
+                        // burned — show a plain 0 instead.
+                        Text(
+                            if (totalBurnedCalories > 0) "-$totalBurnedCalories" else "0",
+                            style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = Color(0xFF60A5FA)
+                        )
                     }
                     Column(horizontalAlignment = Alignment.End) {
                         Text(tr("Net Calories", userProfile.language), color = Color(0xFF94A3B8), style = MaterialTheme.typography.labelMedium)
@@ -1274,7 +1282,11 @@ fun DashboardTab(
                         color = Color(0xFF64748B)
                     )
                     Text(
-                        text = "${String.format(java.util.Locale.US, "%,d", calorieTargetGoal)} kcal",
+                        text = String.format(
+                            localeForLanguage(userProfile.language),
+                            "%,d kcal",
+                            calorieTargetGoal
+                        ),
                         style = MaterialTheme.typography.labelSmall,
                         color = Color(0xFF64748B)
                     )
@@ -1318,7 +1330,9 @@ fun DashboardTab(
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "P ${String.format("%.1f", avgProtein)}g · C ${String.format("%.1f", avgCarbs)}g · F ${String.format("%.1f", avgFat)}g",
+                        text = "P ${String.format(localeForLanguage(userProfile.language), "%.1f", avgProtein)}g · " +
+                            "C ${String.format(localeForLanguage(userProfile.language), "%.1f", avgCarbs)}g · " +
+                            "F ${String.format(localeForLanguage(userProfile.language), "%.1f", avgFat)}g",
                         color = AccentSoft,
                         style = MaterialTheme.typography.bodyMedium
                     )
@@ -1345,7 +1359,8 @@ fun DashboardTab(
                     name = tr("Protein", userProfile.language),
                     actual = totalProtein,
                     target = proteinTarget,
-                    color = Color(0xFFF97316) // orange
+                    color = Color(0xFFF97316), // orange
+                    language = userProfile.language
                 )
             }
             // Carbs progress — split-color when any food in the window has a
@@ -1367,14 +1382,16 @@ fun DashboardTab(
                         actualSecondary = totalFreeSugars.coerceAtMost(totalCarbs),
                         target = carbsTarget,
                         colorPrimary = Color(0xFF8B5CF6),    // violet-500 (unchanged)
-                        colorSecondary = Color(0xFFC4B5FD)   // violet-300 (free sugars tail)
+                        colorSecondary = Color(0xFFC4B5FD),  // violet-300 (free sugars tail)
+                        language = userProfile.language
                     )
                 } else {
                     MacroProgressIndicator(
                         name = tr("Carbohydrates", userProfile.language),
                         actual = totalCarbs,
                         target = carbsTarget,
-                        color = Color(0xFF8B5CF6) // violet
+                        color = Color(0xFF8B5CF6), // violet
+                        language = userProfile.language
                     )
                 }
             }
@@ -1396,14 +1413,16 @@ fun DashboardTab(
                         actualSecondary = totalSatFat.coerceAtMost(totalFat),
                         target = fatTarget,
                         colorPrimary = Color(0xFFEAB308),    // yellow-500 (unchanged)
-                        colorSecondary = Color(0xFFFDE68A)   // yellow-200 (sat fat tail)
+                        colorSecondary = Color(0xFFFDE68A),  // yellow-200 (sat fat tail)
+                        language = userProfile.language
                     )
                 } else {
                     MacroProgressIndicator(
                         name = tr("Fat", userProfile.language),
                         actual = totalFat,
                         target = fatTarget,
-                        color = Color(0xFFEAB308) // yellow
+                        color = Color(0xFFEAB308), // yellow
+                        language = userProfile.language
                     )
                 }
             }
@@ -1487,13 +1506,13 @@ fun DashboardTab(
                                 modifier = Modifier.size(16.dp)
                             )
                             Text(
-                                text = "S-Health Active",
+                                text = tr("S-Health Active", userProfile.language),
                                 color = AccentSoft,
                                 style = MaterialTheme.typography.labelSmall
                             )
                         } else {
                             Text(
-                                text = "S-Health Offline",
+                                text = tr("S-Health Offline", userProfile.language),
                                 color = Color(0xFF64748B),
                                 style = MaterialTheme.typography.bodySmall
                             )
@@ -1543,8 +1562,8 @@ fun DashboardTab(
                                 )
                                 Text(
                                     text = String.format(
-                                        java.util.Locale.US,
-                                        "%,d / %,d steps",
+                                        localeForLanguage(userProfile.language),
+                                        "%,d / %,d " + tr("steps", userProfile.language),
                                         periodSteps,
                                         periodTargetSteps
                                     ),
@@ -1559,7 +1578,7 @@ fun DashboardTab(
                                 if (periodDistanceMeters > 0f) {
                                     Text(
                                         text = String.format(
-                                            java.util.Locale("pt", "PT"),
+                                            localeForLanguage(userProfile.language),
                                             "%.2f km",
                                             periodDistanceMeters / 1000f
                                         ),
@@ -1584,7 +1603,7 @@ fun DashboardTab(
                                     color = Color(0xFF94A3B8)
                                 )
                                 Text(
-                                    text = "$totalActivityMinutes / $periodTargetActiveMinutes mins",
+                                    text = "$totalActivityMinutes / $periodTargetActiveMinutes " + tr("mins", userProfile.language),
                                     style = MaterialTheme.typography.bodyLarge,
                                     fontWeight = FontWeight.Bold,
                                     color = Color.White
@@ -1663,7 +1682,8 @@ fun DashboardTab(
                         )
                         if (showLastSync) {
                             Text(
-                                text = "Last synced: " + java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date(shLastSyncMs)),
+                                text = tr("Last synced", userProfile.language) + ": " +
+                                    java.text.SimpleDateFormat("HH:mm:ss", localeForLanguage(userProfile.language)).format(java.util.Date(shLastSyncMs)),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = Color(0xFF64748B),
                                 textAlign = TextAlign.End
@@ -2374,7 +2394,8 @@ fun MacroProgressIndicator(
     name: String,
     actual: Double,
     target: Double,
-    color: Color
+    color: Color,
+    language: String,
 ) {
     // Single-segment look: fill clamped to 100% even when actual > target, so
     // an over-limit day reads as "full bar" instead of stretching the domain.
@@ -2413,7 +2434,7 @@ fun MacroProgressIndicator(
                     style = MaterialTheme.typography.bodyMedium
                 )
                 Text(
-                    "${String.format("%.1f", actual)}g / ${target.toInt()}g",
+                    "${String.format(localeForLanguage(language), "%.1f", actual)}g / ${target.toInt()}g",
                     color = Color(0xFF94A3B8),
                     style = MaterialTheme.typography.labelSmall
                 )
@@ -2471,7 +2492,8 @@ fun MacroProgressIndicatorSplit(
     actualSecondary: Double,
     target: Double,
     colorPrimary: Color,
-    colorSecondary: Color
+    colorSecondary: Color,
+    language: String,
 ) {
     val total = actualPrimary + actualSecondary
     // Title shows the single total %: consumed ÷ target, matching the other
@@ -2519,7 +2541,7 @@ fun MacroProgressIndicatorSplit(
                     style = MaterialTheme.typography.bodyMedium
                 )
                 Text(
-                    "${String.format("%.1f", total)}g / ${target.toInt()}g",
+                    "${String.format(localeForLanguage(language), "%.1f", total)}g / ${target.toInt()}g",
                     color = Color(0xFF94A3B8),
                     style = MaterialTheme.typography.labelSmall
                 )
@@ -4482,7 +4504,7 @@ fun HistoryTab(
                                                 )
                                                 append("${entry.calories} kcal")
                                                 pop()
-                                                append("  •  P: ${String.format("%.1f", entry.protein)}g C: ${String.format("%.1f", entry.carbs)}g F: ${String.format("%.1f", entry.fat)}g")
+                                                append("  •  P: ${String.format(localeForLanguage(userProfile.language), "%.1f", entry.protein)}g C: ${String.format(localeForLanguage(userProfile.language), "%.1f", entry.carbs)}g F: ${String.format(localeForLanguage(userProfile.language), "%.1f", entry.fat)}g")
                                             },
                                             color = Color(0xFF94A3B8),
                                             fontSize = 12.sp
@@ -6345,25 +6367,28 @@ fun DateSelectorBar(
     val context = LocalContext.current
     
     val dateDisplayLabel = remember(selectedDate, period, language) {
+        // QA 2026-10: month/weekday names must follow the APP language, not
+        // Locale.US — a pt-PT user saw "Hoje, Oct 20" (English month).
+        val locale = localeForLanguage(language)
         val todayLocal = LocalDate.now(java.time.ZoneId.systemDefault())
         when (period) {
             "Daily" -> {
                 if (selectedDate == todayLocal) {
-                    "${tr("Today", language)}, ${selectedDate.format(java.time.format.DateTimeFormatter.ofPattern("MMM d", java.util.Locale.US))}"
+                    "${tr("Today", language)}, ${selectedDate.format(java.time.format.DateTimeFormatter.ofPattern("d MMM", locale))}"
                 } else if (selectedDate == todayLocal.minusDays(1)) {
-                    "${tr("Yesterday", language)}, ${selectedDate.format(java.time.format.DateTimeFormatter.ofPattern("MMM d", java.util.Locale.US))}"
+                    "${tr("Yesterday", language)}, ${selectedDate.format(java.time.format.DateTimeFormatter.ofPattern("d MMM", locale))}"
                 } else {
-                    selectedDate.format(java.time.format.DateTimeFormatter.ofPattern("EEEE, MMM d, yyyy", java.util.Locale.US))
+                    selectedDate.format(java.time.format.DateTimeFormatter.ofPattern("EEEE, d MMM, yyyy", locale))
                 }
             }
             "Weekly" -> {
                 val monday = selectedDate.minusDays((selectedDate.dayOfWeek.value - 1).toLong())
                 val sunday = monday.plusDays(6)
-                val formatter = java.time.format.DateTimeFormatter.ofPattern("MMM d, yyyy", java.util.Locale.US)
+                val formatter = java.time.format.DateTimeFormatter.ofPattern("d MMM, yyyy", locale)
                 "${monday.format(formatter)} - ${sunday.format(formatter)}"
             }
             else -> {
-                val formatter = java.time.format.DateTimeFormatter.ofPattern("MMMM yyyy", java.util.Locale.US)
+                val formatter = java.time.format.DateTimeFormatter.ofPattern("MMMM yyyy", locale)
                 selectedDate.format(formatter)
             }
         }
@@ -7016,7 +7041,7 @@ private fun ActivitySummaryTableBody(
             ActivityTableRowItem(
                 name = tr("Total Distance", lang),
                 valStr = String.format(
-                    java.util.Locale("pt", "PT"),
+                    localeForLanguage(lang),
                     "%.2f km",
                     distanceMeters / 1000f
                 ),
@@ -7649,7 +7674,7 @@ fun BodyCompositionCard(
                 val bodyFatPct = latestBodyComp?.bodyFatPct
                 val muscleMassKg = latestBodyComp?.muscleMassKg
                 val totalBodyWaterKg = latestBodyComp?.totalBodyWaterKg
-                val ptLoc = java.util.Locale("pt", "PT")
+                val ptLoc = localeForLanguage(lang)
                 // Row order mirrors the Evolução chart: weight → lean → muscle
                 // → fat → water. Each row shows kg AND % (Hugo, 2026-08-19).
                 // Muscle/water are stored in kg (converted from the scale's %
@@ -9086,7 +9111,7 @@ fun ReportTab(
                         val hasTargets = aggregatedTargetsReport.days > 0
 
                         // Body-comp KPI rows — mirror BodyCompositionCard's table.
-                        val ptLocale = java.util.Locale("pt", "PT")
+                        val ptLocale = localeForLanguage(lang)
                         val bodyCompRows = buildList {
                             val bc = latestBodyComp
                             val weightKg = bc?.weightKg
@@ -9947,34 +9972,19 @@ fun MessageBubbleItem(
                     val imagePayload = message.imageBase64
                     if (!imagePayload.isNullOrBlank()) {
                         val parts = remember(imagePayload) { ChatImageStore.decode(imagePayload) }
-                        val bitmaps = remember(imagePayload) {
-                            parts.map { entry ->
-                                if (ChatImageStore.isPath(entry)) {
-                                    try {
-                                        val uri = android.net.Uri.parse(entry)
-                                        val rawPath = uri.path
-                                        if (rawPath != null) {
-                                            // Try the raw path first (file://
-                                            // URIs land here). Fall back to
-                                            // the filesDir-prefixed path for
-                                            // legacy `content://com.example
-                                            // .fileprovider/chat_images/...`
-                                            // rows whose `uri.path` is
-                                            // `/chat_images/...` only.
-                                            // Decoder is EXIF-aware: rotates
-                                            // landscape captures so they
-                                            // render the way the user shot
-                                            // them.
-                                            val direct = ChatImageStore.decodeBitmapWithOrientation(rawPath)
-                                            direct ?: ChatImageStore.decodeBitmapWithOrientation(
-                                                "/data/data/${com.example.BuildConfig.APPLICATION_ID}/files$rawPath"
-                                            )
-                                        } else null
-                                    } catch (e: Exception) { null }
-                                } else {
-                                    entry.toBitmap()
-                                }
-                            }
+                        // F3 (performance): bitmap decode moved OFF the main
+                        // thread — LaunchedEffect + Dispatchers.IO, same
+                        // pattern as FoodImagePreview. `remember` used to
+                        // decode synchronously during composition (30–150 ms
+                        // per photo, jank on every image message entering
+                        // the viewport).
+                        var bitmaps by remember(imagePayload) {
+                            mutableStateOf<List<Bitmap?>>(emptyList())
+                        }
+                        LaunchedEffect(imagePayload) {
+                            bitmaps = kotlinx.coroutines.withContext(
+                                kotlinx.coroutines.Dispatchers.IO
+                            ) { decodeChatImagePayloads(parts) }
                         }
                         if (bitmaps.size == 1) {
                             bitmaps.first()?.let { bmp ->
@@ -11558,6 +11568,39 @@ private fun launchCamera(
     launcher.launch(uri)
 }
 
+/**
+ * F3 (performance, 2026-10-22): decode the bitmaps for a chat message's
+ * image payload. Extracted from the bubble's `remember {}` block so the
+ * decode (30–150 ms per full photo on the S25) runs on Dispatchers.IO via
+ * LaunchedEffect instead of on the MAIN thread during composition — same
+ * pattern as FoodImagePreview below. Fail-soft: any entry that can't be
+ * decoded yields null (the bubble renders its placeholder, never crashes).
+ */
+internal fun decodeChatImagePayloads(parts: List<String>): List<Bitmap?> {
+    return parts.map { entry ->
+        if (ChatImageStore.isPath(entry)) {
+            try {
+                val uri = android.net.Uri.parse(entry)
+                val rawPath = uri.path
+                if (rawPath != null) {
+                    // Try the raw path first (file:// URIs land here). Fall
+                    // back to the filesDir-prefixed path for legacy
+                    // `content://com.example.fileprovider/chat_images/...`
+                    // rows whose `uri.path` is `/chat_images/...` only.
+                    // Decoder is EXIF-aware: rotates landscape captures so
+                    // they render the way the user shot them.
+                    val direct = ChatImageStore.decodeBitmapWithOrientation(rawPath)
+                    direct ?: ChatImageStore.decodeBitmapWithOrientation(
+                        "/data/data/${com.example.BuildConfig.APPLICATION_ID}/files$rawPath"
+                    )
+                } else null
+            } catch (e: Exception) { null }
+        } else {
+            entry.toBitmap()
+        }
+    }
+}
+
 fun String.toBitmap(): Bitmap? {
     return try {
         val bytes = Base64.decode(this, Base64.DEFAULT)
@@ -11648,14 +11691,14 @@ private fun FoodImagePreview(
         LaunchedEffect(imagePath) {
             val loaded = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 try {
+                    // F8: serve from the shared LRU cache when possible —
+                    // re-composition (scroll, tab switch, back/forward) no
+                    // longer re-decodes the file.
                     val uri = Uri.parse(imagePath)
-                    // Downsample to ~512 px max on the longer side. Full-resolution
-                    // camera photos (12–50 MP → 48–200 MB in ARGB_8888) blow the
-                    // ~268 MB Java heap on the Galaxy S25 when several previews
-                    // are simultaneously in the composition tree (Análise tab,
-                    // meal history, chat bubbles). Observed: 160 imagens em
-                    // files/food_images = 520 MB total → OOM em cadeia.
-                    decodeDownsampledBitmap(context, uri, maxDim = 512)
+                    foodImageBitmapCache.get(imagePath)
+                        ?: decodeDownsampledBitmap(context, uri, maxDim = 512)?.also {
+                            foodImageBitmapCache.put(imagePath, it)
+                        }
                 } catch (t: Throwable) {
                     null
                 }
@@ -12627,11 +12670,11 @@ fun ActivityPieChart(
  * - Se o nome estiver vazio (caso defensivo: o `UserProfile` já força "Humano"
  *   como default e o save dialog faz `.ifBlank { "Humano" }`), devolve só "Nutri".
  *
- * Exemplos: "Hugo Rodrigues" → "NutriHugo"; "joão" → "NutriJoão"; "" → "Nutri".
+ * Exemplos: qualquer nome → "NutriMadhvi" (QA 2026-10: marca unificada).
  */
 private fun nutriBrand(profileName: String): String {
-    val first = profileName.trim().split(Regex("\\s+")).firstOrNull().orEmpty()
-    if (first.isEmpty()) return "Nutri"
-    val capitalized = first.replaceFirstChar { it.uppercase() }
-    return "Nutri$capitalized"
+    // QA 2026-10 (brand unification): the wordmark is ALWAYS "NutriMadhvi".
+    // The old per-user "Nutri{FirstName}" (e.g. "NutriHumano") contradicted
+    // the launcher label and every other brand surface.
+    return "NutriMadhvi"
 }

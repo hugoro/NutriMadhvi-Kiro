@@ -18,6 +18,7 @@ import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withContext
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -116,6 +117,45 @@ class ChatViewModelCheckpointPersistenceTest {
         }
     }
 
+    /** v41 (review item 2): the COACH_TARGETS regeneration answers from a
+     *  gate (fresh targets speaking the NEW capture's conventions) while
+     *  the checkpoint enrichment hangs forever — so the test isolates the
+     *  repair path from the LLM enrichment path. */
+    private class TargetsRepo(db: ChatDatabase) : GeminiRepository(
+        chatDao = db.chatDao,
+        foodDao = db.foodDao,
+        activityDao = db.activityDao,
+        foodHabitDao = db.foodHabitDao,
+        targetSnapshotDao = db.targetSnapshotDao,
+        bmrSnapshotDao = db.bmrSnapshotDao,
+        bodyCompositionSnapshotDao = db.bodyCompositionSnapshotDao,
+        dailyActivitySnapshotDao = db.dailyActivitySnapshotDao,
+        userInsightDao = db.userInsightDao,
+        performanceSnapshotDao = db.performanceSnapshotDao,
+        performanceGoalDao = db.performanceGoalDao,
+        bodyPlanCheckpointDao = db.bodyPlanCheckpointDao,
+    ) {
+        val gate = CompletableDeferred<Unit>()
+        var targetsCallCount = 0
+
+        /** Fresh targets for the FRESH capture: waist 0.25 (pose
+         *  person-height unit), belly 0.20 — both inside the
+         *  physiological clamp range. */
+        val freshTargetsJson = """{"waist":0.25,"belly":0.20}"""
+
+        override suspend fun generateCoachReport(prompt: String): String? {
+            targetsCallCount++
+            withContext(Dispatchers.IO) { gate.await() }
+            return "Relatório atualizado.\n\n" +
+                "[COACH_TARGETS]" + freshTargetsJson + "[/COACH_TARGETS]"
+        }
+
+        override suspend fun generateBodyPlanContent(prompt: String, language: String): GeminiRepository.BodyPlanLlmResult {
+            withContext(Dispatchers.IO) { CompletableDeferred<Unit>().await() }
+            return GeminiRepository.BodyPlanLlmResult(null, null)
+        }
+    }
+
     @Before
     fun setUp() {
         // The ViewModel's viewModelScope dispatches to Main — drive it
@@ -203,6 +243,65 @@ class ChatViewModelCheckpointPersistenceTest {
         val snap = runBlocking { db.performanceSnapshotDao.getById(saved.snapshotId!!) }
         assertNotNull("snapshot must be persisted with the checkpoint", snap)
         assertEquals(0.24f, snap!!.frontalWaistRatio!!, 0.0001f)
+    }
+
+    // ── Item 5: legacy (pre-v39) snapshots backfill their checkpoint ────────
+    // Users whose data predates the checkpoint feature (v35-v38) have
+    // snapshots but NO checkpoints: Plano would sit in the "no checkpoint"
+    // empty state forever even though a goal and data points exist. The VM
+    // backfills the LATEST snapshot through the same local idempotent
+    // capture path — exactly one checkpoint, no network required.
+
+    @Test
+    fun `legacy snapshots without checkpoints backfill exactly one checkpoint for the newest on vm start`() {
+        // Two pre-checkpoint-era snapshots, no body_plan_checkpoints rows.
+        val (olderId, newestId) = runBlocking {
+            val olderId = db.performanceSnapshotDao.insert(
+                PerformanceSnapshotEntity(
+                    capturedAtMs = 1_650_000_000_000L,
+                    frontalWaistRatio = 0.30f,
+                    frontalHipRatio = 0.33f,
+                    lateralBellyRatio = 0.21f,
+                )
+            )
+            val newestId = db.performanceSnapshotDao.insert(
+                PerformanceSnapshotEntity(
+                    capturedAtMs = 1_750_000_000_000L,
+                    frontalWaistRatio = 0.26f,
+                    frontalHipRatio = 0.31f,
+                    lateralBellyRatio = 0.19f,
+                )
+            )
+            olderId to newestId
+        }
+        seedComposition(700L, 70f, 24f)
+        seedComposition(701L, 69.5f, 23f)
+
+        // Constructing the VM triggers the one-shot legacy backfill…
+        val vm = TestableChatViewModel(HangingRepo(db), SamsungHealthRepository(context))
+
+        // …exactly one checkpoint, anchored to the NEWEST snapshot only.
+        val cp = waitForCheckpoint()
+        assertNotNull(
+            "a legacy snapshot must backfill a checkpoint on VM start",
+            cp,
+        )
+        assertEquals(
+            "backfill must anchor the newest snapshot",
+            newestId,
+            cp!!.snapshotId,
+        )
+        val all = runBlocking { db.bodyPlanCheckpointDao.recent(50) }
+        assertEquals(
+            "older legacy snapshots must NOT be backfilled (one checkpoint)",
+            1,
+            all.size,
+        )
+        org.junit.Assert.assertNotEquals(
+            "the older snapshot must stay a legacy record, not a checkpoint",
+            olderId,
+            all.first().snapshotId,
+        )
     }
 
     // ── Item 4: retry is checkpoint-anchored, traceable, debounced ──────────
@@ -307,5 +406,91 @@ class ChatViewModelCheckpointPersistenceTest {
         }
         assertEquals("checkpoint_gone", error)
         assertEquals(0, repo.callCount)
+    }
+
+    // ── v41 item 2: convention change → regenerate + repair the checkpoint ─
+
+    @Test
+    fun `convention change regenerates compatible targets and repairs the checkpoint`() {
+        // 1) A goal whose targets were derived under the LEGACY
+        //    image-height convention (per side).
+        runBlocking {
+            db.performanceGoalDao.insert(
+                PerformanceGoalEntity(
+                    goalText = "reduzir cintura",
+                    coachTargetJson = """{"waist":0.23,"belly":0.20}""",
+                    targetsGeneratedAtMs = 1_700_000_000_000L,
+                    targetsConventionFrontal = "image_height",
+                    targetsConventionLateral = "image_height",
+                )
+            )
+        }
+        seedComposition(700L, 70f, 24f)
+        seedComposition(701L, 69.5f, 23f)
+
+        val repo = TargetsRepo(db)
+        val vm = TestableChatViewModel(repo, SamsungHealthRepository(context))
+
+        // 2) A FRESH capture speaking POSE person-height on the frontal
+        //    photo — the anchored targets are NOT same-unit for the frontal
+        //    waist, but ARE same-unit for the lateral belly. The checkpoint
+        //    flow reads the goal directly from the DB
+        //    (latestPerformanceGoalOnce), so no UI subscription is needed.
+        vm.savePerformanceSnapshotAndRequestReport(
+            PerformanceSnapshotEntity(
+                capturedAtMs = 1_800_000_000_000L,
+                frontalWaistRatio = 0.27f,
+                lateralBellyRatio = 0.24f,
+                frontalNormalization = "pose_person_height",
+                lateralNormalization = "image_height",
+            )
+        )
+        val cp = waitForCheckpoint()
+        assertNotNull("checkpoint must be created locally before the network", cp)
+        val cpId = cp!!.id
+
+        // 3) BEFORE the gate opens (targets still stale): the per-side gate
+        //    must have OMITTED the incompatible frontal waist — no
+        //    misleading priorities persisted — while the same-unit lateral
+        //    belly computed.
+        val before = runBlocking { db.bodyPlanCheckpointDao.getById(cp!!.id) }!!
+        assertTrue("same-unit belly priority must be present",
+            before.prioritiesJson!!.contains("\"zone\":\"belly\""))
+        assertFalse("incompatible-convention waist must NOT be persisted",
+            before.prioritiesJson!!.contains("\"zone\":\"waist\""))
+        assertNull("enrichment hangs — tactics must still be pending", before.tacticsJson)
+
+        // 4) Open the gate: regeneration succeeds with fresh targets that
+        //    speak the FRESH capture's conventions → the just-created
+        //    checkpoint's deterministic core is repaired IN PLACE.
+        repo.gate.complete(Unit)
+        val deadline = System.currentTimeMillis() + 10_000
+        var after: BodyPlanCheckpointEntity? = null
+        while (System.currentTimeMillis() < deadline) {
+            val g = runBlocking { db.performanceGoalDao.latest() }
+            if (g != null && g.targetsConventionFrontal == "pose_person_height") {
+                after = runBlocking { db.bodyPlanCheckpointDao.getById(cpId) }
+                if (after != null && after.prioritiesJson?.contains("\"zone\":\"waist\"") == true) break
+            }
+            Thread.sleep(20)
+        }
+        val finalGoal = runBlocking { db.performanceGoalDao.latest() }
+        assertNotNull("goal row must carry the regenerated conventions",
+            finalGoal?.targetsConventionFrontal?.let { it == "pose_person_height" })
+        assertEquals("regenerated targets speak the fresh capture per side",
+            "image_height", finalGoal?.targetsConventionLateral)
+        assertTrue("regenerated targets must be persisted",
+            finalGoal?.coachTargetJson?.contains("\"waist\":0.25") == true)
+
+        assertNotNull("the checkpoint must be repaired (not left stale)", after)
+        val repaired = after!!
+        assertTrue("repaired priorities must include the now-compatible waist",
+            repaired.prioritiesJson!!.contains("\"zone\":\"waist\""))
+        assertTrue("repaired priorities keep the belly",
+            repaired.prioritiesJson!!.contains("\"zone\":\"belly\""))
+        assertTrue("repaired checkpoint anchors the NEW targets",
+            repaired.goalTargetsJson?.contains("\"waist\":0.25") == true)
+        assertEquals("same checkpoint row — repaired in place", cpId, repaired.id)
+        assertNull("repair never touches the (still pending) LLM tactics", repaired.tacticsJson)
     }
 }

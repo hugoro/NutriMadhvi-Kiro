@@ -42,12 +42,27 @@ object BodyPlanPromptBuilder {
         previousRatios: String? = null,
         deltaSummary: String? = null,
     ): String {
+        // QA 2026-10 (second pass): the raw language code ("pt-PT", "en-US")
+        // in "Escreve em $lang" produced mixed-language reports — map to a
+        // human-readable target language like PerformanceCoachBuilder does.
+        val langName = when {
+            lang.isBlank() || lang.startsWith("pt", ignoreCase = true) -> "português (Portugal)"
+            lang.startsWith("en", ignoreCase = true) -> "English"
+            lang.startsWith("gu", ignoreCase = true) -> "Gujarati"
+            else -> lang
+        }
         val comp = latestComp?.let {
             "Peso ${it.weightKg} kg" +
                 it.bodyFatPct?.let { f -> ", gordura ${f}% " } +
                 it.muscleMassKg?.let { m -> ", massa muscular ${m} kg" } +
-                "."
+                ". "
         } ?: "Sem dados de composição corporal (balança) — usa faixas conservadoras."
+
+        // v43 (2026-10): the demo list is generated FROM the local curated
+        // catalog so the prompt and the validator allowlist can never drift.
+        val demoList = TrainingDemoCatalog.ALL.joinToString(", ") { d ->
+            "${d.id} (${d.kind.name.lowercase()})"
+        }
 
         val prioText = priorities.takeIf { it.isNotEmpty() }?.joinToString("; ") { p ->
             val dir = when (p.direction) {
@@ -67,7 +82,9 @@ object BodyPlanPromptBuilder {
         }
 
         return """
-            Tu és um coach de composição corporal conservador. Escreve em $lang.
+            Tu és um coach de composição corporal conservador.
+            Escreve o relatório e as táticas em $langName.
+            (Write the report text and every tactic "text"/"target" field in $langName.)
 
             Utilizador: $name
             Fase atual (calculada localmente, não a alteres): ${phase?.name ?: "desconhecida"}
@@ -88,14 +105,31 @@ object BodyPlanPromptBuilder {
             - "category" deve ser um de: protein, strength, steps, sleep, calories, zone
             - "text": 1 frase imperativa, concreta e acionável (máx. 140 caracteres)
             - "target": o número/valores de referência (ex. "120 g/dia", "2–3 sessões/semana")
+            - NÚMEROS com unidade reconhecível, sempre colada ao número:
+              "g/kg", "g/dia" ou "g por dia", "kcal", "%", "horas" (ex. "7–8 horas
+              por noite"), "minutos", "passos"/"steps", "sessões/semana",
+              "vezes por semana", "km", "dias", "semanas", "séries x repetições",
+              "RPE", "% do 1RM". Intervalos são aceites (ex. "7–8 horas",
+              "2-3 sessões"). NUNCA um número solto sem unidade.
             - "windowDays": inteiro 7–120
+            - Táticas de força: 2–3 exemplos concretos de exercícios de corpo
+              inteiro (ex. agachamento, prancha, remada), séries × repetições
+              e a regra de progressão em números (ex. "+1 série ou +1
+              repetição a cada 2 semanas") — nunca só "progressão gradual".
             - Táticas de zona: uma por prioridade, com direção REDUZIR/AUMENTAR e
               OBRIGATORIAMENTE o campo "zone" com a chave da zona
               (shoulder, waist, hip, thigh, chest, belly, lateralThigh)
             - NUNCA recomendar reduzir uma zona muscular (ombro, peito, quadril, coxa)
             - Faixas conservadoras; isto NÃO é um aconselhamento médico
-            - Sem links, sem vídeos, sem listas de exercícios específicas de YouTube
-            - Texto simples, sem markdown, sem blocos além de [TACTICS]
+            - "demoId" (INCLUI em 2 táticas compatíveis sempre que possível,
+              no máximo 2): demonstração de um catálogo LOCAL curado.
+              Escolhe APENAS um destes IDs, COMPATÍVEL com a tática: $demoList.
+              Força de pernas/glúteos → squat_bodyweight; passos/atividade →
+              brisk_walk; recuperação/sono → hip_flexor_stretch.
+              NUNCA inventes exercícios, URLs ou cargas — qualquer outro ID,
+              qualquer URL no texto, ou uma demonstração incompatível com a
+              tática, é rejeitado pelas regras de segurança.
+            - Texto simples, sem markdown, sem links, sem blocos além de [TACTICS]
         """.trimIndent()
     }
 

@@ -479,12 +479,28 @@ open class GeminiRepository(
         performanceGoalDao?.observeLatest()
             ?: kotlinx.coroutines.flow.flowOf(null)
 
+    /** v41: one-shot (non-flow) read of the latest goal row — used by the
+     *  repair path immediately after a target regeneration, when the
+     *  StateFlow backing the UI may not have processed the invalidation
+     *  yet (a deterministic read avoids racing the flow). */
+    suspend fun latestPerformanceGoalOnce(): com.example.data.local.PerformanceGoalEntity? =
+        performanceGoalDao?.latest()
+
     suspend fun insertPerformanceGoal(
         goal: com.example.data.local.PerformanceGoalEntity
     ): Long = performanceGoalDao?.insert(goal) ?: -1L
 
-    suspend fun updatePerformanceGoalTargets(id: Long, json: String, ts: Long) {
-        performanceGoalDao?.updateCoachTargets(id, json, ts)
+    /** v41: persists the targets AND the per-side normalization conventions
+     *  they were derived under, so a later checkpoint can tell whether its
+     *  own capture speaks the same measurement unit as the targets. */
+    suspend fun updatePerformanceGoalTargets(
+        id: Long,
+        json: String,
+        ts: Long,
+        convFrontal: String?,
+        convLateral: String?,
+    ) {
+        performanceGoalDao?.updateCoachTargets(id, json, ts, convFrontal, convLateral)
     }
 
     /** Calls Gemini (text-only, ~180-word output) to produce the silhouette coach report.
@@ -548,6 +564,20 @@ open class GeminiRepository(
 
     suspend fun updateBodyPlanCheckpointTactics(id: Long, json: String, source: String) {
         bodyPlanCheckpointDao?.updateTactics(id, json, source)
+    }
+
+    /** v41 repair path: after a convention-compatible target regeneration,
+     *  recompute the checkpoint's deterministic core and overwrite ONLY
+     *  that (LLM enrichment fields untouched — never lost on repair). */
+    suspend fun updateBodyPlanCheckpointDeterministic(
+        id: Long,
+        phase: String?,
+        prioritiesJson: String?,
+        deltaSummary: String?,
+        goalText: String?,
+        goalTargetsJson: String?,
+    ) {
+        bodyPlanCheckpointDao?.updateDeterministic(id, phase, prioritiesJson, deltaSummary, goalText, goalTargetsJson)
     }
 
     suspend fun updateBodyPlanCheckpointReport(id: Long, report: String, ts: Long) {

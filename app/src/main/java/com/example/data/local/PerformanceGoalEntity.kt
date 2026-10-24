@@ -21,4 +21,11 @@ data class PerformanceGoalEntity(
     val goalText: String,
     val coachTargetJson: String? = null,
     val targetsGeneratedAtMs: Long? = null,
+    /** v41: the normalization convention the FRONTAL-side targets were
+     *  derived under (e.g. "image_height" or "pose_person_height"). NULL =
+     *  derived before conventions were tracked = UNKNOWN → the targets are
+     *  never compared against a new capture until re-derived (fail-closed). */
+    val targetsConventionFrontal: String? = null,
+    /** v41: same metadata for the LATERAL-side targets. */
+    val targetsConventionLateral: String? = null,
 )

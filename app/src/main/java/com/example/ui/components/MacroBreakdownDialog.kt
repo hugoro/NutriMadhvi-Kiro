@@ -187,14 +187,16 @@ fun MacroBreakdownDialog(
                                 actualSecondary = totalFreeSugars.coerceAtMost(totalCarbs),
                                 target = target,
                                 colorPrimary = Color(0xFF8B5CF6),
-                                colorSecondary = Color(0xFFC4B5FD)
+                                colorSecondary = Color(0xFFC4B5FD),
+                                language = language
                             )
                         } else {
                             com.example.ui.MacroProgressIndicator(
                                 name = tr("Carbohydrates", language),
                                 actual = totalCarbs,
                                 target = target,
-                                color = Color(0xFF8B5CF6)
+                                color = Color(0xFF8B5CF6),
+                                language = language
                             )
                         }
                     }
@@ -202,7 +204,8 @@ fun MacroBreakdownDialog(
                         name = tr("Protein", language),
                         actual = totalProtein,
                         target = target,
-                        color = Color(0xFFF97316)
+                        color = Color(0xFFF97316),
+                        language = language
                     )
                     MacroKind.FAT -> {
                         if (hasAnySatFatData) {
@@ -212,14 +215,16 @@ fun MacroBreakdownDialog(
                                 actualSecondary = totalSatFat.coerceAtMost(totalFat),
                                 target = target,
                                 colorPrimary = Color(0xFFEAB308),
-                                colorSecondary = Color(0xFFFDE68A)
+                                colorSecondary = Color(0xFFFDE68A),
+                                language = language
                             )
                         } else {
                             com.example.ui.MacroProgressIndicator(
                                 name = tr("Fat", language),
                                 actual = totalFat,
                                 target = target,
-                                color = Color(0xFFEAB308)
+                                color = Color(0xFFEAB308),
+                                language = language
                             )
                         }
                     }

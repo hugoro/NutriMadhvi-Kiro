@@ -235,7 +235,7 @@ open class ChatViewModel(
             val checkpointId = createBodyPlanCheckpointLocal(saved)
             // 2) Legacy coach report — independent network job, isolated failure.
             viewModelScope.launch {
-                runCatching { generateCoachReport(saved) }
+                runCatching { runCoachReportJob(saved) }
                     .onFailure { android.util.Log.w("SHD", "[coach-report] generation failed", it) }
             }
             // 3) Checkpoint LLM enrichment — independent network job,
@@ -256,7 +256,7 @@ open class ChatViewModel(
 
     /** Triggers async coach report generation for an already-saved snapshot. */
     fun requestCoachReport(entity: com.example.data.local.PerformanceSnapshotEntity) {
-        viewModelScope.launch { generateCoachReport(entity) }
+        viewModelScope.launch { runCoachReportJob(entity) }
     }
 
     /** Saves the user's free-text performance goal and derives ratio targets via LLM.
@@ -265,18 +265,31 @@ open class ChatViewModel(
      *  a duplicate row. */
     fun savePerformanceGoal(text: String) {
         viewModelScope.launch {
-            val latest = latestPerformanceGoal.value
+            // Trusted-source read: the idempotency check must not depend on
+            // an active UI subscriber — the StateFlow is a UI projection
+            // (WhileSubscribed) that is empty right after a process restart.
+            val latest = repository.latestPerformanceGoalOnce()
             if (latest != null && latest.goalText == text && latest.coachTargetJson == null) {
-                generateCoachTargets(latest)   // retry on the existing row
+                if (!generateCoachTargets(latest)) {   // retry on the existing row
+                    android.util.Log.w("SHD", "[coach-targets] retry failed goal=${latest.id} — user can re-save the goal")
+                }
                 return@launch
             }
             val entity = com.example.data.local.PerformanceGoalEntity(goalText = text)
             val id = repository.insertPerformanceGoal(entity)
-            if (id > 0) generateCoachTargets(entity.copy(id = id))
+            if (id > 0 && !generateCoachTargets(entity.copy(id = id))) {
+                android.util.Log.w("SHD", "[coach-targets] initial generation failed goal=$id — user can re-save the goal")
+            }
         }
     }
 
-    private suspend fun generateCoachTargets(goal: com.example.data.local.PerformanceGoalEntity) {
+    /** Derives ratio targets for [goal] via LLM and persists them TOGETHER
+     *  with the normalization conventions they were derived under (v41:
+     *  taken from the LATEST capture, which is what the targets describe).
+     *  Returns true when targets were persisted, false on any LLM failure —
+     *  the caller decides what to surface (visible state for the goal, or a
+     *  log for the async repair path). */
+    private suspend fun generateCoachTargets(goal: com.example.data.local.PerformanceGoalEntity): Boolean {
         val gender = _userProfile.value.gender.ifBlank { "Male" }
         val lang = _userProfile.value.language.ifBlank { "pt-PT" }
         val snapshot = repository.recentPerformanceSnapshots(1).firstOrNull()
@@ -286,18 +299,30 @@ open class ChatViewModel(
         val raw = repository.generateCoachReport(prompt)
         if (raw == null) {
             android.util.Log.w("SHD", "[coach-targets] LLM returned null (key/network) goal=${goal.id}")
-            return
+            return false
         }
         val json = extractCoachTargetsJson(raw)
         if (json == null) {
             android.util.Log.w("SHD", "[coach-targets] no [COACH_TARGETS] block in response goal=${goal.id}")
-            return
+            return false
         }
         // Clamp every target into the physiological reference range so a stray or
         // echoed-noise value from the LLM can never drive the silhouette.
         val clamped = com.example.data.chat.PerformanceCoachBuilder.clampTargetsJson(json)
-        repository.updatePerformanceGoalTargets(goal.id, clamped, System.currentTimeMillis())
-        android.util.Log.i("SHD", "[coach-targets] persisted goal=${goal.id} raw=$json clamped=$clamped")
+        // v41: the targets are derived FROM this snapshot's ratios, so they
+        // speak THIS capture's normalization convention — persist that
+        // metadata per side so a later checkpoint can decide whether its own
+        // capture is comparable to these targets (same unit or not).
+        val convFrontal = com.example.data.performance.BodyPlanEngine.snapshotConvention(
+            snapshot?.frontalNormalization)
+        val convLateral = com.example.data.performance.BodyPlanEngine.snapshotConvention(
+            snapshot?.lateralNormalization)
+        repository.updatePerformanceGoalTargets(goal.id, clamped, System.currentTimeMillis(), convFrontal, convLateral)
+        android.util.Log.i(
+            "SHD", "[coach-targets] persisted goal=${goal.id} raw=$json clamped=$clamped " +
+                "convF=$convFrontal convL=$convLateral"
+        )
+        return true
     }
 
     private suspend fun generateCoachReport(entity: com.example.data.local.PerformanceSnapshotEntity) {
@@ -305,15 +330,31 @@ open class ChatViewModel(
         val bodyComp = repository.recentBodyCompositionSnapshots(10)
         val name = _userProfile.value.name.ifBlank { "Utilizador" }
         val lang = _userProfile.value.language.ifBlank { "pt-PT" }
-        val goal = latestPerformanceGoal.value
+        // Trusted-source read (not the UI StateFlow — this flow runs even
+        // when no composable is subscribed, e.g. right after a process
+        // restart; a null goal here would silently skip COACH_TARGETS).
+        val goal = repository.latestPerformanceGoalOnce()
         val prompt = com.example.data.chat.PerformanceCoachBuilder.buildPrompt(
             entity, bodyComp, name, lang, goal)
         val report = repository.generateCoachReport(prompt) ?: return
-        // If the report contains [COACH_TARGETS], extract, clamp and persist them too
+        // If the report contains [COACH_TARGETS], extract, clamp and persist them too.
+        // v41: the block describes THIS capture, so the target conventions
+        // persist with THIS capture's normalization metadata — and if a
+        // convention change just made the latest checkpoint's persisted
+        // targets incompatible, regenerate compatible targets now and
+        // deterministically REPAIR that checkpoint (v41: the repair is no
+        // longer left to "the next capture").
         val json = extractCoachTargetsJson(report)
         if (json != null && goal != null) {
             val clamped = com.example.data.chat.PerformanceCoachBuilder.clampTargetsJson(json)
-            repository.updatePerformanceGoalTargets(goal.id, clamped, System.currentTimeMillis())
+            val convFrontal = com.example.data.performance.BodyPlanEngine.snapshotConvention(entity.frontalNormalization)
+            val convLateral = com.example.data.performance.BodyPlanEngine.snapshotConvention(entity.lateralNormalization)
+            repository.updatePerformanceGoalTargets(goal.id, clamped, System.currentTimeMillis(), convFrontal, convLateral)
+            // Repair the just-created checkpoint if its anchored targets
+            // speak a different normalization convention than this capture
+            // (convention changed between the checkpoint's snapshot and the
+            // goal's targets).
+            repairCheckpointAfterTargetRegeneration(entity)
         }
         // Strip the block from the visible report before saving
         val cleanReport = stripCoachTargetsBlock(report)
@@ -348,6 +389,39 @@ open class ChatViewModel(
     private val _enrichingCheckpointIds = MutableStateFlow<Set<Long>>(emptySet())
     private val _checkpointEnrichmentErrors = MutableStateFlow<Map<Long, String>>(emptyMap())
 
+    // QA 2026-10: the legacy coach-report generation is tracked the same way
+    // as checkpoint enrichment so the report card can show an explicit
+    // pending state instead of a spinner that also says "retry".
+    private val _coachReportGeneratingIds = MutableStateFlow<Set<Long>>(emptySet())
+
+    /** Snapshot ids whose coach-report generation is currently in flight. */
+    val coachReportGeneratingIds: StateFlow<Set<Long>> =
+        _coachReportGeneratingIds.asStateFlow()
+
+    private fun acquireReportSlot(snapshotId: Long): Boolean {
+        var acquired = false
+        _coachReportGeneratingIds.update { cur ->
+            if (snapshotId in cur) cur else { acquired = true; cur + snapshotId }
+        }
+        return acquired
+    }
+
+    private fun releaseReportSlot(snapshotId: Long) {
+        _coachReportGeneratingIds.update { it - snapshotId }
+    }
+
+    /** Runs [generateCoachReport] under the in-flight slot (debounced: a
+     *  retry tap while a generation is running cannot race the same row). */
+    private suspend fun runCoachReportJob(entity: com.example.data.local.PerformanceSnapshotEntity) {
+        if (entity.id <= 0L) return
+        if (!acquireReportSlot(entity.id)) return
+        try {
+            generateCoachReport(entity)
+        } finally {
+            releaseReportSlot(entity.id)
+        }
+    }
+
     /** Checkpoint ids whose LLM enrichment is currently in flight. A retry
      *  for an id already in flight is ignored (debounce) so repeated taps
      *  cannot race the same row's writes (v40). */
@@ -381,6 +455,33 @@ open class ChatViewModel(
         _checkpointEnrichmentErrors.update { it - checkpointId }
     }
 
+    /** QA 2026-10 (third round): legacy checkpoint backfill. Snapshots
+     *  captured before the checkpoint feature existed (v35-v38) have no
+     *  body_plan_checkpoints row — Plano would sit in the "no checkpoint"
+     *  empty state forever even when the user already has a goal AND data
+     *  points. Backfill the LATEST snapshot through the same local
+     *  idempotent path used at capture time (deterministic engine first,
+     *  one checkpoint per snapshot via the unique index, LLM enrichment
+     *  only if a slot frees). One-shot per process. Side effect: also
+     *  heals the documented snapshot-without-checkpoint gap left by a
+     *  process death between the two writes, on the next launch. */
+    private var legacyCheckpointBackfillStarted = false
+
+    fun backfillLegacyCheckpointIfNeeded() {
+        if (legacyCheckpointBackfillStarted) return
+        legacyCheckpointBackfillStarted = true
+        viewModelScope.launch {
+            if (repository.latestBodyPlanCheckpoint() != null) return@launch
+            val snapshot = repository.recentPerformanceSnapshots(1).firstOrNull()
+                ?: return@launch
+            android.util.Log.i(
+                "SHD", "[body-plan] backfill: snapshot#${snapshot.id} has no " +
+                    "checkpoint (pre-v39 legacy) — creating"
+            )
+            createBodyPlanCheckpoint(snapshot)
+        }
+    }
+
     /** Creates a checkpoint for a just-saved silhouette snapshot.
      *  Deterministic part is local-only + persisted first; LLM enrichment
      *  is async and independently retryable via [requestCheckpointEnrichment]. */
@@ -403,11 +504,32 @@ open class ChatViewModel(
      *  Runs the deterministic engine + the transactional insert and returns
      *  the persisted checkpoint id — or null when the insert failed. NO
      *  network work here: the caller decides afterwards which independent
-     *  jobs to launch (coach report, LLM enrichment). */
+     *  jobs to launch (coach report, LLM enrichment).
+     *
+     *  v41: priorities only cite targets that speak the SAME normalization
+     *  convention as this capture (per side); if the anchored goal's
+     *  targets are incompatible (or their convention is unknown — pre-v41
+     *  rows), compatible targets are regenerated and the JUST-CREATED
+     *  checkpoint's deterministic core is repaired in place.
+     *
+     *  Known residual gap (documented, not fixable without duplicating the
+     *  engine in the DB layer): the snapshot insert and the checkpoint
+     *  insert are two separate atomic Room writes, not one transaction —
+     *  the checkpoint is derived from snapshot + composition history +
+     *  latest goal by the pure-JVM BodyPlanEngine at the ViewModel layer,
+     *  and folding that derivation into a @Transaction DAO would duplicate
+     *  the engine and break pure-JVM testability. A process death BETWEEN
+     *  the two writes leaves a snapshot without a checkpoint — recoverable
+     *  by the next capture's prevSnapshot math and by the user re-running
+     *  the assessment; there is no orphan row and no data corruption. */
     private suspend fun createBodyPlanCheckpointLocal(
         snapshot: com.example.data.local.PerformanceSnapshotEntity,
     ): Long? {
-        val goal = latestPerformanceGoal.value
+        // Trusted-source read: the persisted checkpoint must anchor the goal
+        // even when no UI subscriber has collected the StateFlow yet (the
+        // WhileSubscribed projection is empty right after a process
+        // restart) — otherwise targets/conventions would silently drop.
+        val goal = repository.latestPerformanceGoalOnce()
         // recent() is newest-first — reverse to oldest→newest for trend math.
         val bodyComp = repository.recentBodyCompositionSnapshots(10).reversed()
         val prev = repository.latestBodyPlanCheckpoint()
@@ -420,8 +542,14 @@ open class ChatViewModel(
         val targets = goal?.coachTargetJson?.let {
             com.example.data.performance.BodyPlanEngine.targetsFromJson(it)
         } ?: emptyMap()
+        // v41: conventions come from the GOAL (per side). A goal row without
+        // target convention metadata (pre-v41) is UNKNOWN → targets are
+        // never compared (fail-closed); the repair path below regenerates
+        // compatible targets and fixes this checkpoint.
+        val tConvF = goal?.targetsConventionFrontal
+        val tConvL = goal?.targetsConventionLateral
         val priorities = com.example.data.performance.BodyPlanEngine.rankPriorities(
-            snapshot, targets, hasComp
+            snapshot, targets, hasComp, tConvF, tConvL
         )
         val deltas = com.example.data.performance.BodyPlanEngine.deltasBetween(
             snapshot, prevSnapshot,
@@ -450,21 +578,87 @@ open class ChatViewModel(
             "SHD", "[body-plan] checkpoint#$id phase=$phase priorities=${priorities.size} " +
                 "prev=${prev?.id ?: "none"} delta=\"$deltaSummary\""
         )
-        // The goal's ratio targets were derived from the PREVIOUS capture's
-        // ratios. If the normalization convention changed between captures
-        // (e.g. this time the camera got a full-body pose), the old targets
-        // are not same-unit data — re-derive them (v40).
-        if (goal != null && goal.coachTargetJson != null && prevSnapshot != null) {
-            val prevConv = prevSnapshot.frontalNormalization to prevSnapshot.lateralNormalization
-            val newConv = snapshot.frontalNormalization to snapshot.lateralNormalization
-            if (prevConv != newConv) {
+        // v41: if the anchored goal's targets are not same-unit with THIS
+        // capture (convention changed between the capture the targets were
+        // derived from and this one — or the goal predates convention
+        // metadata), regenerate compatible targets NOW and repair the
+        // just-created checkpoint's deterministic core in place.
+        if (goal != null && goal.coachTargetJson != null) {
+            val engine = com.example.data.performance.BodyPlanEngine
+            if (!engine.allTargetsCompatible(snapshot, targets, tConvF, tConvL)) {
                 android.util.Log.i(
-                    "SHD", "[body-plan] normalization convention changed $prevConv → $newConv — regenerating goal targets"
+                    "SHD", "[body-plan] targets incompatible with snapshot " +
+                        "convF=${snapshot.frontalNormalization} convL=${snapshot.lateralNormalization} " +
+                        "(goal convF=$tConvF convL=$tConvL) — regenerating + repairing checkpoint#$id"
                 )
-                viewModelScope.launch { generateCoachTargets(goal) }
+                if (generateCoachTargets(goal)) {
+                    repairCheckpointAfterTargetRegeneration(snapshot, id)
+                }
             }
         }
         return id
+    }
+
+    /** v41 repair: after a convention-compatible target regeneration,
+     *  recompute the latest checkpoint's deterministic core from the
+     *  FRESH goal targets and overwrite ONLY that (LLM enrichment fields —
+     *  tactics/report — are untouched, so a successful LLM pass is never
+     *  lost by a repair). [checkpointId] null = the latest checkpoint. */
+    private suspend fun repairCheckpointAfterTargetRegeneration(
+        snapshot: com.example.data.local.PerformanceSnapshotEntity,
+        checkpointId: Long? = null,
+    ) {
+        // Deterministic read of the just-persisted goal row (targets +
+        // conventions) — the UI StateFlow may lag behind the invalidation,
+        // and a stale row would silently re-omit compatible zones.
+        val goal = repository.latestPerformanceGoalOnce() ?: return
+        val targets = goal.coachTargetJson?.let {
+            com.example.data.performance.BodyPlanEngine.targetsFromJson(it)
+        } ?: return
+        // The regenerated targets were derived FROM this snapshot, so their
+        // per-side convention is this snapshot's own markers (a NULL marker
+        // is the legacy image-height convention by definition).
+        val convF = com.example.data.performance.BodyPlanEngine.snapshotConvention(snapshot.frontalNormalization)
+        val convL = com.example.data.performance.BodyPlanEngine.snapshotConvention(snapshot.lateralNormalization)
+        val freshPriorities = com.example.data.performance.BodyPlanEngine.rankPriorities(
+            snapshot, targets,
+            repository.recentBodyCompositionSnapshots(10).any { it.bodyFatPct != null || it.muscleMassKg != null },
+            convF,
+            convL,
+        )
+        val prev = checkpointId?.let { repository.bodyPlanCheckpointById(it) }
+            ?: repository.latestBodyPlanCheckpoint()
+        val targetId = prev?.id ?: return
+        if (prev?.snapshotId != snapshot.id) {
+            // Not the checkpoint for this capture — nothing to repair
+            // (the next checkpoint creation will use the fresh targets).
+            android.util.Log.w(
+                "SHD", "[body-plan] repair skipped: checkpoint#$targetId is for " +
+                    "snapshot=${prev?.snapshotId} != ${snapshot.id}"
+            )
+            return
+        }
+        val prevSnapshot = prev.snapshotId?.let { sid ->
+            sid.takeIf { it != snapshot.id }?.let { repository.performanceSnapshotById(it) }
+        }
+        val bodyComp = repository.recentBodyCompositionSnapshots(10).reversed()
+        val deltas = com.example.data.performance.BodyPlanEngine.deltasBetween(
+            snapshot, prevSnapshot,
+            bodyComp.lastOrNull(),
+            bodyComp.dropLast(1).lastOrNull(),
+        )
+        repository.updateBodyPlanCheckpointDeterministic(
+            targetId,
+            com.example.data.performance.BodyPlanEngine.classifyPhase(bodyComp, goal.goalText)?.name,
+            prioritiesToJson(freshPriorities),
+            formatDeltaSummary(deltas),
+            goal.goalText,
+            goal.coachTargetJson,
+        )
+        android.util.Log.i(
+            "SHD", "[body-plan] checkpoint#$targetId repaired after convention-compatible " +
+                "target regeneration (priorities=${freshPriorities.size})"
+        )
     }
 
     /** Explicit retry for the LLM enrichment of an existing checkpoint
@@ -542,7 +736,7 @@ open class ChatViewModel(
             // shows "Gerar novamente" instead of a silent state).
             repository.updateBodyPlanCheckpointTactics(
                 checkpointId,
-                fallbackTacticsJson(phase, priorities, anchoredComp?.weightKg, lang),
+                withDeterministicDemos(fallbackTacticsJson(phase, priorities, anchoredComp?.weightKg, lang)),
                 "deterministic_fallback",
             )
             setCheckpointError(checkpointId, "llm_failed")
@@ -552,11 +746,12 @@ open class ChatViewModel(
         val raw = result.text
         val tacticsJson = extractTacticsJson(raw)
         val reportText = stripTacticsBlock(raw).trim()
-        // SEMANTIC safety validation (v40): the LLM tactics must agree with
-        // the persisted, safety-gated priorities and tissue classification.
-        // Any violation (unknown zone, conflicting direction, reduce-advice
-        // for a muscle-dominant zone, out-of-bounds calorie/protein numbers)
-        // rejects the whole block → deterministic fallback.
+        // SEMANTIC safety validation (v40; v42 per-tactic granularity):
+        // each LLM tactic is checked against the persisted, safety-gated
+        // priorities, the tissue classification and explicit conservative
+        // numeric bounds. SAFE tactics survive; ONLY the rejected categories
+        // are swapped for the deterministic equivalent (never the whole
+        // block, never unsafe text). Nothing safe → full fallback + error.
         val candidates = tacticsJson?.let { parseTacticCandidates(it) }
         val hasAnchoredComp = anchoredComp?.let {
             it.bodyFatPct != null || it.muscleMassKg != null
@@ -564,28 +759,125 @@ open class ChatViewModel(
         val verdict = com.example.data.performance.TacticSafetyValidator.validate(
             candidates, priorities, anchoredComp?.weightKg, hasAnchoredComp
         )
-        if (candidates != null && verdict.safeJson != null) {
-            repository.updateBodyPlanCheckpointTactics(checkpointId, verdict.safeJson, "llm:${result.modelUsed}")
-            clearCheckpointError(checkpointId)
-        } else {
-            repository.updateBodyPlanCheckpointTactics(
-                checkpointId,
-                fallbackTacticsJson(phase, priorities, anchoredComp?.weightKg, lang),
-                "deterministic_fallback",
-            )
-            setCheckpointError(checkpointId, if (candidates == null) "llm_failed" else "tactics_rejected")
-            android.util.Log.w(
-                "SHD", "[body-plan] checkpoint#$checkpointId tactics rejected " +
-                    "(${verdict.reasons.joinToString("; ")}) → deterministic fallback"
-            )
+        val weightKg = anchoredComp?.weightKg
+        val safeJson = verdict.safeJson
+        when {
+            verdict.blocked || safeJson == null -> {
+                // Nothing usable: full deterministic fallback + VISIBLE error.
+                repository.updateBodyPlanCheckpointTactics(
+                    checkpointId,
+                    withDeterministicDemos(fallbackTacticsJson(phase, priorities, weightKg, lang)),
+                    "deterministic_fallback",
+                )
+                setCheckpointError(checkpointId, if (candidates == null) "llm_failed" else "tactics_rejected")
+                android.util.Log.w(
+                    "SHD", "[body-plan] checkpoint#$checkpointId tactics fully rejected " +
+                        "(${verdict.reasons.joinToString("; ")}) → deterministic fallback"
+                )
+            }
+            verdict.rejected.isEmpty() -> {
+                // Fully safe LLM plan — persist as-is (v43.10: + the
+                // deterministic demoId backfill for tactics the model did
+                // not tag — additive, fail closed).
+                repository.updateBodyPlanCheckpointTactics(
+                    checkpointId, withDeterministicDemos(safeJson), "llm:${result.modelUsed}"
+                )
+                clearCheckpointError(checkpointId)
+            }
+            else -> {
+                // v42: partially safe — keep the safe LLM tactics, replace
+                // ONLY the rejected categories with the deterministic
+                // equivalent. The resulting plan is complete and safe → no
+                // error, no retry; the UI shows an informational note.
+                val merged = mergeTacticsWithFallback(
+                    verdict, phase, priorities, weightKg, lang
+                )
+                repository.updateBodyPlanCheckpointTactics(
+                    checkpointId, withDeterministicDemos(merged), "mixed:llm:${result.modelUsed}"
+                )
+                clearCheckpointError(checkpointId)
+                android.util.Log.i(
+                    "SHD", "[body-plan] checkpoint#$checkpointId tactics adjusted " +
+                        "(kept ${verdict.safe.size}, replaced ${verdict.rejected.size}: " +
+                        verdict.rejected.joinToString { r ->
+                            r.tactic.category + ": " + r.reasons.first()
+                        } + ")"
+                )
+            }
         }
         if (reportText.isNotBlank()) {
             repository.updateBodyPlanCheckpointReport(checkpointId, reportText, System.currentTimeMillis())
         }
         android.util.Log.i(
             "SHD", "[body-plan] checkpoint#$checkpointId enriched " +
-                "(tactics=${if (candidates != null && verdict.safeJson != null) "llm:${result.modelUsed}" else "fallback"}, report=${reportText.isNotEmpty()})"
+                "(tactics=${when {
+                    verdict.blocked || safeJson == null -> "fallback"
+                    verdict.rejected.isEmpty() -> "llm:${result.modelUsed}"
+                    else -> "mixed:llm:${result.modelUsed}"
+                }}, report=${reportText.isNotEmpty()})"
         )
+    }
+
+    /** v42 granularity: merges the SAFE LLM tactics with the deterministic
+     *  equivalents of the rejected categories (deduped by category, capped
+     *  at TACTICS_MAX). Each tactic carries its own "source" ("llm" /
+     *  "fallback") for audit — the single tacticSource column cannot express
+     *  a per-item origin, so the per-tactic field lives inside the tactics
+     *  JSON (existing parsers ignore unknown fields — no schema change). */
+    private fun mergeTacticsWithFallback(
+        verdict: com.example.data.performance.TacticSafetyValidator.Verdict,
+        phase: com.example.data.performance.BodyPlanEngine.BodyPhase?,
+        priorities: List<com.example.data.performance.BodyPlanEngine.ZonePriority>,
+        weightKg: Float?,
+        lang: String,
+    ): String {
+        val merged = mutableListOf<
+            Pair<String, com.example.data.performance.TacticSafetyValidator.TacticCandidate>>()
+        val seen = mutableSetOf<String>()
+        for (t in verdict.safe) {
+            val cat = t.category.lowercase().trim()
+            if (cat in seen) continue
+            seen += cat
+            merged += "llm" to t
+        }
+        val defaults = com.example.data.performance.BodyPlanEngine.defaultTactics(
+            phase, priorities, weightKg
+        )
+        for (r in verdict.rejected) {
+            if (merged.size >= com.example.data.performance.TacticSafetyValidator.TACTICS_MAX) break
+            val cat = r.tactic.category.lowercase().trim()
+            if (cat in seen) continue
+            val fb = defaults.firstOrNull { it.category == cat } ?: continue
+            var text = tr(fb.i18nKey, lang)
+            for ((k, v) in fb.i18nArgs) text = text.replace("{${k}}", v)
+            if (text.isBlank()) text = fb.i18nKey
+            seen += cat
+            merged += "fallback" to com.example.data.performance.TacticSafetyValidator.TacticCandidate(
+                fb.category, text, null, fb.windowDays, null,
+                // v43.6: keep the deterministic visual example in mixed plans
+                demoId = fb.demoId,
+            )
+        }
+        val sb = StringBuilder("[")
+        merged.forEachIndexed { i, (source, t) ->
+            if (i > 0) sb.append(",")
+            sb.append("{\"category\":\"").append(t.category.lowercase().trim())
+            sb.append("\",\"text\":\"").append(t.text.trim().replace("\"", "'"))
+            t.target?.takeIf { it.isNotBlank() }?.let {
+                sb.append("\",\"target\":\"").append(it.trim().replace("\"", "'"))
+            }
+            sb.append("\",\"windowDays\":").append(t.windowDays)
+            t.zone?.takeIf { it.isNotBlank() }?.let {
+                sb.append(",\"zone\":\"").append(it.trim()).append("\"")
+            }
+            sb.append(",\"source\":\"").append(source).append("\"")
+            // v43.6: keep the demoId (safe LLM tactic or fallback fill-in)
+            t.demoId?.takeIf { it.isNotBlank() }?.let {
+                sb.append(",\"demoId\":\"").append(it).append("\"")
+            }
+            sb.append("}")
+        }
+        return sb.append("]").toString()
     }
 
     /** Deterministic, localized fallback tactics (engine templates → I18n). */
@@ -603,10 +895,56 @@ open class ChatViewModel(
             var text = tr(t.i18nKey, lang)
             for ((k, v) in t.i18nArgs) text = text.replace("{${k}}", v)
             if (text.isBlank()) text = t.i18nKey
-            sb.append("{\"category\":\"${t.category}\",\"text\":\"${text.replace("\"", "'")}\",\"windowDays\":${t.windowDays}}")
+            sb.append("{\"category\":\"${t.category}\",\"text\":\"${text.replace("\"", "'")}\",\"windowDays\":${t.windowDays}")
+            // v43.6: deterministic visual example (fail-closed at generation)
+            if (t.demoId != null) {
+                sb.append(",\"demoId\":\"").append(t.demoId).append('"')
+            }
+            sb.append('}')
         }
-        return sb.append("]").toString()
+        return sb.append(']').toString()
     }
+
+    /** v43.6 (2026-10): one-shot enrichment of pre-v43.6 checkpoints whose
+     *  tactics lack visual examples (demoId) — covers BOTH the deterministic
+     *  fallback rows (e.g. the 2026-10-20 plans) and LLM rows persisted
+     *  before the prompt asked for demoIds. The user's standing wish: the
+     *  Plano always shows the visual examples whenever a compatible demo
+     *  exists. Safety: [BodyPlanEngine.backfillDemoIds] applies the same
+     *  fail-closed catalog gate per tactic (a demo is added only when
+     *  genuinely compatible — never invented), is purely additive, returns
+     *  null when nothing changes, and never overwrites a persisted demoId.
+     *  The tacticSource is preserved (this enriches, not regenerates). */
+    private fun backfillCheckpointDemoIds() {
+        viewModelScope.launch {
+            runCatching {
+                val checkpoints = repository.observeAllBodyPlanCheckpoints().first()
+                for (cp in checkpoints) {
+                    val updated =
+                        com.example.data.performance.BodyPlanEngine.backfillDemoIds(cp.tacticsJson) ?: continue
+                    repository.updateBodyPlanCheckpointTactics(
+                        cp.id, updated, cp.tacticSource ?: "deterministic_fallback"
+                    )
+                    android.util.Log.d("CHAT_BODYPLAN", "backfilled demoId onto checkpoint ${cp.id}")
+                }
+            }.onFailure {
+                // Enrichment only — a failure must never block the app.
+                android.util.Log.d("CHAT_BODYPLAN", "demoId backfill skipped: $it")
+            }
+        }
+    }
+
+    /** v43.10 (2026-10): the user's standing wish — every exercise tactic
+     *  carries its visual example. The deterministic fallback already sets
+     *  demoIds; LLM tactics arrive without one unless the model emitted it,
+     *  and the startup backfill only catches them at the NEXT launch. Apply
+     *  the SAME fail-closed, additive [BodyPlanEngine.backfillDemoIds] gate
+     *  at persistence time so the demo appears in-session: a demo is added
+     *  only when genuinely compatible (never invented), persisted demoIds
+     *  are never overridden, and `null` = nothing changed. */
+    private fun withDeterministicDemos(tacticsJson: String): String =
+        com.example.data.performance.BodyPlanEngine.backfillDemoIds(tacticsJson)
+            ?: tacticsJson
 
     /** Formats the numeric deltas into a short localized summary string
      *  (e.g. "cintura −0.3pp · peso +0.4kg · gordura −0.8pp"). Empty when
@@ -694,8 +1032,12 @@ open class ChatViewModel(
                     28
                 }
                 val zone = o.optString("zone", "").takeIf { it.isNotBlank() }
+                // v43 (2026-10): curated training-demo id — validated against
+                // the local catalog allowlist by the safety validator below
+                // (unknown id → tactic rejected, never invented content).
+                val demoId = o.optString("demoId", "").takeIf { it.isNotBlank() }
                 out += com.example.data.performance.TacticSafetyValidator.TacticCandidate(
-                    category, text, target, windowDays, zone
+                    category, text, target, windowDays, zone, demoId
                 )
             }
             out
@@ -3465,6 +3807,15 @@ open class ChatViewModel(
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     init {
+        // QA 2026-10 (third round): pre-v39 legacy snapshots get their
+        // checkpoint on start (no-op once any checkpoint exists).
+        backfillLegacyCheckpointIfNeeded()
+
+        // v43.6 (2026-10): one-shot, idempotent enrichment of pre-v43.6
+        // checkpoints with deterministic visual examples (demoId) —
+        // additive, fail-closed per tactic, replay-safe, fails soft.
+        backfillCheckpointDemoIds()
+
         // Voice Mode auto-loop: wire the timeline-observer + TTS-done-observer
         // that keep the hands-free cycle turning. Safe no-op when the VM was
         // built without controllers (headless tests).

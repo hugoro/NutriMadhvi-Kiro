@@ -93,6 +93,17 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        // QA 2026-10 (dark-theme bar icon contrast): the app UI is ALWAYS
+        // dark (#0B0F19), but edge-to-edge leaves the status/nav bar icon
+        // appearance to the *system* theme — on a light system theme that
+        // yields DARK icons over our dark background, nearly invisible.
+        // Force LIGHT icons (i.e. NOT "light appearance") so they stay
+        // legible regardless of the device's day/night setting.
+        androidx.core.view.WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
+
         // 1. Initialize local persistent database
         val database = ChatDatabase.getInstance(applicationContext)
         val chatDao = database.chatDao

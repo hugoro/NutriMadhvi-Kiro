@@ -28,4 +28,12 @@ google-services.json
 graphify-out/
 .claude/worktrees/
 
+# Local backups & data — NEVER commit (local-only repo, user rule 2026-10-20)
+*.db
+*.db-wal
+*.db-shm
+*.zip
+nutrimadhvi_backup_*
+madhvi_s25_backup_*
+
 CLAUDE.md

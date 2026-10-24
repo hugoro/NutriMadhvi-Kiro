@@ -104,6 +104,9 @@ private fun validMeasure(key: String, raw: Float?): Float? {
 private enum class ZoneVerdict { GROW, REDUCE, HOLD, NO_TARGET, INVALID }
 
 private data class ZoneBand(
+    // QA 2026-10 (second pass): stable internal key (flank-map lookup) so the
+    // display label can be translated without breaking marker placement.
+    val zoneKey: String,
     val label: String,
     val yTop: Float,          // normalised to pane height
     val yBottom: Float,
@@ -128,27 +131,58 @@ private data class ZoneBand(
     companion object { const val HOLD_EPS = 0.012f }
 }
 
-// Y bands calibrated to human proportions mapped onto the PNG figure
-// (body spans PNG-norm 0.087→0.898; landmarks from the 7.5-head canon).
-// The female figure's waist sits a touch higher and is more marked, so female
-// bands shift up slightly (dY) vs the male canon.
-private fun frontalBands(snap: PerformanceSnapshotEntity, t: SilhouetteTargets, isMale: Boolean): List<ZoneBand> {
-    val dY = if (isMale) 0f else -0.03f   // raise female markers ~3%
-    return listOf(
-        ZoneBand("Ombros", 0.22f + dY, 0.29f + dY, validMeasure("shoulder", snap.frontalShoulderRatio), t.shoulder),
-        ZoneBand("Cintura", 0.38f + dY, 0.44f + dY, validMeasure("waist", snap.frontalWaistRatio), t.waist),
-        ZoneBand("Ancas",  0.46f + dY, 0.53f + dY, validMeasure("hip", snap.frontalHipRatio), t.hip),
-        ZoneBand("Coxas",  0.56f + dY, 0.70f + dY, validMeasure("thigh", snap.frontalThighRatio), t.thigh),
-    )
+// Y bands calibrated to the v43.13+ realistic A-pose demo_muscle_* renders
+// (v43.18, 2026-10-23: the goal card moved from the old line-art silhouettes
+// to the SAME A-pose figures used by the demo cards in Plano — the user QA
+// flagged the two tabs showing two different generations of figures).
+// v43.20 (2026-10-23): the MALE figures were regenerated to the user-confirmed
+// female standard (A-pose with a 40-50px arm-torso gap, dark brown hair,
+// bright white briefs — the old male lateral read as bald/clothless); the
+// male frontal + lateral bands/flanks below were re-measured on the new
+// PNGs. The female assets are unchanged.
+// All coordinates are FULL-PNG fractions (the assets are 768×1344; the body
+// spans differ per render because of head/hair padding: male frontal
+// rows 34..1309, female frontal 34..1308 (v43.24 full-body single render —
+// head to sole, Gemini inpainted feet, cleanly keyed), male lateral
+// 34..1309, female lateral 115..1286).
+// Bands were re-measured on the real PNGs (per-row ink segments, α>60)
+// and are GENDER-AWARE — no shared dY shift.
+private fun frontalBands(snap: PerformanceSnapshotEntity, t: SilhouetteTargets, isMale: Boolean, lang: String): List<ZoneBand> {
+    return if (isMale) {
+        listOf(
+            ZoneBand("shoulder", tr("zone_shoulder", lang), 0.298f, 0.379f, validMeasure("shoulder", snap.frontalShoulderRatio), t.shoulder),
+            ZoneBand("waist",    tr("zone_waist", lang),    0.402f, 0.491f, validMeasure("waist", snap.frontalWaistRatio), t.waist),
+            ZoneBand("hip",      tr("zone_hip", lang),      0.491f, 0.550f, validMeasure("hip", snap.frontalHipRatio), t.hip),
+            ZoneBand("thigh",    tr("zone_thigh", lang),    0.558f, 0.707f, validMeasure("thigh", snap.frontalThighRatio), t.thigh),
+        )
+    } else {
+        // v43.24: re-measured on the full-body single render (body rows
+        // 34..1308): crotch f0.51, knee f0.73, ankle f0.91 — the legs are
+        // proportionally longer than the v43.23 composite (crotch f0.69), so
+        // the thigh band is shorter and the hip band sits lower.
+        listOf(
+            ZoneBand("shoulder", tr("zone_shoulder", lang), 0.222f, 0.306f, validMeasure("shoulder", snap.frontalShoulderRatio), t.shoulder),
+            ZoneBand("waist",    tr("zone_waist", lang),    0.426f, 0.479f, validMeasure("waist", snap.frontalWaistRatio), t.waist),
+            ZoneBand("hip",      tr("zone_hip", lang),      0.568f, 0.642f, validMeasure("hip", snap.frontalHipRatio), t.hip),
+            ZoneBand("thigh",    tr("zone_thigh", lang),    0.653f, 0.737f, validMeasure("thigh", snap.frontalThighRatio), t.thigh),
+        )
+    }
 }
 
-private fun lateralBands(snap: PerformanceSnapshotEntity, t: SilhouetteTargets, isMale: Boolean): List<ZoneBand> {
-    val dY = if (isMale) 0f else -0.03f
-    return listOf(
-        ZoneBand("Peito",   0.27f + dY, 0.36f + dY, validMeasure("chest", snap.lateralChestRatio), t.chest),
-        ZoneBand("Barriga", 0.43f + dY, 0.51f + dY, validMeasure("belly", snap.lateralBellyRatio), t.belly),
-        ZoneBand("Coxas",   0.58f + dY, 0.72f + dY, validMeasure("ltrhigh", snap.lateralThighRatio), t.lateralThigh),
-    )
+private fun lateralBands(snap: PerformanceSnapshotEntity, t: SilhouetteTargets, isMale: Boolean, lang: String): List<ZoneBand> {
+    return if (isMale) {
+        listOf(
+            ZoneBand("chest",   tr("zone_chest", lang),   0.313f, 0.402f, validMeasure("chest", snap.lateralChestRatio), t.chest),
+            ZoneBand("belly",   tr("zone_belly", lang),   0.402f, 0.513f, validMeasure("belly", snap.lateralBellyRatio), t.belly),
+            ZoneBand("ltrhigh", tr("zone_lateralThigh", lang), 0.558f, 0.737f, validMeasure("ltrhigh", snap.lateralThighRatio), t.lateralThigh),
+        )
+    } else {
+        listOf(
+            ZoneBand("chest",   tr("zone_chest", lang),   0.347f, 0.417f, validMeasure("chest", snap.lateralChestRatio), t.chest),
+            ZoneBand("belly",   tr("zone_belly", lang),   0.449f, 0.537f, validMeasure("belly", snap.lateralBellyRatio), t.belly),
+            ZoneBand("ltrhigh", tr("zone_lateralThigh", lang), 0.589f, 0.715f, validMeasure("ltrhigh", snap.lateralThighRatio), t.lateralThigh),
+        )
+    }
 }
 
 // ─── Verdict colours & copy ─────────────────────────────────────────────────────
@@ -165,19 +199,21 @@ private fun verdictColor(v: ZoneVerdict): Color = when (v) {
     ZoneVerdict.NO_TARGET, ZoneVerdict.INVALID -> colorMuted
 }
 
-private fun verdictLabel(band: ZoneBand): String = when (band.verdict) {
-    ZoneVerdict.GROW   -> "aumentar" + deltaSuffix(band.deltaPct)
-    ZoneVerdict.REDUCE -> "reduzir"  + deltaSuffix(band.deltaPct)
-    ZoneVerdict.HOLD   -> "manter"
-    ZoneVerdict.NO_TARGET -> "sem alvo"
-    ZoneVerdict.INVALID   -> "medição inválida"
+private fun verdictLabel(band: ZoneBand, lang: String): String = when (band.verdict) {
+    ZoneVerdict.GROW   -> tr("verdict_grow", lang) + deltaSuffix(band.deltaPct, lang)
+    ZoneVerdict.REDUCE -> tr("verdict_reduce", lang) + deltaSuffix(band.deltaPct, lang)
+    ZoneVerdict.HOLD   -> tr("verdict_hold", lang)
+    ZoneVerdict.NO_TARGET -> tr("no_target", lang)
+    ZoneVerdict.INVALID   -> tr("verdict_invalid", lang)
 }
 
-private fun deltaSuffix(deltaPct: Float?): String {
+// QA 2026-10 (second pass): locale-aware decimal separator for the Δpp value.
+private fun deltaSuffix(deltaPct: Float?, lang: String): String {
     if (deltaPct == null) return ""
     val mag = abs(deltaPct)
     if (mag < 0.1f) return ""
-    return " ${if (deltaPct >= 0) "+" else "−"}${"%.1f".format(mag)}pp"
+    return " ${if (deltaPct >= 0) "+" else "−"}" +
+        String.format(localeForLanguage(lang), "%.1f", mag) + "pp"
 }
 
 // ─── Zone marker overlay (contour-parallel strokes, not filled ovals) ───────────
@@ -193,34 +229,57 @@ private fun deltaSuffix(deltaPct: Float?): String {
 // not centred (arms hang right) and ContentScale.Fit letterboxes it inside the
 // pane, so markers must be mapped through the rendered PNG rect, not the Canvas
 // centre. [axis] is the body's vertical centre line at that zone.
-private data class Flank(val axis: Float, val top: Float, val mid: Float, val bot: Float)
+// v43.18 (2026-10-23): the card now renders the SAME realistic A-pose figures
+// as the Plano demo cards (demo_muscle_*), so the flank geometry below was
+// re-measured on those PNGs (per-row α>60 ink segments; see SilhouetteAsset
+// tests). One zone may have SEVERAL columns (the male frontal thighs are two
+// separate columns). Edges are ABSOLUTE x in full-PNG-normalised coords at
+// the band top/mid/bottom rows, following the torso/limb contour (arms
+// excluded), so each stroke pair hugs the body outline.
+private data class FlankCol(
+    val lTop: Float, val lMid: Float, val lBot: Float,
+    val rTop: Float, val rMid: Float, val rBot: Float,
+)
 
-// Half-widths are the TORSO/limb flank (conservative, inside the arms), as a
-// fraction of the PNG width. Axis measured from the PNG per gender.
-// MALE PNG: figure hangs right → axis ≈0.60 frontal, ≈0.47 lateral.
+private data class Flank(val cols: List<FlankCol>)
+
 private val MALE_FRONTAL_FLANK = mapOf(
-    "Ombros"  to Flank(0.60f, 0.22f, 0.30f, 0.30f),
-    "Cintura" to Flank(0.60f, 0.26f, 0.25f, 0.26f),
-    "Ancas"   to Flank(0.60f, 0.27f, 0.30f, 0.28f),
-    "Coxas"   to Flank(0.60f, 0.24f, 0.20f, 0.17f),
+    "shoulder" to Flank(listOf(FlankCol(0.363f, 0.371f, 0.378f, 0.634f, 0.625f, 0.620f))),
+    "waist"    to Flank(listOf(FlankCol(0.370f, 0.357f, 0.344f, 0.628f, 0.639f, 0.652f))),
+    "hip"      to Flank(listOf(FlankCol(0.344f, 0.337f, 0.332f, 0.652f, 0.659f, 0.665f))),
+    "thigh"    to Flank(listOf(
+        FlankCol(0.332f, 0.349f, 0.357f, 0.490f, 0.469f, 0.449f),
+        FlankCol(0.512f, 0.533f, 0.549f, 0.667f, 0.659f, 0.641f),
+    )),
 )
 private val MALE_LATERAL_FLANK = mapOf(
-    "Peito"   to Flank(0.47f, 0.30f, 0.34f, 0.34f),
-    "Barriga" to Flank(0.46f, 0.34f, 0.36f, 0.31f),
-    "Coxas"   to Flank(0.48f, 0.26f, 0.24f, 0.21f),
+    "chest"   to Flank(listOf(FlankCol(0.368f, 0.383f, 0.397f, 0.600f, 0.596f, 0.600f))),
+    // The left (back) edge bulges out around f0.42 (lumbar curve) — the mid
+    // sample sits on the bulge so the Bezier tracks it within ~8px.
+    "belly"   to Flank(listOf(FlankCol(0.397f, 0.406f, 0.387f, 0.600f, 0.603f, 0.620f))),
+    // The left (front) edge dips slightly below f0.65 before the knee;
+    // a single quadratic follows it within ~9px over the band.
+    "ltrhigh" to Flank(listOf(FlankCol(0.414f, 0.415f, 0.396f, 0.608f, 0.572f, 0.521f))),
 )
-// FEMALE PNG: near-centred (axis ≈0.51 frontal, ≈0.49 lateral). Narrower waist,
-// wider hips — torso flanks conservative (inside arms).
 private val FEMALE_FRONTAL_FLANK = mapOf(
-    "Ombros"  to Flank(0.51f, 0.20f, 0.26f, 0.26f),
-    "Cintura" to Flank(0.51f, 0.22f, 0.20f, 0.23f),   // marked waist
-    "Ancas"   to Flank(0.51f, 0.24f, 0.29f, 0.27f),   // wider hips
-    "Coxas"   to Flank(0.51f, 0.24f, 0.19f, 0.16f),
+    // v43.24: re-measured on the full-body single render (body rows
+    // 34..1308; figure centred on axis x=384). Shoulder follows the
+    // deltoid slope; waist/hip hug the torso/leg edges (arms excluded —
+    // the A-pose hands drop to ~row 805); thigh hugs the OUTER leg edges.
+    "shoulder" to Flank(listOf(FlankCol(0.314f, 0.306f, 0.296f, 0.688f, 0.694f, 0.704f))),
+    "waist"    to Flank(listOf(FlankCol(0.368f, 0.357f, 0.346f, 0.633f, 0.643f, 0.654f))),
+    "hip"      to Flank(listOf(FlankCol(0.335f, 0.341f, 0.354f, 0.665f, 0.659f, 0.646f))),
+    // One stroke pair on the OUTER edges of both thighs (the female
+    // design keeps a single column, unlike the male's two per-thigh
+    // columns).
+    "thigh"    to Flank(listOf(FlankCol(0.358f, 0.375f, 0.376f, 0.642f, 0.624f, 0.622f))),
 )
 private val FEMALE_LATERAL_FLANK = mapOf(
-    "Peito"   to Flank(0.49f, 0.24f, 0.26f, 0.21f),
-    "Barriga" to Flank(0.49f, 0.26f, 0.29f, 0.26f),
-    "Coxas"   to Flank(0.49f, 0.22f, 0.17f, 0.18f),
+    // Top started at f0.30 — above that the back edge recedes fast
+    // (0.632 → 0.615 between f0.28 and f0.30).
+    "chest"   to Flank(listOf(FlankCol(0.423f, 0.426f, 0.438f, 0.615f, 0.609f, 0.599f))),
+    "belly"   to Flank(listOf(FlankCol(0.435f, 0.395f, 0.398f, 0.600f, 0.591f, 0.586f))),
+    "ltrhigh" to Flank(listOf(FlankCol(0.424f, 0.422f, 0.428f, 0.589f, 0.560f, 0.529f))),
 )
 
 private fun flankMapFor(isMale: Boolean, isFrontal: Boolean) = when {
@@ -231,12 +290,8 @@ private fun flankMapFor(isMale: Boolean, isFrontal: Boolean) = when {
 }
 
 // PNG intrinsic aspect (width/height) per gender+view, for ContentScale.Fit mapping.
-private fun pngAspectFor(isMale: Boolean, isFrontal: Boolean): Float = when {
-    isMale  && isFrontal -> 300f / 1224f
-    isMale  && !isFrontal -> 300f / 2141f
-    !isMale && isFrontal -> 300f / 869f
-    else                  -> 300f / 1558f
-}
+// v43.18: all four demo_muscle_* assets share the same 768×1344 canvas.
+private fun pngAspectFor(isMale: Boolean, isFrontal: Boolean): Float = 768f / 1344f
 
 private fun DrawScope.drawZoneMarkers(bands: List<ZoneBand>, isFrontal: Boolean, isMale: Boolean) {
     val flankMap = flankMapFor(isMale, isFrontal)
@@ -265,39 +320,37 @@ private fun DrawScope.drawZoneMarkers(bands: List<ZoneBand>, isFrontal: Boolean,
     bands.forEach { band ->
         if (band.verdict == ZoneVerdict.INVALID && band.target == null) return@forEach
         val color = verdictColor(band.verdict)
-        val flank = flankMap[band.label] ?: Flank(0.5f, 0.3f, 0.3f, 0.3f)
+        val flank = flankMap[band.zoneKey] ?: return@forEach
 
         val yTop = py(band.yTop)
         val yMid = py(band.midY)
         val yBot = py(band.yBottom)
-        // Half-widths scaled by rendered PNG width (not pane width).
-        val hTop = flank.top * renderW
-        val hMid = flank.mid * renderW
-        val hBot = flank.bot * renderW
-        val axisX = px(flank.axis)
 
         val stroke = 3f
         val alpha = if (band.verdict == ZoneVerdict.GROW ||
                         band.verdict == ZoneVerdict.REDUCE ||
                         band.verdict == ZoneVerdict.HOLD) 0.9f else 0.55f
 
-        val right = Path().apply {
-            moveTo(axisX + hTop, yTop)
-            quadraticBezierTo(axisX + hMid, yMid, axisX + hBot, yBot)
-        }
-        val left = Path().apply {
-            moveTo(axisX - hTop, yTop)
-            quadraticBezierTo(axisX - hMid, yMid, axisX - hBot, yBot)
-        }
-        drawPath(right, color = color.copy(alpha = alpha), style = Stroke(width = stroke))
-        drawPath(left,  color = color.copy(alpha = alpha), style = Stroke(width = stroke))
+        // One stroke pair per body column (the male frontal thighs are two).
+        flank.cols.forEach { col ->
+            val right = Path().apply {
+                moveTo(px(col.rTop), yTop)
+                quadraticBezierTo(px(col.rMid), yMid, px(col.rBot), yBot)
+            }
+            val left = Path().apply {
+                moveTo(px(col.lTop), yTop)
+                quadraticBezierTo(px(col.lMid), yMid, px(col.lBot), yBot)
+            }
+            drawPath(right, color = color.copy(alpha = alpha), style = Stroke(width = stroke))
+            drawPath(left,  color = color.copy(alpha = alpha), style = Stroke(width = stroke))
 
-        if (band.verdict == ZoneVerdict.GROW || band.verdict == ZoneVerdict.REDUCE) {
-            val inward = band.verdict == ZoneVerdict.REDUCE
-            val arrowLen = renderW * 0.045f
-            val a = color.copy(alpha = 0.9f)
-            drawArrow(Offset(axisX + hMid, yMid), toward = if (inward) -1f else 1f, len = arrowLen, color = a)
-            drawArrow(Offset(axisX - hMid, yMid), toward = if (inward) 1f else -1f, len = arrowLen, color = a)
+            if (band.verdict == ZoneVerdict.GROW || band.verdict == ZoneVerdict.REDUCE) {
+                val inward = band.verdict == ZoneVerdict.REDUCE
+                val arrowLen = renderW * 0.045f
+                val a = color.copy(alpha = 0.9f)
+                drawArrow(Offset(px(col.rMid), yMid), toward = if (inward) -1f else 1f, len = arrowLen, color = a)
+                drawArrow(Offset(px(col.lMid), yMid), toward = if (inward) 1f else -1f, len = arrowLen, color = a)
+            }
         }
     }
 }
@@ -318,6 +371,7 @@ fun SilhouetteGoalCard(
     snap: PerformanceSnapshotEntity,
     latestGoal: PerformanceGoalEntity?,
     isMale: Boolean,
+    lang: String,
 ) {
     val targets = remember(latestGoal?.coachTargetJson) {
         parseTargets(latestGoal?.coachTargetJson)
@@ -330,7 +384,7 @@ fun SilhouetteGoalCard(
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(
-                "Silhueta com objetivos",
+                tr("goal_silhouette_title", lang),
                 color = AccentSoft,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 13.sp,
@@ -338,10 +392,8 @@ fun SilhouetteGoalCard(
 
             if (!targets.hasAny) {
                 Text(
-                    "O coach ainda não gerou alvos de silhueta para o teu objetivo. " +
-                        "Guarda um objetivo e corre uma avaliação — as recomendações por " +
-                        "zona aparecem aqui.",
-                    color = Color.White.copy(0.45f),
+                    tr("goal_silhouette_no_targets", lang),
+                    color = Color.White.copy(0.6f),
                     fontSize = 11.sp,
                 )
             }
@@ -352,19 +404,26 @@ fun SilhouetteGoalCard(
             ) {
                 SilhouettePane(
                     modifier  = Modifier.weight(1f),
-                    label     = "Frontal",
-                    bands     = frontalBands(snap, targets, isMale),
+                    label     = tr("view_frontal", lang),
+                    bands     = frontalBands(snap, targets, isMale, lang),
                     isMale    = isMale,
                     isFrontal = true,
+                    lang      = lang,
                 )
                 SilhouettePane(
                     modifier  = Modifier.weight(1f),
-                    label     = "Lateral",
-                    bands     = lateralBands(snap, targets, isMale),
+                    label     = tr("view_lateral", lang),
+                    bands     = lateralBands(snap, targets, isMale, lang),
                     isMale    = isMale,
                     isFrontal = false,
+                    lang      = lang,
                 )
             }
+
+            // v43.18: the schematic-figure disclaimer is gone — the card now
+            // renders the same realistic A-pose figures as the Plano demo
+            // cards (demo_muscle_*), so the old line-art contour-gap caveat no
+            // longer applies.
 
             // Legend — maps colours to meaning (shown only when any target exists).
             if (targets.hasAny) {
@@ -372,16 +431,16 @@ fun SilhouetteGoalCard(
                     Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
                 ) {
-                    LegendDot(colorGrow,   "aumentar")
-                    LegendDot(colorReduce, "reduzir")
-                    LegendDot(colorHold,   "manter")
-                    LegendDot(colorMuted,  "sem alvo")
+                    LegendDot(colorGrow,   tr("verdict_grow", lang))
+                    LegendDot(colorReduce, tr("verdict_reduce", lang))
+                    LegendDot(colorHold,   tr("verdict_hold", lang))
+                    LegendDot(colorMuted,  tr("no_target", lang))
                 }
             }
 
             Text(
-                "Aperta para ampliar · pp = pontos percentuais da altura",
-                color = Color.White.copy(alpha = 0.25f),
+                tr("perf_zoom_hint", lang) + " · " + tr("perf_pp_legend", lang),
+                color = Color.White.copy(alpha = 0.5f),
                 fontSize = 9.sp,
                 modifier = Modifier.align(Alignment.CenterHorizontally),
             )
@@ -398,19 +457,25 @@ private fun SilhouettePane(
     bands: List<ZoneBand>,
     isMale: Boolean,
     isFrontal: Boolean,
+    lang: String,
 ) {
     var scale  by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
 
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(label, color = Color.White.copy(0.40f), fontSize = 10.sp)
+        Text(label, color = Color.White.copy(0.6f), fontSize = 10.sp)
         Spacer(Modifier.height(4.dp))
         Box(
             Modifier
                 .fillMaxWidth()
-                .aspectRatio(0.28f)
+                // QA 2026-10: fixed height instead of aspectRatio(0.28f). At a
+                // ~148dp pane width the old ratio produced a ~1585px-tall pane
+                // that pushed the whole silhouette card (and the zone rows)
+                // below the fold. 340dp keeps the card on one screen; the
+                // zone markers map through the pane size, so they adapt.
+                .height(340.dp)
                 .clip(RoundedCornerShape(10.dp))
-                .background(Color.White.copy(0.03f))
+                .background(Color.White.copy(0.06f))
                 // Pinch-to-zoom WITHOUT stealing vertical scroll from the parent
                 // LazyColumn. A single-finger drag is only consumed once we are
                 // already zoomed (scale > 1) so the user can pan the zoomed image;
@@ -441,11 +506,14 @@ private fun SilhouettePane(
                     }
                 }
         ) {
+            // v43.18 (2026-10-23): same realistic A-pose figures as the Plano
+            // demo cards (user QA: the two tabs must show the same generation
+            // of figures). No white tint — the renders are realistic.
             val drawableRes = when {
-                isFrontal &&  isMale -> R.drawable.silhouette_male_frontal
-                isFrontal && !isMale -> R.drawable.silhouette_female_frontal
-                !isFrontal && isMale -> R.drawable.silhouette_male_lateral
-                else                 -> R.drawable.silhouette_female_lateral
+                isFrontal &&  isMale -> R.drawable.demo_muscle_male_frontal
+                isFrontal && !isMale -> R.drawable.demo_muscle_female_frontal
+                !isFrontal && isMale -> R.drawable.demo_muscle_male_lateral
+                else                 -> R.drawable.demo_muscle_female_lateral
             }
             Image(
                 painter = painterResource(drawableRes),
@@ -457,7 +525,6 @@ private fun SilhouettePane(
                         scaleX = scale, scaleY = scale,
                         translationX = offset.x, translationY = offset.y,
                     ),
-                colorFilter = ColorFilter.tint(Color.White.copy(alpha = 0.70f)),
             )
             Canvas(
                 Modifier
@@ -480,14 +547,14 @@ private fun SilhouettePane(
             bands.forEach { band ->
                 // Hide zones that are both unmeasured and un-targeted.
                 if (band.verdict == ZoneVerdict.INVALID && band.target == null) return@forEach
-                ZoneRow(band)
+                ZoneRow(band, lang)
             }
         }
     }
 }
 
 @Composable
-private fun ZoneRow(band: ZoneBand) {
+private fun ZoneRow(band: ZoneBand, lang: String) {
     Row(
         Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -498,13 +565,13 @@ private fun ZoneRow(band: ZoneBand) {
         }
         Text(
             band.label,
-            color = Color.White.copy(0.72f),
+            color = Color.White.copy(0.8f),
             fontSize = 10.sp,
             fontWeight = FontWeight.Medium,
             modifier = Modifier.weight(1f),
         )
         Text(
-            verdictLabel(band),
+            verdictLabel(band, lang),
             color = verdictColor(band.verdict).copy(
                 alpha = if (band.verdict == ZoneVerdict.INVALID ||
                             band.verdict == ZoneVerdict.NO_TARGET) 0.6f else 0.95f,
@@ -525,6 +592,6 @@ private fun LegendDot(color: Color, label: String) {
         Canvas(Modifier.size(8.dp)) {
             drawCircle(color = color, radius = size.minDimension / 2f)
         }
-        Text(label, color = Color.White.copy(0.50f), fontSize = 10.sp)
+        Text(label, color = Color.White.copy(0.65f), fontSize = 10.sp)
     }
 }

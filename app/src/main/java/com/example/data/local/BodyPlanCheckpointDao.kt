@@ -28,6 +28,24 @@ interface BodyPlanCheckpointDao {
     @Query("UPDATE body_plan_checkpoints SET coachReport=:report, reportGeneratedAtMs=:ts WHERE id=:id")
     suspend fun updateReport(id: Long, report: String, ts: Long)
 
+    /** v41 repair path: overwrite ONLY the deterministic core (phase,
+     *  priorities, delta, anchored goal) after a convention-compatible
+     *  target regeneration. LLM enrichment fields (tacticsJson,
+     *  tacticSource, coachReport) are untouched — a successful LLM pass is
+     *  never lost by a repair. */
+    @Query(
+        "UPDATE body_plan_checkpoints SET phase=:phase, prioritiesJson=:prioritiesJson, " +
+            "deltaSummary=:deltaSummary, goalText=:goalText, goalTargetsJson=:goalTargetsJson WHERE id=:id"
+    )
+    suspend fun updateDeterministic(
+        id: Long,
+        phase: String?,
+        prioritiesJson: String?,
+        deltaSummary: String?,
+        goalText: String?,
+        goalTargetsJson: String?,
+    )
+
     @Query("SELECT * FROM body_plan_checkpoints WHERE id=:id")
     suspend fun getById(id: Long): BodyPlanCheckpointEntity?
 

@@ -1,7 +1,10 @@
 package com.example.ui
 
-fun tr(key: String, lang: String): String {
-    val pt = mapOf(
+// F1 (performance, 2026-10-22): the three translation maps used to be
+// rebuilt on EVERY tr() call — 628 call sites, many inside lazy-list row
+// composition, so a full-screen scroll rebuilt ~1,482 map entries over and
+// over. Hoisted to top-level vals: built once, at class init.
+internal val PT_MAP: Map<String, String> = mapOf(
        "Dashboard" to "Painel",
         "Capture" to "Capturar",
         "Food" to "Comida",
@@ -132,6 +135,18 @@ fun tr(key: String, lang: String): String {
         // Balanço card redesign 2026-07-20 — two sections (Energia / Macros)
         "Energy" to "Energia",
         "Consumed" to "Consumido",
+        // QA 2026-10: dashboard labels that were rendering in English.
+        "Burned" to "Queimadas",
+        "Net Calories" to "Calorias líquidas",
+        "Activity Metrics" to "Métricas de atividade",
+        "Steps count" to "Passos",
+        "Active Minutes" to "Minutos ativos",
+        "Calories Burned" to "Calorias queimadas",
+        "Last synced" to "Última sincronização",
+        "steps" to "passos",
+        "mins" to "min",
+        "S-Health Active" to "S-Health ativo",
+        "S-Health Offline" to "S-Health offline",
         "Spent — Activity" to "Gasto — Atividade",
         "Spent — BMR" to "Gasto — TMB",
         "deficit" to "défice",
@@ -614,7 +629,13 @@ fun tr(key: String, lang: String): String {
         "leftover_edit_hint" to "Editar as sobras faz a IA recalcular os totais ao guardar.",
         // ── Body plan / checkpoints (v39) ────────────────────────────────────
         "tactic_protein_target" to "Proteína: ~{grams} g por dia, distribuídas pelas refeições",
-        "tactic_strength_progressive" to "Força: 2–3 sessões/semana com progressão gradual da carga",
+        // v43.7: concrete full-body prescription (exercises, sets×reps,
+        // session length, numbered progression rule) instead of the vague
+        // "progressão gradual da carga" — still conservative, still static.
+        // v43.9: plain-language definition up front — "força" is jargon to
+        // most users; say WHAT it is (train the muscles) and WHERE (full
+        // body) in the tactic line itself.
+        "tactic_strength_progressive" to "Força (treinar os músculos): 2–3 sessões de corpo inteiro (30–45 min) — 3×8–12 de agachamento, flexão (ou nos joelhos) e prancha; a cada 2 semanas, +1 série ou +1 repetição",
         "tactic_daily_steps" to "Atividade: 7–9 mil passos por dia",
         "tactic_sleep" to "Sono: 7–9 horas de qualidade",
         "tactic_zone_reduce" to "Zona {zone}: défice calórico moderado mantendo a carga de treino",
@@ -627,19 +648,79 @@ fun tr(key: String, lang: String): String {
         "perf_tab_plan" to "Plano",
         "perf_tab_progress" to "Progresso",
         "phase_unknown" to "Fase",
-        "phase_cut" to "CUT — Perder gordura",
-        "phase_bulk" to "BULK — Ganhar massa",
-        "phase_recomp" to "RECOMP — Recomposição",
-        "phase_maintain" to "MAINTAIN — Manutenção",
+        "phase_cut" to "Perder gordura",
+        "phase_bulk" to "Ganhar massa",
+        "phase_recomp" to "Recomposição",
+        "phase_maintain" to "Manutenção",
         "plan_phase" to "Fase atual",
         "plan_no_checkpoint" to "Ainda não tens um checkpoint. Faz uma avaliação de silhueta para criar o teu plano.",
         "plan_priorities" to "Prioridades",
         "plan_no_targets" to "Define o teu objetivo para receber prioridades por zona.",
         "plan_tactics" to "Táticas",
         "plan_tactics_pending" to "Táticas a gerar...",
-        "plan_tactics_source_llm" to "Gerado por IA",
-        "plan_tactics_source_fallback" to "Recomendações de base (IA indisponível)",
-        "plan_tactics_source_llm_model" to "Gerado por IA ({model})",
+        // v43 (2026-10): neutral label for any usable plan (fully LLM,
+        // partially adjusted, or full deterministic fallback). No
+        // "IA indisponível", no model name — tacticSource stays in the DB
+        // and logcat for audit.
+        "plan_recommended" to "Plano recomendado",
+        // v43 (2026-10): curated training-demo catalog copy (local, no camera,
+        // no spot-reduction claims).
+        "demo_view" to "Ver demonstração",
+        "demo_squat_bodyweight_name" to "Agachamento sem peso · pernas e glúteos",
+        "demo_squat_bodyweight_prescription" to "3 séries de 12 · 2 a 3 sessões por semana",
+        "demo_squat_bodyweight_cue" to "Calcanhares no chão, peito aberto, desce devagar e com controle, até uma amplitude confortável e sem dor; usa uma cadeira como apoio se precisar e para de imediato se a dor for aguda ou crescente",
+        "demo_squat_bodyweight_progression" to "Só com técnica sólida e sem dor, aumenta gradualmente para 4 séries",
+        "demo_brisk_walk_name" to "Caminhada rápida · corpo todo e cardio",
+        "demo_brisk_walk_prescription" to "30 minutos a passo firme, sem perder o fôlego",
+        "demo_brisk_walk_cue" to "Queixo paralelo ao chão, ombros relaxados, braços a balanciar",
+        "demo_brisk_walk_progression" to "Quando ficar fácil, aumenta 5 minutos ou o ritmo, mantendo a postura",
+        "demo_hip_flexor_stretch_name" to "Stretch do flexor do quadril · recuperação",
+        "demo_hip_flexor_stretch_prescription" to "30 s por lado, sem rebolar",
+        "demo_hip_flexor_stretch_cue" to "Joelho de trás perto do chão, tronco ereto, sente o alongamento à frente do quadril",
+        "demo_hip_flexor_stretch_progression" to "Quando ficar confortável, inclina ligeiramente o tronco para a frente",
+        // v43.9: generic "força" demo — a region-neutral full-body circuit
+        // (squat + push-up + plank) so the strength tactic explains WHAT
+        // "força" is and WHERE the work lands on both halves of the body.
+        "demo_full_body_circuit_name" to "Circuito de força · corpo inteiro (pernas e tronco)",
+        "demo_full_body_circuit_prescription" to "2–3 sessões por semana · 3 voltas · 8–12 repetições em cada exercício",
+        "demo_full_body_circuit_cue" to "Agachamento: calcanhares no chão, desce devagar. Flexão: mãos abaixo dos ombros, corpo reto — faz nos joelhos se precisares. Prancha: corpo reto, anca sem afundar. Respira normalmente.",
+        "demo_full_body_circuit_progression" to "Só com técnica sólida e sem dor: a cada 2 semanas, +1 repetição por exercício",
+        // v43.7 (2026-10): personal-trainer execution protocol — intent,
+        // muscles-to-FEEL (with the mirror self-check rule), post-set do/don't.
+        "demo_intent_label" to "Intento",
+        "demo_feel_label" to "Deves sentir",
+        "demo_after_label" to "Ao terminar",
+        // v43.7 fail-closed: rendered when a demo has no localized feel copy.
+        "demo_feel_mirror_fallback" to "Se não sentires o músculo indicado: para, usa um espelho para verificar a postura e retoma só quando conseguires reproduzir a sensação.",
+        // v43.8: tap-a-figure-to-zoom affordance + close hint.
+        "demo_feel_zoom_hint" to "Toca numa figura para ampliar",
+        "demo_feel_zoom_close" to "Toca para fechar",
+        "muscle_quadriceps" to "quadríceps (frente da coxa)",
+        "muscle_glutes" to "glúteos",
+        "muscle_hip_flexors" to "flexores do quadril (frente do quadril)",
+        "muscle_calves" to "panturrilhas",
+        "muscle_hamstrings" to "isquiotibiais (atras da coxa)",
+        // v43.9: upper-body names — plain words + where in the torso.
+        "muscle_pectorals" to "peito (frente do tronco)",
+        "muscle_lats" to "costas (atrás do tronco)",
+        "demo_squat_bodyweight_intent" to "Carregar glúteos e quadríceps com a coluna estável — a descida é controlada pelo quadríceps e a subida liderada pelo glúteo.",
+        "demo_squat_bodyweight_feel" to "Deves sentir glúteos e a frente das coxas. Se doer no joelho ou na lombar, ou não sentires nada: para, verifica a postura num espelho e retoma só quando reproduzires a sensação.",
+        "demo_squat_bodyweight_after_do" to "Sai da posição final devagar e mantém um movimento leve (caminhada lenta) durante 1–2 minutos.",
+        "demo_squat_bodyweight_after_dont" to "Não te sentes nem deites de imediato e não prendas a respiração — a paragem brusca faz o sangue acumular nas pernas e pode dar tontura ou desmaio.",
+        "demo_brisk_walk_intent" to "Subir o ritmo cardíaco a intensidade moderada — o passo em que ainda consegues falar — para treinar o cardio sem sobrecarregar as articulações.",
+        "demo_brisk_walk_feel" to "Deves sentir as panturrilhas, os glúteos e a respiração a subir. Se já não conseguires dizer uma frase inteira: intensidade alta demais — abrandar.",
+        "demo_brisk_walk_after_do" to "Caminha devagar 2–3 minutos (rescaldo) para o ritmo cardíaco descer gradualmente.",
+        "demo_brisk_walk_after_dont" to "Não pares abruptamente nem te sentes de imediato — a paragem brusca faz o sangue acumular nas pernas e pode dar tontura ou desmaio.",
+        "demo_hip_flexor_stretch_intent" to "Alongar os flexores do quadril, curtos pelo sedentarismo — tensão controlada, nunca dor.",
+        "demo_hip_flexor_stretch_feel" to "Deves sentir tensão na frente do quadril da perna estendida e o glúteo da perna fletida. Dor no joelho ou lombar: para, usa o espelho e reduz a amplitude.",
+        "demo_hip_flexor_stretch_after_do" to "Volta à posição neutra devagar e caminha cerca de 1 minuto antes de te sentares.",
+        "demo_hip_flexor_stretch_after_dont" to "Não faças movimentos de quique nem prandes a respiração — os quiques arriscam microlesões e prender o ar sobe a tensão arterial.",
+        "demo_full_body_circuit_intent" to "Treinar as pernas, o peito, os ombros e as costas ao mesmo tempo — os músculos e os ossos ficam mais fortes e o dia a dia (e a corrida) fica mais fácil.",
+        "demo_full_body_circuit_feel" to "Deves sentir as coxas e os glúteos nas pernas, e o peito e as costas no tronco. Se doer no ombro ou na lombar, ou não sentires nada: para, verifica a postura num espelho e retoma só quando reproduzires a sensação.",
+        "demo_full_body_circuit_after_do" to "Caminha devagar 1–2 minutos (rescaldo) e alonga levemente as pernas e o tronco.",
+        "demo_full_body_circuit_after_dont" to "Não faças a última volta a alta intensidade nem prendas a respiração — a paragem brusca faz o sangue acumular nas pernas e pode dar tontura ou desmaio.",
+        // v42 (2026-10): partially adjusted plan — informational, not an alarm.
+        "plan_tactics_adjusted" to "Alguns conselhos da IA foram ajustados por segurança.",
         "plan_error_checkpoint_gone" to "Este checkpoint já não existe.",
         "plan_error_snapshot_missing" to "A avaliação de silhueta associada a este checkpoint já não existe.",
         "plan_error_llm_failed" to "Não foi possível gerar com IA — as recomendações de base estão aplicadas.",
@@ -648,12 +729,44 @@ fun tr(key: String, lang: String): String {
         "perf_convention_mixed" to "{n} avaliações anteriores não são comparáveis (convenção de normalização diferente).",
         "medical_disclaimer" to "Estimativas baseadas em silhueta e correlações de grupo. Não é aconselhamento, diagnóstico ou dispositivo médico. Para questões de saúde, consulta um clínico adequado.",
         "plan_retry" to "Gerar novamente",
+        // QA 2026-10: explicit pending/idle/failed states + goal shortcut.
+        "plan_open_goal" to "Definir objetivo",
+        "plan_tactics_idle" to "Táticas ainda não geradas.",
+        "plan_tactics_failed" to "Táticas não geradas.",
+        "plan_tactics_generate" to "Gerar táticas",
+        "progress_report_idle" to "Relatório ainda não gerado.",
+        "progress_report_generate" to "Gerar relatório",
+        // QA 2026-10 (second pass): coach-report card copy through tr().
+        "progress_report_need_photos" to "Faz uma avaliação com fotos frontal e lateral para gerar o relatório de coach.",
+        "perf_evolution_need_two" to "Faz pelo menos duas avaliações de silhueta para veres a evolução.",
+        // QA 2026-10 (second pass): previously hardcoded PT copy.
+        "perf_silhouette_comp" to "Análise de silhueta e composição",
+        "perf_coach_report" to "Relatório do coach",
+        "perf_silhouette_analysis" to "Análise de silhueta",
+        "perf_silhouette_analysis_desc" to "Tira 2 fotos (frente + lado) para obteres uma análise de coach baseada nos teus dados de composição corporal.",
+        "perf_start_assessment" to "Iniciar avaliação",
+        "goal_silhouette_title" to "Silhueta com objetivos",
+        "goal_silhouette_no_targets" to "O coach ainda não gerou alvos de silhueta para o teu objetivo. Guarda um objetivo e corre uma avaliação — as recomendações por zona aparecem aqui.",
+        "view_frontal" to "Frontal",
+        "view_lateral" to "Lateral",
+        "view_posterior" to "Posterior",
+        "no_target" to "sem alvo",
+        "verdict_grow" to "aumentar",
+        "verdict_reduce" to "reduzir",
+        "verdict_hold" to "manter",
+        "verdict_invalid" to "medição inválida",
+        "perf_zoom_hint" to "Aperta para ampliar",
+        "perf_pp_legend" to "pp = pontos percentuais da altura",
+        "goal_silhouette_schematic" to "Figura esquemática; o contorno visual pode ser parcial.",
+        "Connect S-Health" to "Ligar o S-Health",
         "plan_direction_reduce" to "Reduzir",
         "plan_direction_grow" to "Aumentar",
         "plan_direction_hold" to "Manter",
         "plan_window_days" to "{days} dias",
         "plan_delta_label" to "Evolução",
         "progress_empty" to "Cada avaliação de silhueta cria um checkpoint aqui.",
+        "progress_legacy_assessment" to "Avaliação anterior",
+        "progress_legacy_explanation" to "Registo preservado antes da introdução dos checkpoints adaptativos.",
         "progress_report_pending" to "Relatório a gerar...",
         "zone_shoulder" to "ombro",
         "zone_waist" to "cintura",
@@ -665,14 +778,20 @@ fun tr(key: String, lang: String): String {
         "delta_weight" to "peso",
         "delta_fat" to "gordura",
         "delta_muscle" to "massa muscular",
-    )
-    val gu = mapOf(
+)
+
+internal val GU_MAP: Map<String, String> = mapOf(
         "Dashboard" to "ડેશબોર્ડ",
         "Capture" to "કેપ્ચર",
         "History" to "ઇતિહાસ",
         "Chat" to "ચેટ",
         "Report" to "રિપોર્ટ",
         "Analytics" to "વિશ્લેષણ",
+        // v43.8: view labels for the muscle-map figures (transliteration,
+        // same convention as the other anatomy terms).
+        "view_frontal" to "ફ્રન્ટલ",
+        "view_lateral" to "લેટરલ",
+        "view_posterior" to "ਪ੉ਨર਼ੇਰਿ૱ਰ",
         "Nutrition and activity status" to "પોષણ અને પ્રવૃત્તિની સ્થિતિ",
         "Macronutrients" to "મેક્રોન્યુટ્રિએન્ટ્સ",
         "Activities" to "પ્રવૃત્તિઓ",
@@ -1266,7 +1385,8 @@ fun tr(key: String, lang: String): String {
         "leftover_edit_hint" to "બાકીનું સંપાદન કરવાથી AI સાચવતી વખતે કુલ ફરી ગણતરી કરે છે.",
         // ── Body plan / checkpoints (v39) ────────────────────────────────────
         "tactic_protein_target" to "પ્રોટીન: દિવસમાં ~{grams} ગ્રામ, ભોજન વચ્ચે વહેંચીને",
-        "tactic_strength_progressive" to "બળ: અઠવાડિયે 2–3 સિઝન, ધીરે ધીરે લોડ વધારો",
+        // v43.7: concrete full-body prescription (PT mirror).
+        "tactic_strength_progressive" to "બળ (મસલોનું કસાણું): અઠવડીમાં 2–3 શરીર-ભરની સિઝન (30–45 મિનિટ) — 3×8–12: સ્કવોટ, પુશ-અપ (અથવા ઘૂંટણે) અને પ્લંક; દર 2 અઠવાડિયે +1 સેટ અથવા +1 રિપીટ",
         "tactic_daily_steps" to "સક્રિયતા: દિવસમાં 7–9 હજાર પગલાં",
         "tactic_sleep" to "નિદ્રા: 7–9 કલાકની સારી નિદ્રા",
         "tactic_zone_reduce" to "ઝોન {zone}: મધ્યમ કેલરી ઘાટો, ટ્રેનિંગ લોડ જાળવો",
@@ -1279,19 +1399,73 @@ fun tr(key: String, lang: String): String {
         "perf_tab_plan" to "યોજના",
         "perf_tab_progress" to "પગલું",
         "phase_unknown" to "પર્ચે",
-        "phase_cut" to "કટ — ચરબી ઘટાડો",
-        "phase_bulk" to "બલ્ક — ઝુંડ વધારો",
-        "phase_recomp" to "રિકોમ્પ — પુનઃરચના",
-        "phase_maintain" to "મેઇન્ટેઇન — સંભાળ",
+        "phase_cut" to "ચરબી ઘટાડો",
+        "phase_bulk" to "ઝુંડ વધારો",
+        "phase_recomp" to "પુનઃરચના",
+        "phase_maintain" to "સંભાળ",
         "plan_phase" to "વર્તમાન પર્ચે",
         "plan_no_checkpoint" to "તમારા પાસે હજુ ચેકપોઇન્ટ નથી. યોજના બનાવવા માટે સિલુએટ મૂલ્યાંકન કરો.",
         "plan_priorities" to "પ્રાથમિકતાઓ",
         "plan_no_targets" to "ઝોન પ્રાથમિકતા મેળવવા માટે તમારું લક્ષ્ય સેટ કરો.",
         "plan_tactics" to "રણનીતિઓ",
         "plan_tactics_pending" to "રણનીતિઓ બનવામાં...",
-        "plan_tactics_source_llm" to "AI દ્વારા બનાવેલું",
-        "plan_tactics_source_fallback" to "આધારભૂત ભલામણો (AI ઉપલબ્ધ નથી)",
-        "plan_tactics_source_llm_model" to "AI ({model}) દ્વારા બનાવેલું",
+        // v43 (2026-10): neutral label for any usable plan (audit-only source).
+        "plan_recommended" to "ભલામણ કરેલો પ્લાન",
+        // v43 (2026-10): curated training-demo catalog copy (local, no camera,
+        // no spot-reduction claims).
+        "demo_view" to "ડેમો જુઓ",
+        "demo_squat_bodyweight_name" to "બાડીવેઇટ સ્કવોટ · પાંય અને ગ્લેટ",
+        "demo_squat_bodyweight_prescription" to "3 સેટ × 12 · 2 થી 3 સેશન સપ્તાહમાં",
+        "demo_squat_bodyweight_cue" to "ગાઠળ જમીન પર, સીનું ખુલ્લું, ધીરે અન નિયંત્રિત રીતે સુગમ અન દરદ વગરની ગતિમાને નીચે જાઓ; જરૂર પડે તો ખુરશીનો સહારો લો; જો દરદ તીવ્ર અથવા વધતું હોય તો તરત થોકો",
+        "demo_squat_bodyweight_progression" to "જ્યારે તકનીક સુદૃઢ અન દરદ વગરની હોય, ત્યારે ધીરે ધીરે 4 સેટ સુધી વધારો",
+        "demo_brisk_walk_name" to "ઝડપી ચાલ · સંપૂર્ણ શરીર અને કાર્ડિયો",
+        "demo_brisk_walk_prescription" to "30 મિનિટ દઢ પગલે, શ્વસન સાથે",
+        "demo_brisk_walk_cue" to "ઢાંકણું જમીન સમાંતર, ઢીલા કંઠ, હાથ ફેરવો",
+        "demo_brisk_walk_progression" to "સાધારણ લાગે ત્યારે 5 મિનિટ અથવા ઝડપ ઉમેરો, સ્થિતિ જાળવો",
+        "demo_hip_flexor_stretch_name" to "હિપ ફ્લેક્સર સ્ટ્રેચ · રિકવરી",
+        "demo_hip_flexor_stretch_prescription" to "દરેક બાજુ 30 સેકન્ડ, ઝપાકપટાક વગર",
+        "demo_hip_flexor_stretch_cue" to "પાછલું ઘૂંટણું જમીન પાસે, સીધા તરફ, હિપની આગળ સ્ટ્રેચ અનુભવો",
+        "demo_hip_flexor_stretch_progression" to "સુગમ લાગે ત્યારે થોડું થોડું આગળ ઝુકો",
+        // v43.9: generic "બળ" demo — region-neutral full-body circuit.
+        "demo_full_body_circuit_name" to "બળ સર્કિટ · સંપૂર્ણ શરિર (પાંય અને ટ્રંકો)",
+        "demo_full_body_circuit_prescription" to "સપ્તાહમાં 2–3 સેશન · 3 રાઉન્ડ · દરેક કસાણમાં 8–12 રિપીટ",
+        "demo_full_body_circuit_cue" to "સ્કવોટ: ગાઠળ જમીન પર, ધીરે નીચે. પુશ-અપ: હાથ ખભેની નીચે, શરિર સીધું — જરૂર પડે તો ઘૂંટણે કરો. પ્લંક: શરિર સીધું, હિપ નીચે નહીં, સામાન્ય શ્વસન",
+        "demo_full_body_circuit_progression" to "તકનિક સુદૃઢ અને દરદ વગરનો હોય તો જ: દર 2 અઠવાડિયે દરેક કસાણમાં +1 રિપીટ",
+        // v43.7 (2026-10): execution protocol (PT mirror) — intent, feel +
+        // mirror self-check, post-set do/don't.
+        "demo_intent_label" to "નિત્ય",
+        "demo_feel_label" to "તમે અનુભવવું જોઈએ",
+        "demo_after_label" to "પૂર્ણ થયા પછી",
+        "demo_feel_mirror_fallback" to "જો તમે સૂચિત ઝલક અનુભવો નહીં: થોભો, મોજીરા માં સ્થિતિ તપાસો અન ફરીથી અનુભવ મેળવ્યા પછી જ ફરી શરૂ કરો.",
+        // v43.8: tap-a-figure-to-zoom affordance + close hint.
+        "demo_feel_zoom_hint" to "વિસ્તારવાં ફિગર ટૅપ કરો",
+        "demo_feel_zoom_close" to "બંધ કરવાં ટૅપ કરો",
+        "muscle_quadriceps" to "ક્વૉડરિસિપ્સ (ટાંકાની આગળ)",
+        "muscle_glutes" to "ગ્લેટ",
+        "muscle_hip_flexors" to "હિપ ફ્લેક્સર્સ (હિપની આગળ)",
+        "muscle_calves" to "પાટિયા",
+        "muscle_hamstrings" to "હૉમસ્ટ્રિંગ્સ (ટાંકાની પાછળ)",
+        // v43.9: upper-body names — plain words + where in the torso.
+        "muscle_pectorals" to "છાતી (ટ્રંકોની આગળ)",
+        "muscle_lats" to "પીઠ (ટ્રંકોની પાછળ)",
+        "demo_squat_bodyweight_intent" to "સ્થિર કરડા સાથે ગ્લેટ અને ક્વૉડ લોડ કરો — નીચે જવું ક્વૉડ દ્વારા નિયંત્રિત, ઉપર જવું ગ્લેટ દ્વારા.",
+        "demo_squat_bodyweight_feel" to "ગ્લેટ અને ટાંકાની આગળ અનુભવવી જોઈએ. ઘૂંટણ કે પીઠની નીચેમાં દરદ, કંઈ નહીં: થોભો, મોજીરા માં સ્થિતિ તપાસો અને ફરી અનુભવ મેળવ્યા પછી જ રહો.",
+        "demo_squat_bodyweight_after_do" to "છેલ્લી સ્થિતિમાંથી ધીમે નીચે આવો અને 1–2 મિનિટ ધીરે ચાલવું ચાલુ રાખો.",
+        "demo_squat_bodyweight_after_dont" to "તરત બેસો કે પડો નહીં અને શ્વસન ન રોકો — અચાનક થોભાથી લોહી પાયમાં જમ થાય છે અને ઝડપકાઈ કે ગૂંચવણ થઈ શકે.",
+        "demo_brisk_walk_intent" to "મધ્યમ તીવ્રતા સુધી હૃદય ઝડપ વધારો — જે પગલે તમે વાતચીત કરી શકો — ઝલકને સંયોગ વગર કાર્ડિયો કસોટી.",
+        "demo_brisk_walk_feel" to "પાટિયા, ગ્લેટ અને શ્વસન વધતું અનુભવો. જો પૂરો વાક્ય કહી ન શકો: તીવ્રતા ખૂબ વધુ — ધીમું કરો.",
+        "demo_brisk_walk_after_do" to "હૃદય ઝડપ ધીમે ઘટે તેમ 2–3 મિનિટ ધીરે ચાલો (કૂલ-ડાઉન).",
+        "demo_brisk_walk_after_dont" to "અચાનક થોભો કે તરત બેસો નહીં — અચાનક થોભાથી લોહી પાયમાં જમ થાય છે અને ઝડપકાઈ કે ગૂંચવણ થઈ શકે.",
+        "demo_hip_flexor_stretch_intent" to "બેસવાથી સંકોચાયેલા હિપ ફ્લેક્સર નો સ્ટ્રેચ — નિયંત્રિત તણાવ, ક્યારેય દરદ નહીં.",
+        "demo_hip_flexor_stretch_feel" to "પ્રસારિત પગની હિપની આગળ તણાવ અને વક્ર પગના ગ્લેટ અનુભવો. ઘૂંટણ કે પીઠની નીચેમાં દરદ: થોભો, મોજીરો વાપરો અને ક્ષેત્ર ઘટાડો.",
+        "demo_hip_flexor_stretch_after_do" to "ધીમે સમતુલ્ય સ્થિતિમાં પરત આવો અને બેસતી પહેલાં આશરે 1 મિનિટ ચાલો.",
+        "demo_hip_flexor_stretch_after_dont" to "'કુિક' ન કરો અને શ્વસન ન રોકો — કુિકથી માઇક્રો-ખાડખાડું નું જોખમ છે અને શ્વસન રોકવાથી રોધનો દબાણ વધે છે.",
+        "demo_full_body_circuit_intent" to "પાંય, છાતી, ખભા અને પીઠ સુંગાત્રે કસાણું — મસલો અને હાડકો મજબૂત થાય અને રોજનું કામ (અને દોડ) સરળ બને.",
+        "demo_full_body_circuit_feel" to "ટાંકાણ અને ગ્લેટ પાંયમાં, છાતી અને પીઠ ટ્રંકોમાં અનુભવવાં જોઈએ. ખભે કે નીચે-પીઠે દરદ, અથવા કંઈ નહીં: થોભો, મોઝીરોમાં સ્થિતિ તપાસો અને ફરી અનુભવ મેળવ્યા પછી જ રહો.",
+        "demo_full_body_circuit_after_do" to "ધીરે 1–2 મિનિટ ચાલો (કૂલ-ડાઉન) અને પાંય/ટ્રંકો ધીરે સ્ટ્રેચ કરો.",
+        "demo_full_body_circuit_after_dont" to "છેલ્લો રાઉન્ડ કઠોર કરો નહીં અને શ્વસન રોકો નહીં — અચાનક થોભાથી લોહી પાયમાં જમ થાય અને ઝડપકાઈ કે ડૂબી શકે.",
+        // v42 (2026-10): partially adjusted plan — informational, not an alarm.
+        "plan_tactics_adjusted" to "કેટલાક AI સૂચનો સલામતી માટે સુધારાયા છે.",
         "plan_error_checkpoint_gone" to "આ ચેકપોઇન્ટ હવે અસ્તિત્વમાં નથી.",
         "plan_error_snapshot_missing" to "આ ચેકપોઇન્ટ સાથે સંકળાયેલ સિલુએટ મૂલ્યાંકન હવે અસ્તિત્વમાં નથી.",
         "plan_error_llm_failed" to "AI થી બનાવી શકાયું નહિ — મૂળભૂત ભલામણો લાગુ થઈ.",
@@ -1306,6 +1480,8 @@ fun tr(key: String, lang: String): String {
         "plan_window_days" to "{days} દિવસ",
         "plan_delta_label" to "ફેરફાર",
         "progress_empty" to "દરેક સિલુએટ મૂલ્યાંકન અહીં ચેકપોઇન્ટ બનાવે છે.",
+        "progress_legacy_assessment" to "પહેલાનું મૂલ્યાંકન",
+        "progress_legacy_explanation" to "અનુકૂલનશીલ ચેકપોઇન્ટ પહેલાં સાચવેલો રેકોર્ડ.",
         "progress_report_pending" to "રિપોર્ટ લાગણીમાં...",
         "zone_shoulder" to "કંધ",
         "zone_waist" to "કમર",
@@ -1317,14 +1493,15 @@ fun tr(key: String, lang: String): String {
         "delta_weight" to "વજન",
         "delta_fat" to "મસ્તક",
         "delta_muscle" to "પેશી દળ",
-    )
+)
+
     // Small English map for keys whose identifier is opaque (e.g. `phase_*`
     // technical tokens used by the meal-analysis orchestrator). For all
     // other keys the legacy `else -> key` branch still wins, which matches
     // the rest of the codebase where the key is itself the English copy
     // (e.g. tr("Dashboard", "en") → "Dashboard"). Keep this map narrow —
     // adding entries here for normal English keys would mask typos.
-    val enExplicit = mapOf(
+internal val EN_EXPLICIT_MAP: Map<String, String> = mapOf(
         "phase_uploading_image" to "Uploading image…",
         // 2026-10-06 (Frente Thinking) — live reasoning card
         "reasoning" to "Reasoning",
@@ -1417,7 +1594,8 @@ fun tr(key: String, lang: String): String {
         "leftover_edit_hint" to "Editing leftovers makes the AI recompute totals on save.",
         // ── Body plan / checkpoints (v39) ────────────────────────────────────
         "tactic_protein_target" to "Protein: ~{grams} g/day, spread across meals",
-        "tactic_strength_progressive" to "Strength: 2–3 sessions/week with gradual load progression",
+        // v43.7: concrete full-body prescription (EN mirror).
+        "tactic_strength_progressive" to "Strength: 2–3 full-body sessions (30–45 min) — 3×8–12 of squats, push-ups (or from the knees) and plank; every 2 weeks, +1 set or +1 rep",
         "tactic_daily_steps" to "Activity: 7–9k steps per day",
         "tactic_sleep" to "Sleep: 7–9 hours of quality sleep",
         "tactic_zone_reduce" to "Zone {zone}: moderate calorie deficit while keeping training load",
@@ -1430,19 +1608,79 @@ fun tr(key: String, lang: String): String {
         "perf_tab_plan" to "Plan",
         "perf_tab_progress" to "Progress",
         "phase_unknown" to "Phase",
-        "phase_cut" to "CUT — Fat loss",
-        "phase_bulk" to "BULK — Build mass",
-        "phase_recomp" to "RECOMP — Recomposition",
-        "phase_maintain" to "MAINTAIN",
+        "phase_cut" to "Fat loss",
+        "phase_bulk" to "Build mass",
+        "phase_recomp" to "Recomposition",
+        "phase_maintain" to "Maintenance",
         "plan_phase" to "Current phase",
         "plan_no_checkpoint" to "You have no checkpoint yet. Do a silhouette assessment to create your plan.",
         "plan_priorities" to "Priorities",
         "plan_no_targets" to "Set your goal to get zone priorities.",
         "plan_tactics" to "Tactics",
         "plan_tactics_pending" to "Generating tactics...",
-        "plan_tactics_source_llm" to "Generated by AI",
-        "plan_tactics_source_fallback" to "Baseline recommendations (AI unavailable)",
-        "plan_tactics_source_llm_model" to "Generated by AI ({model})",
+        // v43 (2026-10): neutral label for any usable plan (audit-only source).
+        "plan_recommended" to "Recommended plan",
+        // v43 (2026-10): curated training-demo catalog copy (local, no camera,
+        // no spot-reduction claims).
+        "demo_view" to "Watch demo",
+        "demo_squat_bodyweight_name" to "Bodyweight squat · legs & glutes",
+        "demo_squat_bodyweight_prescription" to "3 sets of 12 · 2 to 3 sessions per week",
+        "demo_squat_bodyweight_cue" to "Heels down, chest up, lower slowly and with control to a comfortable, pain-free range; use a chair for support if needed and stop at once if pain is sharp or increasing",
+        "demo_squat_bodyweight_progression" to "Only with solid, pain-free form, gradually work up to 4 sets",
+        "demo_brisk_walk_name" to "Brisk walk · full body & cardio",
+        "demo_brisk_walk_prescription" to "30 minutes at a firm pace, keeping your breath",
+        "demo_brisk_walk_cue" to "Chin level with the floor, relaxed shoulders, swinging arms",
+        "demo_brisk_walk_progression" to "When easy, add 5 minutes or the pace, keeping posture",
+        "demo_hip_flexor_stretch_name" to "Hip flexor stretch · recovery",
+        "demo_hip_flexor_stretch_prescription" to "30 s per side, no bouncing",
+        "demo_hip_flexor_stretch_cue" to "Back knee near the floor, upright torso, feel the stretch at the front of the hip",
+        "demo_hip_flexor_stretch_progression" to "When comfortable, lean the torso slightly forward",
+        // v43.9 (2026-10): the generic "strength" demo (EN mirror) — the
+        // region-neutral full-body circuit that gives every strength tactic
+        // a visual example.
+        "demo_full_body_circuit_name" to "Full-body strength circuit · legs & torso",
+        "demo_full_body_circuit_prescription" to "2–3 sessions per week · 3 rounds · 8–12 reps of each exercise",
+        "demo_full_body_circuit_cue" to "Squat: heels down, lower slowly. Push-up: hands under shoulders, body straight — if needed, do it from your knees. Plank: body straight, hips not sagging. Breathe normally.",
+        "demo_full_body_circuit_progression" to "Only with solid, pain-free form: every 2 weeks, +1 rep per exercise",
+        // v43.7 (2026-10): execution protocol (EN mirror) — intent, feel +
+        // mirror self-check, post-set do/don't.
+        "demo_intent_label" to "Intent",
+        "demo_feel_label" to "You should feel",
+        "demo_after_label" to "After finishing",
+        // v43.7 fail-closed: rendered when a demo has no localized feel copy.
+        "demo_feel_mirror_fallback" to "If you do not feel the indicated muscle: stop, check your posture in a mirror and only resume once you can reproduce the sensation.",
+        // v43.8: tap-a-figure-to-zoom affordance + close hint.
+        "demo_feel_zoom_hint" to "Tap a figure to enlarge",
+        "demo_feel_zoom_close" to "Tap to close",
+        "muscle_quadriceps" to "quadriceps (front of thigh)",
+        "muscle_glutes" to "glutes",
+        "muscle_hip_flexors" to "hip flexors (front of hip)",
+        "muscle_calves" to "calves",
+        "muscle_hamstrings" to "hamstrings (back of thigh)",
+        // v43.9 (2026-10): torso regions — the full-body circuit highlights
+        // the upper half just like the leg demos do.
+        "muscle_pectorals" to "chest (front of torso)",
+        "muscle_lats" to "back (rear of torso)",
+        "demo_squat_bodyweight_intent" to "Load the glutes and quads with a stable spine — the descent is controlled by the quads, the ascent driven by the glutes.",
+        "demo_squat_bodyweight_feel" to "You should feel the glutes and the front of your thighs. Pain in the knee or lower back, or nothing at all: stop, check your form in a mirror and only resume once you can reproduce the sensation.",
+        "demo_squat_bodyweight_after_do" to "Lower yourself out of the final position slowly and keep moving lightly (slow walking) for 1–2 minutes.",
+        "demo_squat_bodyweight_after_dont" to "Do not sit or lie down immediately and do not hold your breath — stopping abruptly pools blood in the legs and can cause dizziness or fainting.",
+        "demo_brisk_walk_intent" to "Raise your heart rate to moderate intensity — a pace where you can still hold a conversation — to train the cardio system without overloading the joints.",
+        "demo_brisk_walk_feel" to "You should feel your calves, glutes and breathing rise. If you can no longer say a full sentence: intensity too high — slow down.",
+        "demo_brisk_walk_after_do" to "Walk slowly for 2–3 minutes (cool-down) so your heart rate comes down gradually.",
+        "demo_brisk_walk_after_dont" to "Do not stop abruptly or sit down immediately — stopping abruptly pools blood in the legs and can cause dizziness or fainting.",
+        "demo_hip_flexor_stretch_intent" to "Stretch the hip flexors, shortened by sitting — controlled tension, never pain.",
+        "demo_hip_flexor_stretch_feel" to "You should feel a stretch in the front of the hip of the extended leg and the glute of the bent leg. Knee or lower-back pain: stop, use a mirror and reduce the range.",
+        "demo_hip_flexor_stretch_after_do" to "Return to neutral slowly and walk for about a minute before sitting down.",
+        "demo_hip_flexor_stretch_after_dont" to "Do not bounce and do not hold your breath — bouncing risks micro-tears and breath-holding raises blood pressure.",
+        // v43.9 (2026-10): the generic "strength" demo protocol (EN mirror) —
+        // "what is strength" in plain words + where the work should be felt.
+        "demo_full_body_circuit_intent" to "Train the legs, chest, shoulders and back at the same time — the muscles and bones get stronger and everyday life (and running) gets easier.",
+        "demo_full_body_circuit_feel" to "You should feel your thighs and glutes in the legs, and the chest and back in the torso. Pain in the shoulder or lower back, or nothing at all: stop, check your posture in a mirror and only resume once you can reproduce the sensation.",
+        "demo_full_body_circuit_after_do" to "Walk slowly for 1–2 minutes (cool-down) and gently stretch the legs and torso.",
+        "demo_full_body_circuit_after_dont" to "Do not make the last round high intensity and do not hold your breath — stopping abruptly pools blood in the legs and can cause dizziness or fainting.",
+        // v42 (2026-10): partially adjusted plan — informational, not an alarm.
+        "plan_tactics_adjusted" to "Some AI recommendations were adjusted for safety.",
         "plan_error_checkpoint_gone" to "This checkpoint no longer exists.",
         "plan_error_snapshot_missing" to "The silhouette assessment linked to this checkpoint no longer exists.",
         "plan_error_llm_failed" to "Could not generate with AI — baseline recommendations applied.",
@@ -1451,13 +1689,46 @@ fun tr(key: String, lang: String): String {
         "perf_convention_mixed" to "{n} earlier assessments are not comparable (different normalization convention).",
         "medical_disclaimer" to "Estimates based on silhouette and group correlations. This is not medical advice, diagnosis, or a medical device. For health concerns, consult an appropriate clinician.",
         "plan_retry" to "Generate again",
+        // QA 2026-10: explicit pending/idle/failed states + goal shortcut.
+        "plan_open_goal" to "Set your goal",
+        "plan_tactics_idle" to "Tactics have not been generated yet.",
+        "plan_tactics_failed" to "Tactics could not be generated.",
+        "plan_tactics_generate" to "Generate tactics",
+        "progress_report_idle" to "Report has not been generated yet.",
+        "progress_report_generate" to "Generate report",
+        // QA 2026-10 (second pass): coach-report card copy through tr().
+        "progress_report_pending" to "Generating report…",
+        "progress_report_need_photos" to "Do an assessment with frontal and side photos to generate the coach report.",
+        "perf_evolution_need_two" to "Complete at least two silhouette assessments to see your evolution.",
+        // QA 2026-10 (second pass): previously hardcoded PT copy.
+        "perf_silhouette_comp" to "Silhouette & composition analysis",
+        "perf_coach_report" to "Coach report",
+        "perf_silhouette_analysis" to "Silhouette analysis",
+        "perf_silhouette_analysis_desc" to "Take 2 photos (front + side) to get a coach analysis based on your body composition data.",
+        "perf_start_assessment" to "Start assessment",
+        "goal_silhouette_title" to "Silhouette with goals",
+        "goal_silhouette_no_targets" to "The coach has not generated silhouette targets for your goal yet. Save a goal and run an assessment — per-zone recommendations will appear here.",
+        "view_frontal" to "Frontal",
+        "view_lateral" to "Lateral",
+        "view_posterior" to "Back",
+        "no_target" to "no target",
+        "verdict_grow" to "grow",
+        "verdict_reduce" to "reduce",
+        "verdict_hold" to "hold",
+        "verdict_invalid" to "invalid measurement",
+        "perf_zoom_hint" to "Tap to enlarge",
+        "perf_pp_legend" to "pp = percent of height",
+        "goal_silhouette_schematic" to "Schematic figure; the visual outline may be partial.",
+        "Connect S-Health" to "Connect S-Health",
         "plan_direction_reduce" to "Reduce",
         "plan_direction_grow" to "Grow",
         "plan_direction_hold" to "Hold",
         "plan_window_days" to "{days} days",
         "plan_delta_label" to "Change",
         "progress_empty" to "Each silhouette assessment creates a checkpoint here.",
-        "progress_report_pending" to "Report pending...",
+        // v43.10: duplicate removed — "Generating report…" (QA 2026-10 second
+        // pass, above) is the live copy; this older entry silently won in
+        // mapOf (last key wins).
         "zone_shoulder" to "shoulder",
         "zone_waist" to "waist",
         "zone_hip" to "hip",
@@ -1468,12 +1739,12 @@ fun tr(key: String, lang: String): String {
         "delta_weight" to "weight",
         "delta_fat" to "fat",
         "delta_muscle" to "muscle",
-    )
-    return when (lang) {
-        "pt-PT", "pt", "" -> pt[key] ?: enExplicit[key] ?: key
-        "gu" -> gu[key] ?: enExplicit[key] ?: key
-        else -> enExplicit[key] ?: key
-    }
+)
+
+fun tr(key: String, lang: String): String = when (lang) {
+    "pt-PT", "pt", "" -> PT_MAP[key] ?: EN_EXPLICIT_MAP[key] ?: key
+    "gu" -> GU_MAP[key] ?: EN_EXPLICIT_MAP[key] ?: key
+    else -> EN_EXPLICIT_MAP[key] ?: key
 }
 
 /**

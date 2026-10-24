@@ -48,6 +48,12 @@ object BodyPlanEngine {
         val i18nKey: String,
         val i18nArgs: Map<String, String> = emptyMap(),
         val windowDays: Int = 28,
+        /** v43.6 (2026-10): deterministic visual example for this tactic.
+         *  Set only when a catalog demo is genuinely compatible (checked
+         *  through the SAME fail-closed
+         *  [TrainingDemoCatalog.incompatibilities] gate as the validator);
+         *  `null` = no card, nothing invented. */
+        val demoId: String? = null,
     )
 
     /** Numeric deltas between two checkpoints (UI localises the labels). */
@@ -70,6 +76,63 @@ object BodyPlanEngine {
 
     /** The 7 measurable zones — validation boundary for any zone key. */
     val ZONES = setOf(SHOULDER, WAIST, HIP, THIGH, CHEST, BELLY, LATERAL_THIGH)
+
+    // ── Normalization conventions (v41) ─────────────────────────────────────
+    //
+    // A silhouette ratio is only comparable to its target (or its previous
+    // value) when BOTH sides use the same normalization convention. v40
+    // stored the convention per capture (frontalNormalization /
+    // lateralNormalization markers; NULL = the legacy image-height
+    // convention). v41 additionally stores, with each goal's targets, the
+    // convention they were derived under (per side) — and the engine only
+    // emits gaps/deltas when the two sides agree. Unknown (NULL) target
+    // convention = UNKNOWN by definition = never compared (fail-closed).
+
+    const val CONV_IMAGE_HEIGHT = "image_height"
+    const val CONV_POSE_PERSON_HEIGHT = "pose_person_height"
+
+    /** Zones measured on the frontal photo. */
+    val FRONTAL_ZONES = setOf(SHOULDER, WAIST, HIP, THIGH)
+
+    /** Zones measured on the lateral photo. */
+    val LATERAL_ZONES = setOf(CHEST, BELLY, LATERAL_THIGH)
+
+    /** Effective convention of a persisted snapshot marker. NULL (pre-v39
+     *  rows) is the legacy image-height convention — those rows were only
+     *  ever produced by the fixed-fraction plan. */
+    fun snapshotConvention(marker: String?): String =
+        marker?.takeIf { it.isNotBlank() } ?: CONV_IMAGE_HEIGHT
+
+    /** True when [zone]'s target (if any) was derived under the SAME
+     *  convention as [snapshot]'s measurement of that zone. Target
+     *  convention NULL = unknown → not comparable (fail-closed). */
+    fun zoneTargetCompatible(
+        zone: String,
+        snapshot: PerformanceSnapshotEntity,
+        targetsFrontalConv: String?,
+        targetsLateralConv: String?,
+    ): Boolean {
+        val frontal = zone in FRONTAL_ZONES
+        val snapConv = if (frontal) snapshotConvention(snapshot.frontalNormalization)
+        else snapshotConvention(snapshot.lateralNormalization)
+        val targetConv = if (frontal) targetsFrontalConv else targetsLateralConv
+        return !targetConv.isNullOrBlank() && targetConv == snapConv
+    }
+
+    /** True when EVERY zone that has a target in [targets] is convention-
+     *  compatible with [snapshot] — i.e. the whole target set is safe to
+     *  use. Any incompatibility (or unknown target convention) means the
+     *  targets must be re-derived before priorities may cite them. */
+    fun allTargetsCompatible(
+        snapshot: PerformanceSnapshotEntity,
+        targets: Map<String, Float>,
+        targetsFrontalConv: String?,
+        targetsLateralConv: String?,
+    ): Boolean {
+        if (targets.isEmpty()) return true
+        if (targetsFrontalConv.isNullOrBlank() || targetsLateralConv.isNullOrBlank()) return false
+        return targets.keys.all { zoneTargetCompatible(it, snapshot, targetsFrontalConv, targetsLateralConv) }
+    }
 
     // ── Tunables ────────────────────────────────────────────────────────────
 
@@ -151,17 +214,29 @@ object BodyPlanEngine {
      * GROW only to muscle-dominant zones below target; everything else
      * is HOLD (including every zone when there is no composition data).
      * Zones without a target or without a measured ratio are skipped.
+     * v41: a ratio and its target are only the same unit when both sides
+     * use the same normalization convention — incompatible or
+     * unknown-convention targets are OMITTED (no misleading gap); the
+     * caller re-derives compatible targets and repairs the checkpoint.
      */
     fun rankPriorities(
         snapshot: PerformanceSnapshotEntity,
         targets: Map<String, Float>,
         hasCompositionData: Boolean,
+        targetsFrontalConv: String? = null,
+        targetsLateralConv: String? = null,
         max: Int = 3,
     ): List<ZonePriority> {
         val out = mutableListOf<ZonePriority>()
         for ((zone, ratio) in zonesOf(snapshot)) {
             val target = targets[zone] ?: continue
             if (ratio == null || target <= 0f) continue
+            // v41: a ratio and its target are only the same unit when both
+            // sides use the same normalization convention. Incompatible or
+            // unknown-convention targets are OMITTED (no misleading gap) —
+            // the caller re-derives compatible targets and repairs the
+            // checkpoint.
+            if (!zoneTargetCompatible(zone, snapshot, targetsFrontalConv, targetsLateralConv)) continue
             val gapPp = (ratio - target) * 100f
             if (abs(gapPp) < MIN_GAP_PP) continue
             val tissue = classifyTissue(zone, hasCompositionData)
@@ -271,9 +346,23 @@ object BodyPlanEngine {
             "protein", "tactic_protein_target",
             mapOf("grams" to (proteinG?.toString() ?: "")), 28,
         )
-        tactics += FallbackTactic("strength", "tactic_strength_progressive")
-        tactics += FallbackTactic("steps", "tactic_daily_steps")
-        tactics += FallbackTactic("sleep", "tactic_sleep")
+        // v43.9: the generic strength template is FULL-BODY (no region) →
+        // it now pairs with the region-neutral full-body circuit demo.
+        // demoIdForTactic still fails closed through the catalog gate.
+        tactics += FallbackTactic(
+            "strength", "tactic_strength_progressive",
+            demoId = demoIdForTactic("strength", "", null, null),
+        )
+        // v43.6: deterministic visual examples — the SAME fail-closed
+        // catalog gate (demoIdForTactic) that the validator uses.
+        tactics += FallbackTactic(
+            "steps", "tactic_daily_steps",
+            demoId = demoIdForTactic("steps", "daily steps", null, null),
+        )
+        tactics += FallbackTactic(
+            "sleep", "tactic_sleep",
+            demoId = demoIdForTactic("sleep", "sleep", null, null),
+        )
 
         // One actionable zone tactic for the top priority (if any).
         val top = priorities.firstOrNull { it.direction != Direction.HOLD }
@@ -294,6 +383,195 @@ object BodyPlanEngine {
         return tactics
     }
 
+    // ── v43.6: deterministic demoId + backfill (visual examples) ────────────
+
+    /** Lower-body region keywords (PT/EN) — the POSITIVE match that allows
+     *  a lower-body demo on a strength tactic. A generic strength tactic
+     *  (no region) gets NO demo: nothing is invented. */
+    private val LOWER_BODY_KEYWORDS = listOf(
+        "membros inferiores", "membro inferior", "inferiores",
+        "pernas", "perna", "coxas", "coxa", "quadril",
+        "glúteos", "gluteos", "joelhos", "joelho",
+        "legs", "thigh", "knee", "glute", "lower body",
+    )
+
+    /**
+     * v43.6 (2026-10): deterministic visual example for a tactic.
+     *
+     *  The candidate is chosen by a positive per-category match, then
+     *  passed through the SAME fail-closed catalog gate
+     *  ([TrainingDemoCatalog.incompatibilities]) as
+     *  [TacticSafetyValidator.validateDemoCompatibility]: any mismatch
+     *  (e.g. upper-body keywords or zone on a squat demo) → `null`.
+     *  Categories without a catalog demo (protein, calories, zone) always
+     *  return `null`. Pure JVM.
+     *
+     *  v43.9: strength mapping — an explicit LOWER-body focus keeps the
+     *  squat demo (more specific); anything else (generic "força",
+     *  upper-body focus, no region) gets the region-neutral
+     *  `full_body_circuit`, which highlights both halves of the body.
+     */
+    fun demoIdForTactic(
+        category: String,
+        text: String,
+        target: String?,
+        zone: String?,
+    ): String? {
+        val cat = category.lowercase().trim()
+        val demo = when (cat) {
+            "steps" -> TrainingDemoCatalog.byId("brisk_walk")
+            "sleep" -> TrainingDemoCatalog.byId("hip_flexor_stretch")
+            "strength" ->
+                if (mentionsLowerBody(text, target, zone))
+                    TrainingDemoCatalog.byId("squat_bodyweight")
+                else TrainingDemoCatalog.byId("full_body_circuit")
+            else -> null
+        } ?: return null
+        val compatible = with(TrainingDemoCatalog) {
+            demo.incompatibilities(cat, text, target, zone).isEmpty()
+        }
+        return if (compatible) demo.id else null
+    }
+
+    private fun mentionsLowerBody(text: String, target: String?, zone: String?): Boolean {
+        val z = zone?.lowercase()?.trim()
+        if (z == THIGH || z == LATERAL_THIGH || z == HIP) return true
+        val combined = "$text $target".lowercase()
+        return LOWER_BODY_KEYWORDS.any { combined.contains(it) }
+    }
+
+    /**
+     * v43.6 (2026-10): one-shot, additive, replay-safe backfill of
+     * deterministic visual examples onto an OLD tacticsJson (pre-v43.6
+     * rows persisted without demoId).
+     *
+     *  - ADDITIVE: every existing field (and its order) is preserved; a
+     *    [demoIdForTactic] result is appended only to tactics WITHOUT a
+     *    demoId.
+     *  - NEVER OVERRIDES: a persisted demoId is never rewritten, even if
+     *    it looks wrong — that is the validator's (generation) and the UI
+     *    render-check's (display) business.
+     *  - REPLAY-SAFE: returns `null` when nothing changes, so callers can
+     *    skip the write; a second pass over the output is a no-op.
+     *  - FAIL-SOFT: malformed JSON → `null` (the row is left untouched).
+     */
+    fun backfillDemoIds(tacticsJson: String?): String? {
+        val s = tacticsJson?.trim()
+        if (s.isNullOrEmpty() || s.length < 2 || s[0] != '[') return null
+        val n = s.length
+        var i = 1
+        val objs = mutableListOf<String>()
+        var changed = false
+        while (true) {
+            while (i < n && s[i].isWhitespace()) i++
+            if (i >= n) return null
+            if (s[i] == ']') break
+            if (s[i] == ',') { i++; continue }
+            if (s[i] != '{') return null
+            val parsed = parseFlatObject(s, i) ?: return null
+            val fields = parsed.first
+            val next = parsed.second
+            val cat = fields["category"] ?: return null
+            if (!cat.isString) return null
+            val hasDemo = fields["demoId"]?.isString == true
+            val newDemo = if (hasDemo) null else demoIdForTactic(
+                cat.raw,
+                fields["text"]?.takeIf { it.isString }?.raw.orEmpty(),
+                fields["target"]?.takeIf { it.isString }?.raw,
+                fields["zone"]?.takeIf { it.isString }?.raw,
+            )
+            if (newDemo != null) {
+                // fieldsToJson emits the closing `}` — reopen the object,
+                // append the demo, and close it again.
+                objs += fieldsToJson(fields).dropLast(1) + ",\"demoId\":\"$newDemo\"}"
+                changed = true
+            } else {
+                objs += fieldsToJson(fields)
+            }
+            i = next
+        }
+        if (!changed) return null
+        return "[" + objs.joinToString(",") + "]"
+    }
+
+    /** Flat `{...}` object parser (tactic objects never nest). Returns
+     *  fields in ORIGINAL order plus the index just past `}`; `null` when
+     *  malformed. String values keep their raw interior (escapes intact)
+     *  so re-serialization is byte-stable for untouched fields. */
+    private fun parseFlatObject(s: String, i: Int): Pair<LinkedHashMap<String, TacticField>, Int>? {
+        val fields = LinkedHashMap<String, TacticField>()
+        val n = s.length
+        var j = i + 1
+        while (true) {
+            while (j < n && s[j].isWhitespace()) j++
+            if (j >= n) return null
+            if (s[j] == '}') return fields to (j + 1)
+            if (s[j] != '"') return null
+            // key (kept raw; keys in our JSON are plain)
+            var k = j + 1
+            val keySb = StringBuilder()
+            while (k < n) {
+                if (s[k] == '\\' && k + 1 < n) { keySb.append(s[k]).append(s[k + 1]); k += 2 }
+                else if (s[k] == '"') break
+                else { keySb.append(s[k]); k++ }
+            }
+            if (k >= n) return null
+            val key = keySb.toString()
+            k++
+            while (k < n && s[k].isWhitespace()) k++
+            if (k >= n || s[k] != ':') return null
+            k++
+            while (k < n && s[k].isWhitespace()) k++
+            if (k >= n) return null
+            if (s[k] == '"') {
+                // string value: keep the raw interior (escapes intact)
+                var v = k + 1
+                val start = v
+                while (v < n) {
+                    if (s[v] == '\\' && v + 1 < n) v++
+                    else if (s[v] == '"') break
+                    v++
+                }
+                if (v >= n) return null
+                fields[key] = TacticField(s.substring(start, v), true)
+                j = v + 1
+            } else {
+                // numbers (windowDays) — the only non-string in tactics JSON
+                val numStart = k
+                while (k < n && s[k] != ',' && s[k] != '}' && !s[k].isWhitespace()) k++
+                val tok = s.substring(numStart, k)
+                if (tok.isEmpty() || !tok.all { it.isDigit() || it in "+-.eE" }) return null
+                fields[key] = TacticField(tok, false)
+                j = k
+            }
+            while (j < n && s[j].isWhitespace()) j++
+            if (j >= n) return null
+            if (s[j] != ',' && s[j] != '}') return null
+            if (s[j] == ',') j++
+        }
+    }
+
+    private data class TacticField(val raw: String, val isString: Boolean)
+
+    private fun fieldsToJson(fields: LinkedHashMap<String, TacticField>): String {
+        val sb = StringBuilder("{")
+        var first = true
+        for ((k, f) in fields) {
+            if (!first) sb.append(',')
+            first = false
+            sb.append('"').append(escapeJson(k)).append('"').append(':')
+            sb.append(if (f.isString) '"'.plus(f.raw).plus('"') else f.raw)
+        }
+        sb.append('}')
+        return sb.toString()
+    }
+
+    /** Escape a PLAIN (unescaped) string for JSON emission. Tactic field
+     *  values never contain quotes (the emitters replace `"` with `'`),
+     *  but escape defensively anyway. */
+    private fun escapeJson(s: String): String =
+        s.replace("\\", "\\\\").replace("\"", "\\\"")
+
     // ── Deltas between checkpoints ──────────────────────────────────────────
 
     /** Numeric deltas between the previous and the latest checkpoint.
@@ -311,6 +589,17 @@ object BodyPlanEngine {
             for (zone in cur.keys) {
                 val a = cur[zone] ?: continue
                 val b = prev[zone] ?: continue
+                // v41: a delta is only meaningful when BOTH captures used the
+                // same normalization convention for that zone's photo side —
+                // a frontal image-height ratio and a frontal person-height
+                // ratio are different units, so the delta is omitted (not
+                // computed) rather than reported as a misleading change.
+                val frontal = zone in FRONTAL_ZONES
+                val latestConv = if (frontal) snapshotConvention(latest.frontalNormalization)
+                                 else snapshotConvention(latest.lateralNormalization)
+                val prevConv = if (frontal) snapshotConvention(previous.frontalNormalization)
+                               else snapshotConvention(previous.lateralNormalization)
+                if (latestConv != prevConv) continue
                 val d = (a - b) * 100f
                 if (abs(d) >= MIN_GAP_PP) zoneDeltas[zone] = d
             }

@@ -27,7 +27,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         PerformanceGoalEntity::class,
         BodyPlanCheckpointEntity::class
     ],
-    version = 40,
+    version = 41,
     exportSchema = true
 )
 @androidx.room.TypeConverters(Converters::class)
@@ -837,6 +837,10 @@ abstract class ChatDatabase : RoomDatabase() {
         // checkpoint per snapshot. Strictly additive — three nullable columns
         // via addColumnIfMissing + one unique index (SQLite treats NULLs as
         // distinct, so existing rows and snapshot-less checkpoints stay valid).
+        // v41: BEFORE the unique index is created, duplicate v39 rows per
+        // snapshotId are consolidated transactionally (see
+        // consolidateDuplicateCheckpoints) — creating the index on a
+        // database that still has duplicates would brick the upgrade.
         val MIGRATION_39_40 = object : Migration(39, 40) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.addColumnIfMissing(
@@ -851,9 +855,155 @@ abstract class ChatDatabase : RoomDatabase() {
                 db.addColumnIfMissing(
                     "body_plan_checkpoints", "goalTargetsJson", "TEXT DEFAULT NULL"
                 )
+                // v39 allowed MULTIPLE checkpoints per snapshotId (idempotency
+                // was at-most-once per app run, so a crash/retry could leave
+                // duplicates). Creating the unique index on a database that
+                // still has duplicates would brick the upgrade — so BEFORE
+                // creating it, consolidate every duplicate snapshotId group
+                // into one canonical row.
+                consolidateDuplicateCheckpoints(db)
                 db.execSQL(
                     "CREATE UNIQUE INDEX IF NOT EXISTS `index_body_plan_checkpoints_snapshotId` " +
                         "ON `body_plan_checkpoints` (`snapshotId`)"
+                )
+            }
+        }
+
+        /**
+         * v39→v40 duplicate checkpoint consolidation — runs inside
+         * [MIGRATION_39_40], before the unique snapshotId index exists.
+         *
+         * Deterministic merge precedence, per snapshotId group:
+         *   1. Winner row = newest (checkpointAtMs DESC, id DESC) — the most
+         *      recent user intent; it keeps its id/anchor.
+         *   2. Deterministic fields (phase, prioritiesJson, deltaSummary,
+         *      bodyCompRowId): first non-null scanning newest→oldest.
+         *   3. Tactic fields (tacticsJson + tacticSource): an
+         *      "llm:<model>" source outranks "deterministic_fallback" /
+         *      unknown sources, newest first; if the winner has no tactics
+         *      at all, the best older row's tactics are kept.
+         *   4. Report fields (coachReport + reportGeneratedAtMs): newest
+         *      non-null reportGeneratedAtMs wins (a report with no
+         *      timestamp is never preferred over one with a newer one).
+         *   5. All redundant rows are deleted.
+         *
+         * Runs in one transaction; any failure rolls back and rethrows so
+         * Room reports the migration failure loudly instead of silently
+         * proceeding to (or skipping) the index.
+         */
+        private fun consolidateDuplicateCheckpoints(db: SupportSQLiteDatabase) {
+            db.execSQL("BEGIN")
+            try {
+                val groups = db.query(
+                    "SELECT `snapshotId` FROM `body_plan_checkpoints` " +
+                        "WHERE `snapshotId` IS NOT NULL " +
+                        "GROUP BY `snapshotId` HAVING COUNT(*) > 1",
+                    emptyArray<Any?>()
+                )
+                groups.use { g ->
+                    while (g.moveToNext()) {
+                        val snapId = g.getLong(0)
+                        val rows = db.query(
+                            "SELECT `id`, `phase`, `prioritiesJson`, `tacticsJson`, `tacticSource`, " +
+                                "`deltaSummary`, `coachReport`, `reportGeneratedAtMs`, `bodyCompRowId` " +
+                                "FROM `body_plan_checkpoints` WHERE `snapshotId` = ? " +
+                                "ORDER BY `checkpointAtMs` DESC, `id` DESC",
+                            arrayOf(snapId.toString())
+                        )
+                        var winnerId: Long = -1L
+                        var wPhase: String? = null
+                        var wPriorities: String? = null
+                        var wTactics: String? = null
+                        var wTacticSource: String? = null
+                        var wDelta: String? = null
+                        var wReport: String? = null
+                        var wReportTs: Long? = null
+                        var wComp: Long? = null
+                        var winnerHasLlmTactics = false
+                        rows.use { r ->
+                            while (r.moveToNext()) {
+                                val id = r.getLong(0)
+                                val phase = r.getString(1)
+                                val priorities = r.getString(2)
+                                val tactics = r.getString(3)
+                                val tacticSource = r.getString(4)
+                                val delta = r.getString(5)
+                                val report = r.getString(6)
+                                val reportTs = if (r.isNull(7)) null else r.getLong(7)
+                                val comp = if (r.isNull(8)) null else r.getLong(8)
+                                if (winnerId == -1L) {
+                                    // Newest row wins identity + every field it has.
+                                    winnerId = id
+                                    wPhase = phase
+                                    wPriorities = priorities
+                                    wTactics = tactics
+                                    wTacticSource = tacticSource
+                                    wDelta = delta
+                                    wReport = report
+                                    wReportTs = reportTs
+                                    wComp = comp
+                                    winnerHasLlmTactics = tacticSource?.startsWith("llm:") == true
+                                    continue
+                                }
+                                // Redundant (older) row: fill gaps only.
+                                if (wPhase == null) wPhase = phase
+                                if (wPriorities == null) wPriorities = priorities
+                                if (wDelta == null) wDelta = delta
+                                if (wComp == null) wComp = comp
+                                when {
+                                    winnerHasLlmTactics -> { /* keep winner's llm tactics */ }
+                                    tacticSource?.startsWith("llm:") == true -> {
+                                        wTactics = tactics
+                                        wTacticSource = tacticSource
+                                        winnerHasLlmTactics = true
+                                    }
+                                    wTactics == null && tactics != null -> {
+                                        wTactics = tactics
+                                        wTacticSource = tacticSource
+                                    }
+                                }
+                                if (report != null && (wReport == null ||
+                                    (reportTs != null && (wReportTs == null || reportTs > wReportTs))
+                                )) {
+                                    wReport = report
+                                    wReportTs = reportTs
+                                }
+                            }
+                        }
+                        if (winnerId != -1L) {
+                            db.execSQL(
+                                "UPDATE `body_plan_checkpoints` SET `phase` = ?, `prioritiesJson` = ?, " +
+                                    "`tacticsJson` = ?, `tacticSource` = ?, `deltaSummary` = ?, " +
+                                    "`coachReport` = ?, `reportGeneratedAtMs` = ?, `bodyCompRowId` = ? " +
+                                    "WHERE `id` = ?",
+                                arrayOf(wPhase, wPriorities, wTactics, wTacticSource, wDelta,
+                                    wReport, wReportTs, wComp, winnerId.toString())
+                            )
+                            db.execSQL(
+                                "DELETE FROM `body_plan_checkpoints` WHERE `snapshotId` = ? AND `id` <> ?",
+                                arrayOf(snapId.toString(), winnerId.toString())
+                            )
+                        }
+                    }
+                }
+                db.execSQL("COMMIT")
+            } catch (e: Exception) {
+                db.execSQL("ROLLBACK")
+                throw e
+            }
+        }
+
+        // v41: performance_goals gains the per-side normalization conventions
+        // its coach targets were derived under. NULL rows (pre-v41 goals) are
+        // UNKNOWN by definition — their targets are never compared against a
+        // new snapshot until re-derived (fail-closed, conservative).
+        val MIGRATION_40_41 = object : Migration(40, 41) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.addColumnIfMissing(
+                    "performance_goals", "targetsConventionFrontal", "TEXT DEFAULT NULL"
+                )
+                db.addColumnIfMissing(
+                    "performance_goals", "targetsConventionLateral", "TEXT DEFAULT NULL"
                 )
             }
         }
@@ -947,7 +1097,8 @@ abstract class ChatDatabase : RoomDatabase() {
                     MIGRATION_36_37,
                     MIGRATION_37_38,
                     MIGRATION_38_39,
-                    MIGRATION_39_40
+                    MIGRATION_39_40,
+                    MIGRATION_40_41
                 )
                 // Hard guarantee that v9→v10 (and later) NEVER nukes user data:
                 // if a defined migration throws, the app crashes loudly instead of

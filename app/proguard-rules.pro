@@ -258,3 +258,13 @@
     <init>(...);
 }
 -dontwarn com.google.mlkit.**
+
+# -------------------------------------------------------------------------
+# Instrumented-test APK (debugAndroidTest, minified like the app APK):
+# a transitive test dependency carries com.google.errorprone.annotations
+# classes that reference javax.lang.model.element.Modifier — a JDK-internal
+# API that does not exist on Android. The reference is annotation-only
+# (never executed at runtime), so silence it. R8 emitted this exact rule
+# to missing_rules.txt when the test APK failed to build (2026-10-24).
+# -------------------------------------------------------------------------
+-dontwarn javax.lang.model.element.Modifier

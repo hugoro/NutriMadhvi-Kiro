@@ -2344,6 +2344,231 @@ class DatabaseMigrationTest {
         }
     }
 
+    /** v41 (review item 1): v39 allowed MULTIPLE checkpoint rows per
+     *  snapshotId (idempotency was at-most-once per app run). Creating the
+     *  unique index on such a database would brick the upgrade — so
+     *  MIGRATION_39_40 must consolidate each duplicate group transactionally
+     *  BEFORE the index. This test seeds three complementary duplicates for
+     *  one snapshot and proves: migration succeeds, exactly one row remains
+     *  (newest id), every field carries the deterministically best value,
+     *  and the unique index now works. */
+    @Test
+    fun testMigration39To40ConsolidatesDuplicateCheckpointsBeforeUniqueIndex() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val dbFile = context.getDatabasePath("test_migration_v39_v40_dupes")
+        if (dbFile.exists()) dbFile.delete()
+
+        val db39 = SQLiteDatabase.openOrCreateDatabase(dbFile.absolutePath, null)
+        db39.version = 39
+        db39.execSQL("""
+            CREATE TABLE IF NOT EXISTS `performance_snapshots` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `capturedAtMs` INTEGER NOT NULL,
+                `source` TEXT NOT NULL DEFAULT 'manual',
+                `frontalWaistRatio` REAL,
+                `silhouetteNormalization` TEXT DEFAULT NULL
+            )
+        """.trimIndent())
+        db39.execSQL("""
+            CREATE TABLE IF NOT EXISTS `body_plan_checkpoints` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `checkpointAtMs` INTEGER NOT NULL,
+                `snapshotId` INTEGER,
+                `bodyCompRowId` INTEGER,
+                `phase` TEXT,
+                `prioritiesJson` TEXT,
+                `tacticsJson` TEXT,
+                `tacticSource` TEXT,
+                `deltaSummary` TEXT,
+                `coachReport` TEXT,
+                `reportGeneratedAtMs` INTEGER
+            )
+        """.trimIndent())
+        db39.execSQL(
+            """INSERT INTO performance_snapshots
+                (id, capturedAtMs, source, frontalWaistRatio, silhouetteNormalization)
+                VALUES (?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(301L, 1_700_600_000_000L, "manual", 0.26f, "image_height")
+        )
+        // Three duplicates for snapshot 301 with COMPLEMENTARY fields.
+        // Newest (71): no phase/priorities/delta, fallback tactics, OLDEST
+        // report timestamp — its identity must win, nothing else.
+        db39.execSQL(
+            """INSERT INTO body_plan_checkpoints
+                (id, checkpointAtMs, snapshotId, phase, prioritiesJson, tacticsJson,
+                 tacticSource, deltaSummary, coachReport, reportGeneratedAtMs, bodyCompRowId)
+                VALUES (?, ?, ?, NULL, NULL, ?, 'deterministic_fallback', NULL,
+                        ?, ?, NULL)""",
+            arrayOf<Any?>(
+                71L, 1_700_600_300_000L, 301L,
+                """[{"category":"steps","text":"Manter 8000 passos/dia","windowDays":28}]""",
+                "relatório antigo", 1_700_600_200_000L,
+            )
+        )
+        // Middle (72): phase + llm tactics + delta + NEWER report timestamp.
+        db39.execSQL(
+            """INSERT INTO body_plan_checkpoints
+                (id, checkpointAtMs, snapshotId, phase, prioritiesJson, tacticsJson,
+                 tacticSource, deltaSummary, coachReport, reportGeneratedAtMs, bodyCompRowId)
+                VALUES (?, ?, ?, 'CUT', NULL, ?, 'llm:gemini-3.5-flash-lite',
+                        'cintura +0.5pp', ?, ?, NULL)""",
+            arrayOf<Any?>(
+                72L, 1_700_600_200_000L, 301L,
+                """[{"category":"protein","text":"Proteína 2,0 g/kg","windowDays":28}]""",
+                "relatório do meio", 1_700_600_250_000L,
+            )
+        )
+        // Oldest (73): only priorities + bodyCompRowId.
+        db39.execSQL(
+            """INSERT INTO body_plan_checkpoints
+                (id, checkpointAtMs, snapshotId, phase, prioritiesJson, tacticsJson,
+                 tacticSource, deltaSummary, coachReport, reportGeneratedAtMs, bodyCompRowId)
+                VALUES (?, ?, ?, NULL, ?, NULL, NULL, NULL, NULL, NULL, 9)""",
+            arrayOf<Any?>(
+                73L, 1_700_600_100_000L, 301L,
+                """[{"zone":"waist","direction":"REDUCE","gapPp":1.8,"tissue":"FAT_DOMINANT"}]""",
+            )
+        )
+        // A non-duplicate group must be left untouched.
+        db39.execSQL(
+            """INSERT INTO body_plan_checkpoints
+                (id, checkpointAtMs, snapshotId, phase, deltaSummary)
+                VALUES (?, ?, 302, 'RECOMP', 'solo')""",
+            arrayOf<Any?>(80L, 1_700_600_400_000L),
+        )
+        db39.close()
+
+        val db40 = openWithMigration("test_migration_v39_v40_dupes", 40) { db, oldV, newV ->
+            if (oldV == 39 && newV == 40) ChatDatabase.MIGRATION_39_40.migrate(db)
+        }
+        db40.query("PRAGMA user_version").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("migration must succeed and end at v40", 40, it.getInt(0))
+        }
+
+        // 1. Exactly ONE row remains for snapshot 301, keeping the NEWEST id.
+        db40.query("SELECT COUNT(*) FROM body_plan_checkpoints WHERE snapshotId = 301").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("duplicates must be consolidated to exactly one row", 1, it.getInt(0))
+        }
+        db40.query("SELECT id FROM body_plan_checkpoints WHERE snapshotId = 301").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("canonical row must be the newest one", 71L, it.getLong(0))
+        }
+
+        // 2. Every field carries the deterministically best value:
+        //    phase/delta from the middle row, priorities + comp from the
+        //    oldest, llm tactics over the fallback, NEWEST report timestamp.
+        db40.query(
+            "SELECT phase, prioritiesJson, tacticsJson, tacticSource, deltaSummary, " +
+                "coachReport, reportGeneratedAtMs, bodyCompRowId " +
+                "FROM body_plan_checkpoints WHERE id = 71"
+        ).use {
+            assertTrue(it.moveToFirst())
+            assertEquals("CUT", it.getString(0))
+            assertTrue("prioritiesJson must come from the oldest row",
+                it.getString(1).contains("\"zone\":\"waist\""))
+            assertTrue("llm tactics must outrank the deterministic fallback",
+                it.getString(2).contains("2,0 g/kg"))
+            assertEquals("llm:gemini-3.5-flash-lite", it.getString(3))
+            assertEquals("cintura +0.5pp", it.getString(4))
+            assertEquals("newest report timestamp must win",
+                "relatório do meio", it.getString(5))
+            assertEquals(1_700_600_250_000L, it.getLong(6))
+            assertEquals(9L, it.getLong(7))
+        }
+
+        // 3. The non-duplicate group is untouched.
+        db40.query("SELECT id, phase, deltaSummary FROM body_plan_checkpoints WHERE snapshotId = 302").use {
+            assertTrue(it.moveToFirst())
+            assertEquals(80L, it.getLong(0))
+            assertEquals("RECOMP", it.getString(1))
+            assertEquals("solo", it.getString(2))
+        }
+
+        // 4. The unique index exists and rejects a new duplicate.
+        db40.query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='index_body_plan_checkpoints_snapshotId'"
+        ).use {
+            assertTrue("unique snapshotId index missing", it.moveToFirst())
+        }
+        var duplicateRejected = false
+        try {
+            db40.execSQL(
+                "INSERT INTO body_plan_checkpoints (checkpointAtMs, snapshotId, phase) VALUES (?, 301, 'CUT')",
+                arrayOf<Any?>(1_700_601_000_000L),
+            )
+        } catch (e: android.database.sqlite.SQLiteConstraintException) {
+            duplicateRejected = true
+        }
+        assertTrue("post-migration duplicates must be rejected by the index", duplicateRejected)
+    }
+
+    /** v41 (review item 2): performance_goals gains the per-side target
+     *  normalization convention columns — additive, NULL-defaulting, and
+     *  every existing goal row survives byte-identical. */
+    @Test
+    fun testMigration40To41AddsTargetConventionColumnsAndPreservesData() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val dbFile = context.getDatabasePath("test_migration_v40_v41")
+        if (dbFile.exists()) dbFile.delete()
+
+        val db40 = SQLiteDatabase.openOrCreateDatabase(dbFile.absolutePath, null)
+        db40.version = 40
+        db40.execSQL("""
+            CREATE TABLE IF NOT EXISTS `performance_goals` (
+                `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                `createdAtMs` INTEGER NOT NULL,
+                `goalText` TEXT NOT NULL,
+                `coachTargetJson` TEXT,
+                `targetsGeneratedAtMs` INTEGER
+            )
+        """.trimIndent())
+        db40.execSQL(
+            """INSERT INTO performance_goals
+                (id, createdAtMs, goalText, coachTargetJson, targetsGeneratedAtMs)
+                VALUES (?, ?, ?, ?, ?)""",
+            arrayOf<Any?>(
+                5L, 1_700_700_000_000L, "reduzir cintura",
+                """{"waist":0.23,"belly":0.19}""", 1_700_700_100_000L,
+            )
+        )
+        db40.close()
+
+        val db41 = openWithMigration("test_migration_v40_v41", 41) { db, oldV, newV ->
+            if (oldV == 40 && newV == 41) ChatDatabase.MIGRATION_40_41.migrate(db)
+        }
+        db41.query("PRAGMA user_version").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("migration must end at user_version 41", 41, it.getInt(0))
+        }
+        // 1. Both new columns exist and default NULL on the pre-v41 row.
+        db41.query(
+            "SELECT goalText, coachTargetJson, targetsGeneratedAtMs, " +
+                "targetsConventionFrontal, targetsConventionLateral " +
+                "FROM performance_goals WHERE id = 5"
+        ).use {
+            assertTrue("goal row vanished after v40→v41", it.moveToFirst())
+            assertEquals("reduzir cintura", it.getString(0))
+            assertTrue(it.getString(1).contains("\"waist\":0.23"))
+            assertEquals(1_700_700_100_000L, it.getLong(2))
+            assertNull("frontal convention must default NULL", it.getString(3))
+            assertNull("lateral convention must default NULL", it.getString(4))
+        }
+        // 2. New columns are writable (the app path from v41 onwards).
+        db41.execSQL(
+            "UPDATE performance_goals SET targetsConventionFrontal=?, targetsConventionLateral=? WHERE id=5",
+            arrayOf<Any?>("pose_person_height", "image_height"),
+        )
+        db41.query(
+            "SELECT targetsConventionFrontal, targetsConventionLateral FROM performance_goals WHERE id=5"
+        ).use {
+            assertTrue(it.moveToFirst())
+            assertEquals("pose_person_height", it.getString(0))
+            assertEquals("image_height", it.getString(1))
+        }
+    }
+
     /** Open [name] with a SupportSQLiteOpenHelper whose onUpgrade runs [onUpgrade]. */
     private fun openWithMigration(
         name: String,
